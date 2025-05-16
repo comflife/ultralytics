@@ -22,5 +22,5 @@ model = YOLO("yolov8s.pt")  # load a pretrained model (recommended for training)
 # model = YOLO("yolov8s.yaml").load("yolov8s.pt")  # build from YAML and transfer weights
 
 # Train the model
-results = model.train(data="traffic_wide.yaml", epochs=100, imgsz=640, batch=128, auto_augment="ada", device=[0,1])
-#train8
+results = model.train(data="traffic_wide_narrow.yaml", epochs=100, imgsz=640, batch=128, device=[2,3])
+#train11
