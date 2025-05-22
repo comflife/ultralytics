@@ -1,0 +1,20 @@
+# hyp_siamese_scratch.yaml
+epochs: 150
+batch_size: 16
+imgsz: 640
+lr0: 0.0005       # Initial learning rate for AdamW
+momentum: 0.9     # AdamW beta1
+weight_decay: 0.0001 # AdamW weight decay
+
+siamese_feature_dim: 128
+siamese_loss_weight: 0.2 # e.g., give more weight if needed
+detect_loss_weight: 1.0
+
+# Detection Loss Gains (from Ultralytics hyp.scratch0.yaml, adjust as needed)
+box_gain: 7.5
+cls_gain: 0.5 
+dfl_gain: 1.5
+
+grad_accum_steps: 2 # Accumulate gradients over 2 batches before optimizer step
+
+# workers: 8 # set based on your CPU cores and system
