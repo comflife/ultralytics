@@ -1,0 +1,17 @@
+path: /home/byounggun/ultralytics/traffics
+train: narrow_images_only/train # train images (relative to 'path') 4 images
+val: narrow_images_only/val # val images (relative to 'path') 4 images
+
+# Classes
+names:
+  0 : Green
+  1 : Red
+  2 : Green-up
+  3 : Empty-count-down
+  4 : Count-down
+  5 : Yellow
+  6 : Empty
+  7 : Green-right
+  8 : Green-left
+  9 : Red-yellow
+

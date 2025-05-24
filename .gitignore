@@ -174,3 +174,23 @@ pnnx*
 
 # calibration image
 calibration_*.npy
+
+# images 폴더 및 이미지, pdf 파일 무시
+images/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.svg
+*.pdf
+
+*.zip
+*.xml
+*.bak
+
+
+traffics/
+traffic_dataset/

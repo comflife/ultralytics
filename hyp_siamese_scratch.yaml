@@ -1,6 +1,6 @@
 # hyp_siamese_scratch.yaml
 epochs: 150
-batch_size: 16
+batch_size: 32
 imgsz: 640
 lr0: 0.0005       # Initial learning rate for AdamW
 momentum: 0.9     # AdamW beta1
