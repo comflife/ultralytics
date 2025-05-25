@@ -20,6 +20,17 @@ from ultralytics.utils.loss import v8DetectionLoss
 
 from types import SimpleNamespace
 
+###
+# python train_siamese.py --hyp hyp_siamese_scratch.yaml \
+#     --weights /home/byounggun/ultralytics/yolov8s.pt \
+#     --wide-img-dir-train /home/byounggun/cococo/train_resized/images \
+#     --narrow-img-dir-train /home/byounggun/cococo/train_short/images \
+#     --label-dir-train /home/byounggun/cococo/train_resized/labels \
+#     --project runs/my_siamese_training \
+#     --name experiment2 \
+#     --workers 4
+###
+
 DEFAULT_HYPERPARAMS_FILE = 'hyp_siamese_scratch.yaml'
 
 def save_opt_yaml(opt, save_dir):
