@@ -1,13 +1,13 @@
 # hyp_siamese_scratch.yaml
 epochs: 150
-batch_size: 32
+batch_size: 24
 imgsz: 640
-lr0: 0.01
+lr0: 0.001
 momentum: 0.9     # AdamW beta1
 weight_decay: 0.0001 # AdamW weight decay
 
 siamese_feature_dim: 128
-siamese_loss_weight: 0.2 # e.g., give more weight if needed
+siamese_loss_weight: 1000 # e.g., give more weight if needed
 detect_loss_weight: 1.0
 
 # Detection Loss Gains (from Ultralytics hyp.scratch0.yaml, adjust as needed)

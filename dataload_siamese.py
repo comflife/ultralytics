@@ -88,7 +88,7 @@ class SiameseDataset(Dataset):
                     if len(parts) == 5:
                         cls = int(float(parts[0])) # Class ID
                         x_c, y_c, w, h = map(float, parts[1:]) # BBox coords
-                        labels.append([x_c, y_c, w, h, cls]) # Format for Albumentations: x,y,w,h,cls
+                        labels.append([cls, x_c, y_c, w, h]) # Correct YOLO format: cls, x, y, w, h
         
         labels_np = np.array(labels, dtype=np.float32)
         # Ensure labels_np is 2D even if empty, with 5 columns
@@ -98,80 +98,54 @@ class SiameseDataset(Dataset):
             labels_np = labels_np.reshape(1,5)
 
 
-        # Clamp bbox coordinates to valid range [0.0, 1.0] to avoid floating point precision issues
-        if labels_np.shape[0] > 0:
-            # Clamp coordinates to [0.0, 1.0] range to avoid precision errors
-            labels_np[:, :4] = np.clip(labels_np[:, :4], 0.0, 1.0)
-            
-            # Ensure width and height don't cause out-of-bounds issues when converted to xmin, ymin
-            # x_min = x_center - width/2 must be >= 0
-            # y_min = y_center - height/2 must be >= 0
-            # x_max = x_center + width/2 must be <= 1
-            # y_max = y_center + height/2 must be <= 1
-            x_center, y_center = labels_np[:, 0], labels_np[:, 1]
-            width, height = labels_np[:, 2], labels_np[:, 3]
-            
-            # Adjust width to ensure x_min >= 0 and x_max <= 1
-            max_width = np.minimum(2 * x_center, 2 * (1 - x_center))
-            width = np.minimum(width, max_width)
-            
-            # Adjust height to ensure y_min >= 0 and y_max <= 1
-            max_height = np.minimum(2 * y_center, 2 * (1 - y_center))
-            height = np.minimum(height, max_height)
-            
-            # Update the array with adjusted width and height
-            labels_np[:, 2] = width
-            labels_np[:, 3] = height
-            
-            # Apply a small epsilon margin to avoid floating point precision issues
-            epsilon = 1e-6
-            labels_np[:, :4] = np.clip(labels_np[:, :4], epsilon, 1.0 - epsilon)
-            
-        bboxes_for_aug = labels_np[:, :4].tolist() if labels_np.shape[0] > 0 else []
-        class_labels_for_aug = labels_np[:, 4].astype(int).tolist() if labels_np.shape[0] > 0 else []
+        # (수정) bbox clip/보정 없이 원본 라벨 그대로 사용
+        # if labels_np.shape[0] > 0:
+        #     ... (clip/보정 코드 삭제)
+        #
+        # clip/보정 없이 바로 반환
 
-        if self.transform:
-            augmented_wide = self.transform(image=wide_img, bboxes=bboxes_for_aug, class_labels=class_labels_for_aug)
-            wide_img_tensor = augmented_wide['image']
             
-            # Process augmented bboxes
-            augmented_bboxes_list = augmented_wide['bboxes']
-            augmented_class_labels_list = augmented_wide['class_labels']
+            # (수정) epsilon clip 제거: bbox가 너무 작은 값으로 강제되지 않게 한다
+            # epsilon = 1e-6
+            # labels_np[:, :4] = np.clip(labels_np[:, :4], epsilon, 1.0 - epsilon)
             
-            if augmented_bboxes_list: # If there are any bboxes left after augmentation
-                final_labels_list = []
-                for i, bbox in enumerate(augmented_bboxes_list):
-                    cls_label = augmented_class_labels_list[i]
-                    # bbox is (x_center, y_center, width, height) from Albumentations YOLO format
-                    final_labels_list.append([cls_label] + list(bbox)) 
-                final_labels_np = np.array(final_labels_list, dtype=np.float32)
-            else:
-                final_labels_np = np.empty((0, 5), dtype=np.float32) # cls, x, y, w, h
+        # (clip/보정 없이 바로 반환)
 
-            # Apply transform to narrow image (only image part, no labels/bboxes)
-            # This will use its own random parameters for augmentations like ColorJitter.
-            # Geometric transforms (like Flip, Rotate) will also be independently random.
-            narrow_img_transformed = self.transform(image=narrow_img, bboxes=[], class_labels=[]) 
-            narrow_img_tensor = narrow_img_transformed['image']
-        else:
-            # Basic resize and ToTensor if no advanced transform pipeline provided
-            h_orig, w_orig, _ = wide_img.shape
-            wide_img_resized = cv2.resize(wide_img, (self.img_size, self.img_size))
-            narrow_img_resized = cv2.resize(narrow_img, (self.img_size, self.img_size))
-            
-            wide_img_tensor = torch.from_numpy(wide_img_resized.transpose(2, 0, 1)).float() / 255.0
-            narrow_img_tensor = torch.from_numpy(narrow_img_resized.transpose(2, 0, 1)).float() / 255.0
-            
-            # Labels: cls, x,y,w,h format from original file
-            if labels_np.shape[0] > 0:
-                 final_labels_np = np.concatenate(
-                    (labels_np[:, 4][:, np.newaxis], labels_np[:, :4]), axis=1 
-                )
-            else:
-                final_labels_np = np.empty((0,5), dtype=np.float32)
-
-
-        return wide_img_tensor, narrow_img_tensor, torch.from_numpy(final_labels_np)
+        # (수정) augmentation(transform) 완전 비활성화: 아래 블록 전체 주석처리
+        # if self.transform:
+        #     augmented_wide = self.transform(image=wide_img, bboxes=bboxes_for_aug, class_labels=class_labels_for_aug)
+        #     wide_img_tensor = augmented_wide['image']
+        #     
+        #     # Process augmented bboxes
+        #     augmented_bboxes_list = augmented_wide['bboxes']
+        #     augmented_class_labels_list = augmented_wide['class_labels']
+        #     
+        #     if augmented_bboxes_list: # If there are any bboxes left after augmentation
+        #         final_labels_list = []
+        #         for i, bbox in enumerate(augmented_bboxes_list):
+        #             cls_label = augmented_class_labels_list[i]
+        #             # bbox is (x_center, y_center, width, height) from Albumentations YOLO format
+        #             final_labels_list.append([cls_label] + list(bbox)) 
+        #         final_labels_np = np.array(final_labels_list, dtype=np.float32)
+        #     else:
+        #         final_labels_np = np.empty((0, 5), dtype=np.float32) # cls, x, y, w, h
+        #
+        #     # Apply transform to narrow image (only image part, no labels/bboxes)
+        #     # This will use its own random parameters for augmentations like ColorJitter.
+        #     # Geometric transforms (like Flip, Rotate) will also be independently random.
+        #     narrow_img_transformed = self.transform(image=narrow_img, bboxes=[], class_labels=[]) 
+        #     narrow_img_tensor = narrow_img_transformed['image']
+        # else:
+        # Basic resize and ToTensor if no advanced transform pipeline provided
+        h_orig, w_orig, _ = wide_img.shape
+        wide_img_resized = cv2.resize(wide_img, (self.img_size, self.img_size))
+        narrow_img_resized = cv2.resize(narrow_img, (self.img_size, self.img_size))
+        
+        wide_img_tensor = torch.from_numpy(wide_img_resized.transpose(2, 0, 1)).float() / 255.0
+        narrow_img_tensor = torch.from_numpy(narrow_img_resized.transpose(2, 0, 1)).float() / 255.0
+        
+        # 라벨 clip/보정 없이 [cls, x, y, w, h] 그대로 반환
+        return wide_img_tensor, narrow_img_tensor, torch.from_numpy(labels_np)
 
 
 def get_siamese_train_transforms(img_size):

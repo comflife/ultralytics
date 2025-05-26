@@ -106,6 +106,26 @@ def train(opt):
             model_args = yaml.safe_load(f)
     else:
         raise TypeError(f"opt.hyp must be a dict, str (YAML path), or have __dict__, got {type(opt.hyp)}")
+    # --- Hardcoded dataset yaml path for nc (number of classes) extraction ---
+    dataset_yaml = '/home/byounggun/ultralytics/ultralytics/cfg/datasets/coco.yaml'
+    if os.path.exists(dataset_yaml):
+        with open(dataset_yaml, 'r') as f:
+            data_yaml = yaml.safe_load(f)
+        # names can be list or dict
+        names = data_yaml.get('names', None)
+        if isinstance(names, dict):
+            nc = len(names)
+        elif isinstance(names, list):
+            nc = len(names)
+        else:
+            nc = None
+        if nc is not None:
+            model_args['nc'] = nc
+            LOGGER.info(f"[train_siamese.py] Set number of classes (nc) to {nc} from dataset yaml: {dataset_yaml}")
+        else:
+            LOGGER.warning(f"[train_siamese.py] Could not determine nc from dataset yaml: {dataset_yaml}")
+    else:
+        LOGGER.warning(f"[train_siamese.py] Hardcoded dataset yaml not found: {dataset_yaml}, using nc from hyp or default")
     model = SiameseYOLOv8s(
         yolo_weights_path=opt.weights,
         siamese_lambda=opt.siamese_lambda,
@@ -139,6 +159,7 @@ def train(opt):
     
     # AdamW 옵티마이저 사용 (SGD보다 일반적으로 더 효과적)
     optimizer = optim.AdamW(trainable_params, lr=opt.lr0, weight_decay=opt.weight_decay, betas=(0.9, 0.999))
+    # optimizer = optim.SGD(trainable_params, lr=opt.lr0, weight_decay=opt.weight_decay, momentum=0.9)
     
     # OneCycleLR 스케줄러 (학습률을 동적으로 조정하여 수렴 속도 향상)
     steps_per_epoch = len(train_loader)
@@ -148,7 +169,7 @@ def train(opt):
         epochs=opt.epochs, 
         steps_per_epoch=steps_per_epoch,
         pct_start=0.3,  # 최대 학습률까지 상승하는 시간 비율
-        div_factor=1,  # 초기 학습률 = max_lr/div_factor
+        div_factor=10,  # 초기 학습률 = max_lr/div_factor
         final_div_factor=10000  # 최종 학습률 = max_lr/(div_factor*final_div_factor)
     )
 
@@ -159,7 +180,7 @@ def train(opt):
     
     # Set model in training mode
     best_total_loss = float('inf')
-    unfreeze_epoch = 5  # 5에폭 이후 백본 동결 해제
+    unfreeze_epoch = 1  # 5에폭 이후 백본 동결 해제
     # log_batch_interval 옵션이 없으면 기본값 설정
     if not hasattr(opt, 'log_batch_interval'):
         opt.log_batch_interval = 50
@@ -180,7 +201,7 @@ def train(opt):
             
             # 백본 동결 해제 후 학습률 조정 (더 낮은 학습률로 미세 조정)
             for g in optimizer.param_groups:
-                g['lr'] = opt.lr0 / 10  # 백본 미세 조정을 위해 더 낮은 학습률 사용
+                g['lr'] = opt.lr0 / 1  # 백본 미세 조정을 위해 더 낮은 학습률 사용
         model.train()
         epoch_loss_total_sum = 0.0
         epoch_loss_detect_sum = 0.0
@@ -200,15 +221,13 @@ def train(opt):
             with torch.cuda.amp.autocast(enabled=amp):
                 # Forward pass through the model
                 detection_preds_wide, siamese_loss = model(wide_imgs, narrow_imgs)
-                
-                # 감지 헤드의 출력에서 pred 추출
-                if isinstance(detection_preds_wide, tuple) and len(detection_preds_wide) == 2:
-                    # (pred, feat) 형태로 반환되는 경우
-                    pred, feat = detection_preds_wide
-                else:
-                    # 단일 텐서로 반환되는 경우
+
+                # detection_preds_wide가 list/tuple이면 전체를 loss에 넘김
+                if isinstance(detection_preds_wide, (list, tuple)):
                     pred = detection_preds_wide
-                    feat = None
+                else:
+                    pred = detection_preds_wide
+
                 
                 # 손실 가중치 설정
                 box_gain = opt.box_gain if hasattr(opt, 'box_gain') else 7.5
@@ -235,11 +254,11 @@ def train(opt):
                         }
                     )
                     loss_box, loss_cls, loss_dfl = loss_items_detect[0], loss_items_detect[1], loss_items_detect[2]
-                else:
-                    loss_detect_val = torch.tensor(0.0, device=device)
-                    loss_box = torch.tensor(0.0, device=device)
-                    loss_cls = torch.tensor(0.0, device=device)
-                    loss_dfl = torch.tensor(0.0, device=device)
+                # else:
+                #     loss_detect_val = torch.tensor(0.0, device=device)
+                #     loss_box = torch.tensor(0.0, device=device)
+                #     loss_cls = torch.tensor(0.0, device=device)
+                #     loss_dfl = torch.tensor(0.0, device=device)
             
             # Combine losses using weights from opt (both should be scalars now)
             total_loss = opt.detect_loss_weight * (box_gain * loss_box + cls_gain * loss_cls + dfl_gain * loss_dfl) + opt.siamese_loss_weight * siamese_loss
@@ -249,7 +268,10 @@ def train(opt):
                 print("[DEBUG] wide_imgs:", wide_imgs.shape, wide_imgs.min().item(), wide_imgs.max().item())
                 print("[DEBUG] wide_targets:", wide_targets[:5])
                 if 'detection_preds_wide' in locals():
-                    print("[DEBUG] detection_preds_wide:", detection_preds_wide.shape)
+                    if isinstance(detection_preds_wide, (list, tuple)):
+                        print("[DEBUG] detection_preds_wide[0].shape:", detection_preds_wide[0].shape)
+                    else:
+                        print("[DEBUG] detection_preds_wide.shape:", detection_preds_wide.shape)
                 print("[DEBUG] loss_box:", loss_box.item(), "loss_cls:", loss_cls.item(), "loss_dfl:", loss_dfl.item())
                 print("[DEBUG] siamese_loss:", siamese_loss.item())
                 if wandb is not None:
@@ -281,7 +303,7 @@ def train(opt):
             if wandb is not None:
                 wandb.log({
                     "loss/total": total_loss.item(),
-                    "loss/detect": loss_detect_val.item() if hasattr(loss_detect_val, 'item') else float(loss_detect_val),
+                    "loss/detect": loss_detect_val.sum().item() if hasattr(loss_detect_val, 'sum') else float(loss_detect_val),
                     "loss/box": loss_box.item() if hasattr(loss_box, 'item') else float(loss_box),
                     "loss/cls": loss_cls.item() if hasattr(loss_cls, 'item') else float(loss_cls),
                     "loss/dfl": loss_dfl.item() if hasattr(loss_dfl, 'item') else float(loss_dfl),

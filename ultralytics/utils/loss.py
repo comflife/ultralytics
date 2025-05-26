@@ -265,6 +265,21 @@ class v8DetectionLoss:
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
+        # print("==== YOLOv8 Loss Debug ====")
+        # if hasattr(preds, "shape"):
+        #     print("preds.shape:", preds.shape)
+        # else:
+        #     print("WARNING: preds is not a tensor! Type:", type(preds))
+        # print("targets['bboxes'].shape:", targets['bboxes'].shape)
+        # print("targets['cls'].shape:", targets['cls'].shape)
+        # print("targets['batch_idx'].shape:", targets['batch_idx'].shape)
+        # print("targets['bboxes'][:5]:", targets['bboxes'][:5])
+        # print("targets['cls'][:5]:", targets['cls'][:5])
+        # print("targets['batch_idx'][:5]:", targets['batch_idx'][:5])
+        # print("===========================")
+
+
+
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
 
@@ -356,6 +371,8 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[1] *= self.hyp.box  # seg gain
         loss[2] *= self.hyp.cls  # cls gain
         loss[3] *= self.hyp.dfl  # dfl gain
+
+
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
