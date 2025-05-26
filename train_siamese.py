@@ -119,7 +119,7 @@ def train(opt):
     # Optimizer
     # 백본 동결 (전이 학습 최적화)
     LOGGER.info("Freezing backbone for transfer learning optimization...")
-    for param in model.shared_backbone.parameters():
+    for param in model.yolo_model.model[:model.yolo_model.save[-1]+1].parameters():
         param.requires_grad = False
     
     # 훈련 가능한 파라미터만 필터링
@@ -157,7 +157,7 @@ def train(opt):
         # 백본 동결 해제 로직: 초기 에폭에서는 백본을 고정하고, 이후에 전체 모델을 미세 조정
         if epoch == unfreeze_epoch:
             LOGGER.info(f"Unfreezing backbone at epoch {epoch+1} for fine-tuning...")
-            for param in model.shared_backbone.parameters():
+            for param in model.yolo_model.model[:model.yolo_model.save[-1]+1].parameters():
                 param.requires_grad = True
             
             # 모든 파라미터를 학습 가능하게 설정한 후 옵티마이저 재설정
@@ -206,7 +206,7 @@ def train(opt):
                     device = pred[0].device
                 else:
                     device = pred.device
-                h = model.detection_head[-1] if isinstance(model.detection_head, nn.Sequential) else model.detection_head
+                h = model.yolo_model.model[-1]
                 nc = model.nc  # 클래스 수
                 
                 # 공식 YOLOv8 detection loss 사용

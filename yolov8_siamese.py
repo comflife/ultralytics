@@ -7,6 +7,20 @@ from ultralytics.utils import LOGGER
 import os
 
 class SiameseYOLOv8s(nn.Module):
+    def extract_backbone_features(self, x):
+        """
+        DetectionModel의 backbone feature만 추출 (YOLOv8 공식 구조 기반)
+        여러 scale의 feature map 리스트 반환 (보통 [P3, P4, P5_sppf_out])
+        """
+        y, outputs = [], []
+        for m in self.yolo_model.model:
+            if hasattr(m, 'f') and m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x)
+        # self.yolo_model.save에 저장된 인덱스의 feature map만 반환
+        return [y[i] for i in self.yolo_model.save]
+
     def __init__(self, yolo_weights_path='yolov8s.pt', siamese_lambda=0.1, feature_dim=128, args=None):
         """
         Siamese YOLOv8s 모델 초기화.
@@ -32,23 +46,20 @@ class SiameseYOLOv8s(nn.Module):
         try:
             yolo_model_full = YOLO(yolo_weights_path)
             self.yolo_model = yolo_model_full.model  # Expose for v8DetectionLoss compatibility
-            self.shared_backbone = yolo_model_full.model.model[0]
-            self.detection_head = yolo_model_full.model.model[1] # This is an nn.Sequential
+            # DetectionModel 전체를 사용하며, backbone feature 추출은 별도 메서드로 처리
+            model = yolo_model_full.model
+            self.stride = model.stride
+            self.names = model.names
+            self.nc = model.nc
 
-            self.stride = yolo_model_full.model.stride
-            self.names = yolo_model_full.model.names
-            self.nc = yolo_model_full.model.nc
+            # Detect 모듈(헤드)에서 reg_max 등 파라미터를 안전하게 추출
+            detect_module = None
+            for m in reversed(self.yolo_model.model):
+                if m.__class__.__name__ == 'Detect':
+                    detect_module = m
+                    break
+            self.reg_max = getattr(detect_module, 'reg_max', 16)
 
-            # Correctly access reg_max from the Detect layer within the head's Sequential modules
-            if isinstance(self.detection_head, torch.nn.Sequential):
-                # The Detect layer is typically the last module in the head sequence
-                detect_module = self.detection_head[-1]
-            else:
-                # Fallback if self.detection_head is not Sequential (should be for YOLOv8)
-                detect_module = self.detection_head 
-            
-            self.reg_max = detect_module.reg_max if hasattr(detect_module, 'reg_max') else 16
-            
             from types import SimpleNamespace
             if args is not None:
                 # dict로 강제 변환 후 SimpleNamespace로 변환
@@ -117,22 +128,16 @@ class SiameseYOLOv8s(nn.Module):
             LOGGER.error(f"Error loading YOLO model from {yolo_weights_path}: {e}", exc_info=True)
             raise RuntimeError(f"Failed to initialize SiameseYOLOv8s components from {yolo_weights_path}: {e}")
 
-        # Siamese 특징 비교를 위한 프로젝션 헤드 설정을 위해 백본 출력 채널 수를 동적으로 확인
-        # YOLOv8s에서는 일반적으로 backbone의 마지막 특징맵(P5)의 채널 수가 1024이지만
-        # 모델 설정에 따라 달라질 수 있으므로 동적으로 결정합니다.
-        
-        # 더미 입력으로 백본을 실행하여 출력 채널 수 확인
+        # Siamese projector 입력 채널은 backbone feature 추출 메서드의 output(P5 등)에 맞춰 동적으로 결정됨
         dummy_input = torch.zeros(1, 3, 64, 64)  # 작은 크기의 더미 이미지
         with torch.no_grad():
-            backbone_outputs = self.shared_backbone(dummy_input)
+            backbone_outputs = self.extract_backbone_features(dummy_input)
             if isinstance(backbone_outputs, (list, tuple)):
-                deepest_features = backbone_outputs[-1]  # P5_sppf_out
+                deepest_features = backbone_outputs[-1]  # 항상 가장 깊은 feature map 사용 (P5_sppf_out)
             else:
                 deepest_features = backbone_outputs
-                
-            # 채널 수 확인 (C x H x W 에서 C 값)
             backbone_out_channels = deepest_features.shape[1]
-            LOGGER.info(f"Detected backbone output channels: {backbone_out_channels}")
+            LOGGER.info(f"[Siamese] Detected backbone output channels: {backbone_out_channels}")
         
         self.siamese_projector = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
@@ -145,17 +150,15 @@ class SiameseYOLOv8s(nn.Module):
         # Siamese 손실 함수 (코사인 임베딩 손실)
         self.cosine_embedding_loss = nn.CosineEmbeddingLoss()
 
-    def _extract_siamese_features(self, backbone_outputs):
+    def _extract_siamese_features(self, x):
         """
-        백본 출력에서 Siamese 비교를 위한 특징을 추출하고 프로젝션합니다.
-        YOLOv8 백본(self.shared_backbone)은 [P3, P4, P5_sppf_out] 형태의 특징 맵 리스트를 출력합니다.
-        가장 깊은 특징 맵인 P5_sppf_out (backbone_outputs[-1])을 사용합니다.
+        입력 이미지를 받아 YOLOv8 backbone feature를 추출하고, Siamese projector에 통과시킴.
         """
+        backbone_outputs = self.extract_backbone_features(x)
         if isinstance(backbone_outputs, (list, tuple)):
-            deepest_features = backbone_outputs[-1]  # P5_sppf_out, e.g., (batch, 1024, H/32, W/32) for YOLOv8s
-        else: # In case the backbone structure outputs a single tensor
+            deepest_features = backbone_outputs[-1]  # P5_sppf_out 등
+        else:
             deepest_features = backbone_outputs
-        
         projected_features = self.siamese_projector(deepest_features)  # (batch_size, self.feature_dim)
         return projected_features
 
@@ -175,31 +178,20 @@ class SiameseYOLOv8s(nn.Module):
                    detection_predictions_wide는 YOLO 헤드의 원시 출력입니다.
                    실제 손실 계산 및 후처리는 학습/추론 스크립트에서 수행됩니다.
         """
-        # 1. 공유 백본을 통한 특징 추출
-        # feat_wide_tuple/feat_narrow_tuple: [P3_feat, P4_feat, P5_sppf_feat]
-        feat_wide_tuple = self.shared_backbone(x_wide)
-        feat_narrow_tuple = self.shared_backbone(x_narrow)
+        # 1. Siamese 비교를 위한 backbone feature 추출 및 임베딩 생성
+        siamese_emb_wide = self._extract_siamese_features(x_wide)
+        siamese_emb_narrow = self._extract_siamese_features(x_narrow)
 
-        # 2. Siamese 비교를 위한 특징 벡터 추출 및 프로젝션
-        siamese_emb_wide = self._extract_siamese_features(feat_wide_tuple)
-        siamese_emb_narrow = self._extract_siamese_features(feat_narrow_tuple)
-
-        # 3. Siamese 손실 계산 (학습 시에만 필요하나, 여기서 계산하여 반환 가능)
+        # 2. Siamese 손실 계산 (학습 시에만 필요하나, 여기서 계산하여 반환 가능)
         # 가정: x_wide와 x_narrow는 항상 동일한 장면의 "긍정적 쌍(positive pair)"
         # 따라서 코사인 유사도를 최대화 (target = 1)
         target_similarity = torch.ones(x_wide.size(0), device=siamese_emb_wide.device)
         loss_siamese = self.cosine_embedding_loss(siamese_emb_wide, siamese_emb_narrow, target_similarity)
 
-        # 4. 광각 이미지에 대한 객체 탐지 경로
-        # detection_head 대신 YOLOv8 공식 모델의 forward를 사용 (임시 해결)
+        # 3. Detection head는 YOLOv8 공식 모델의 forward를 그대로 사용
         detection_preds_wide = self.yolo_model(x_wide)
 
-        # print('DEBUG: detection_preds_wide type:', type(detection_preds_wide))
-        # print('DEBUG: detection_preds_wide:', detection_preds_wide)
         if self.training:
-            # 학습 시에는 (탐지 예측 결과, Siamese 손실) 반환
-            # 실제 탐지 손실 계산은 외부 학습 스크립트에서 이뤄짐
             return detection_preds_wide, loss_siamese
         else:
-            # 추론 시에는 광각 이미지에 대한 탐지 예측 결과만 반환
             return detection_preds_wide
