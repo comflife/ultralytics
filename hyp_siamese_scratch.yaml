@@ -2,7 +2,7 @@
 epochs: 150
 batch_size: 32
 imgsz: 640
-lr0: 0.0005       # Initial learning rate for AdamW
+lr0: 0.01
 momentum: 0.9     # AdamW beta1
 weight_decay: 0.0001 # AdamW weight decay
 
