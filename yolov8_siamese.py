@@ -162,6 +162,42 @@ class SiameseYOLOv8s(nn.Module):
         projected_features = self.siamese_projector(deepest_features)  # (batch_size, self.feature_dim)
         return projected_features
 
+    def get_narrow_roi_in_wide(self, batch_wide, narrow_K, wide_K, device):
+        # Assume batch_wide: (B, 3, H, W), narrow_K/wide_K: (3,3) np.ndarray
+        # Returns: mask (B, 1, H, W) torch.Tensor
+        import cv2
+        import numpy as np
+        B, C, H, W = batch_wide.shape
+        # Narrow 이미지 해상도는 wide와 동일하다고 가정 (입력 전 resize로 맞춘 경우)
+        corners = np.array([
+            [0, 0],
+            [W-1, 0],
+            [W-1, H-1],
+            [0, H-1]
+        ], dtype=np.float32).reshape(-1, 1, 2)
+        # undistort 없이 단순 투영(동일 위치/방향 가정)
+        # narrow_K, wide_K: np.ndarray
+        narrow_K_inv = np.linalg.inv(narrow_K)
+        wide_K = wide_K
+        points_cam = []
+        for pt in corners:
+            norm = np.dot(narrow_K_inv, np.array([pt[0][0], pt[0][1], 1.0]))
+            norm = norm / norm[2]
+            points_cam.append(norm)
+        points_cam = np.stack(points_cam, axis=0)  # (4, 3)
+        # wide 카메라로 투영
+        points_2d = []
+        for pt in points_cam:
+            proj = np.dot(wide_K, pt)
+            proj = proj / proj[2]
+            points_2d.append(proj[:2])
+        points_2d = np.stack(points_2d, axis=0).astype(np.int32)  # (4,2)
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(mask, [points_2d], 1)
+        mask = torch.from_numpy(mask).float().unsqueeze(0).to(device)  # (1, H, W)
+        mask = mask.unsqueeze(0).repeat(B, 1, 1, 1)  # (B,1,H,W)
+        return mask
+
     def forward(self, x_wide, x_narrow, targets_wide=None):
         """
         모델의 순전파 연산.
@@ -170,7 +206,7 @@ class SiameseYOLOv8s(nn.Module):
             x_wide (torch.Tensor): 광각 이미지 배치 (batch_size, 3, H, W).
             x_narrow (torch.Tensor): 협각 이미지 배치 (batch_size, 3, H, W).
             targets_wide (torch.Tensor, optional): 광각 이미지에 대한 타겟 값 (학습 시).
-                                                  Ultralytics 형식: (num_targets, 6) [batch_idx, cls_idx, x, y, w, h].
+                                               Ultralytics 형식: (num_targets, 6) [batch_idx, cls_idx, x, y, w, h].
 
         Returns:
             tuple: 학습 시에는 (detection_predictions_wide, loss_siamese) 반환.
@@ -178,19 +214,29 @@ class SiameseYOLOv8s(nn.Module):
                    detection_predictions_wide는 YOLO 헤드의 원시 출력입니다.
                    실제 손실 계산 및 후처리는 학습/추론 스크립트에서 수행됩니다.
         """
-        # 1. Siamese 비교를 위한 backbone feature 추출 및 임베딩 생성
-        siamese_emb_wide = self._extract_siamese_features(x_wide)
+        # --- camera intrinsic (예시, 실제론 __init__에서 받아야 함) ---
+        # narrow_K = np.array([[2651.127798, 0, 819.397071], [0, 2635.360938, 896.163803], [0, 0, 1]])
+        # wide_K = np.array([[559.258761, 0, 928.108242], [0, 565.348774, 518.787048], [0, 0, 1]])
+        # 실제론 self.narrow_K, self.wide_K로 관리 권장
+        narrow_K = getattr(self, 'narrow_K', None)
+        wide_K = getattr(self, 'wide_K', None)
+        if narrow_K is None or wide_K is None:
+            import numpy as np
+            narrow_K = np.array([[2651.127798, 0, 819.397071], [0, 2635.360938, 896.163803], [0, 0, 1]])
+            wide_K = np.array([[559.258761, 0, 928.108242], [0, 565.348774, 518.787048], [0, 0, 1]])
+            self.narrow_K = narrow_K
+            self.wide_K = wide_K
+        # --- wide 이미지에서 narrow view ROI만 마스킹 ---
+        mask = self.get_narrow_roi_in_wide(x_wide, self.narrow_K, self.wide_K, x_wide.device)  # (B,1,H,W)
+        x_wide_masked = x_wide * mask
+        # Siamese 임베딩
+        siamese_emb_wide = self._extract_siamese_features(x_wide_masked)
         siamese_emb_narrow = self._extract_siamese_features(x_narrow)
-
-        # 2. Siamese 손실 계산 (학습 시에만 필요하나, 여기서 계산하여 반환 가능)
-        # 가정: x_wide와 x_narrow는 항상 동일한 장면의 "긍정적 쌍(positive pair)"
-        # 따라서 코사인 유사도를 최대화 (target = 1)
+        # Siamese 손실
         target_similarity = torch.ones(x_wide.size(0), device=siamese_emb_wide.device)
         loss_siamese = self.cosine_embedding_loss(siamese_emb_wide, siamese_emb_narrow, target_similarity)
-
-        # 3. Detection head는 YOLOv8 공식 모델의 forward를 그대로 사용
+        # Detection
         detection_preds_wide = self.yolo_model(x_wide)
-
         if self.training:
             return detection_preds_wide, loss_siamese
         else:
