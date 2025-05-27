@@ -147,12 +147,9 @@ def train(opt):
         wandb.watch(model, log="all")
 
 
-    # --- Backbone freeze (전이학습 최적화, detection head만 학습) ---
-    backbone_end = model.yolo_model.save[-1] + 1
-    for param in model.yolo_model.model[:backbone_end].parameters():
-        param.requires_grad = False  # backbone freeze
-    for param in model.yolo_model.model[backbone_end:].parameters():
-        param.requires_grad = True   # detection head는 반드시 풀어줌
+    # --- Backbone 및 detection head 모두 학습 (백본도 trainable!) ---
+    for param in model.yolo_model.parameters():
+        param.requires_grad = True
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,} / {sum(p.numel() for p in model.parameters()):,}")
 

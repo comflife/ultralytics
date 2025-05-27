@@ -1,6 +1,5 @@
 path: /home/byounggun/ultralytics/traffics
-train: wide_narrow/train # train images (relative to 'path') 4 images
-val: wide_narrow/val # val images (relative to 'path') 4 images
+train: /home/byounggun/ultralytics/traffic_train/wide
 
 # Classes
 names:

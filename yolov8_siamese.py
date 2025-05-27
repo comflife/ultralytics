@@ -5,6 +5,7 @@ from ultralytics import YOLO
 from ultralytics.nn.tasks import DetectionModel # For potential type hints or structure reference
 from ultralytics.utils import LOGGER
 import os
+from pytorch_msssim import ssim, ms_ssim
 
 class SiameseYOLOv8s(nn.Module):
     def extract_backbone_features(self, x):
@@ -150,6 +151,9 @@ class SiameseYOLOv8s(nn.Module):
         # Siamese 손실 함수 (코사인 임베딩 손실)
         self.cosine_embedding_loss = nn.CosineEmbeddingLoss()
 
+        # SSIM 손실 함수
+        # self.ssim_loss = 
+
     def _extract_siamese_features(self, x):
         """
         입력 이미지를 받아 YOLOv8 backbone feature를 추출하고, Siamese projector에 통과시킴.
@@ -227,17 +231,38 @@ class SiameseYOLOv8s(nn.Module):
             self.narrow_K = narrow_K
             self.wide_K = wide_K
         # --- wide 이미지에서 narrow view ROI만 마스킹 ---
-        mask = self.get_narrow_roi_in_wide(x_wide, self.narrow_K, self.wide_K, x_wide.device)  # (B,1,H,W)
-        x_wide_masked = x_wide * mask
+        # mask = self.get_narrow_roi_in_wide(x_wide, self.narrow_K, self.wide_K, x_wide.device)  # (B,1,H,W)
+        # x_wide_masked = x_wide * mask
         # Siamese 임베딩
-        siamese_emb_wide = self._extract_siamese_features(x_wide_masked)
-        siamese_emb_narrow = self._extract_siamese_features(x_narrow)
-        # Siamese 손실
-        target_similarity = torch.ones(x_wide.size(0), device=siamese_emb_wide.device)
-        loss_siamese = self.cosine_embedding_loss(siamese_emb_wide, siamese_emb_narrow, target_similarity)
+        # siamese_emb_wide = self._extract_siamese_features(x_wide)
+        # siamese_emb_narrow = self._extract_siamese_features(x_narrow)
+        # # Siamese 손실
+        # target_similarity = torch.ones(x_wide.size(0), device=siamese_emb_wide.device)
+        # loss_siamese = self.cosine_embedding_loss(siamese_emb_wide, siamese_emb_narrow, target_similarity)
+
+        # YOLO backbone feature 추출
+        feat_wide = self.extract_backbone_features(x_wide)
+        feat_narrow = self.extract_backbone_features(x_narrow)
+        # 가장 깊은 feature map 사용 (예: P5)
+        if isinstance(feat_wide, (list, tuple)):
+            feat_wide = feat_wide[-1]
+            feat_narrow = feat_narrow[-1]
+        # Debug: requires_grad 체크
+        if not feat_wide.requires_grad or not feat_narrow.requires_grad:
+            from ultralytics.utils import LOGGER
+            LOGGER.warning(f"[SiameseYOLOv8s] Backbone features do not require grad! Check backbone train/freeze state.")
+        # SSIM 계산 전 feature map 정규화 ([0, 1] 범위)
+        def minmax_norm(x):
+            return (x - x.min()) / (x.max() - x.min() + 1e-8)
+        feat_wide_norm = minmax_norm(feat_wide)
+        feat_narrow_norm = minmax_norm(feat_narrow)
+        ssim_score_tensor = ssim(feat_wide_norm, feat_narrow_norm, data_range=1.0, size_average=False)
+        ssim_loss = 1 - ssim_score_tensor.mean()
+        total_ssim_loss = ssim_loss
+        
         # Detection
         detection_preds_wide = self.yolo_model(x_wide)
         if self.training:
-            return detection_preds_wide, loss_siamese
+            return detection_preds_wide, total_ssim_loss
         else:
             return detection_preds_wide
