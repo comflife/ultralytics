@@ -147,105 +147,55 @@ def train(opt):
         wandb.watch(model, log="all")
 
 
-    # Optimizer
-    # 백본 동결 (전이 학습 최적화)
-    LOGGER.info("Freezing backbone for transfer learning optimization...")
-    for param in model.yolo_model.model[:model.yolo_model.save[-1]+1].parameters():
-        param.requires_grad = False
-    
-    # 훈련 가능한 파라미터만 필터링
+    # --- Backbone freeze (전이학습 최적화, detection head만 학습) ---
+    backbone_end = model.yolo_model.save[-1] + 1
+    for param in model.yolo_model.model[:backbone_end].parameters():
+        param.requires_grad = False  # backbone freeze
+    for param in model.yolo_model.model[backbone_end:].parameters():
+        param.requires_grad = True   # detection head는 반드시 풀어줌
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     LOGGER.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,} / {sum(p.numel() for p in model.parameters()):,}")
-    
-    # AdamW 옵티마이저 사용 (SGD보다 일반적으로 더 효과적)
-    optimizer = optim.AdamW(trainable_params, lr=opt.lr0, weight_decay=opt.weight_decay, betas=(0.9, 0.999))
-    # optimizer = optim.SGD(trainable_params, lr=opt.lr0, weight_decay=opt.weight_decay, momentum=0.9)
-    
-    # OneCycleLR 스케줄러 (학습률을 동적으로 조정하여 수렴 속도 향상)
-    steps_per_epoch = len(train_loader)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=opt.lr0, 
-        epochs=opt.epochs, 
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.3,  # 최대 학습률까지 상승하는 시간 비율
-        div_factor=10,  # 초기 학습률 = max_lr/div_factor
-        final_div_factor=10000  # 최종 학습률 = max_lr/(div_factor*final_div_factor)
-    )
+
+    optimizer = optim.AdamW(trainable_params, lr=opt.lr0, weight_decay=opt.weight_decay)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=opt.lr0, total_steps=opt.epochs * len(train_loader))
 
     LOGGER.info(f"{colorstr('Starting training:')} for {opt.epochs} epochs on {device} device...")
     LOGGER.info(f"Hyperparameters: {vars(opt)}") # Log all options
     best_total_loss = float('inf')
     last_opt_step = -1 # For EMA if implemented
-    
-    # Set model in training mode
-    best_total_loss = float('inf')
-    unfreeze_epoch = 1  # 5에폭 이후 백본 동결 해제
     # log_batch_interval 옵션이 없으면 기본값 설정
     if not hasattr(opt, 'log_batch_interval'):
         opt.log_batch_interval = 50
 
     for epoch in range(opt.epochs):
-        if wandb is not None:
-            wandb.log({"epoch": epoch}, step=epoch)
-
-        # 백본 동결 해제 로직: 초기 에폭에서는 백본을 고정하고, 이후에 전체 모델을 미세 조정
-        if epoch == unfreeze_epoch:
-            LOGGER.info(f"Unfreezing backbone at epoch {epoch+1} for fine-tuning...")
-            for param in model.yolo_model.model[:model.yolo_model.save[-1]+1].parameters():
-                param.requires_grad = True
-            
-            # 모든 파라미터를 학습 가능하게 설정한 후 옵티마이저 재설정
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            LOGGER.info(f"Trainable parameters after unfreezing: {sum(p.numel() for p in trainable_params):,}")
-            
-            # 백본 동결 해제 후 학습률 조정 (더 낮은 학습률로 미세 조정)
-            for g in optimizer.param_groups:
-                g['lr'] = opt.lr0 / 1  # 백본 미세 조정을 위해 더 낮은 학습률 사용
         model.train()
         epoch_loss_total_sum = 0.0
         epoch_loss_detect_sum = 0.0
         epoch_loss_siamese_sum = 0.0
-        
-        # tqdm progress bar
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{opt.epochs}", bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')
-        
-        optimizer.zero_grad() # Zero gradients once per epoch or N iterations
         for i, (wide_imgs, narrow_imgs, wide_targets) in progress_bar:
-            # Data to device
             wide_imgs = wide_imgs.to(device, non_blocking=True)
             narrow_imgs = narrow_imgs.to(device, non_blocking=True)
-            wide_targets = wide_targets.to(device, non_blocking=True) # Format: (total_objs, 6) [batch_idx, cls, x, y, w, h]
-
-            # Forward pass
+            wide_targets = wide_targets.to(device, non_blocking=True)
+            optimizer.zero_grad()
             with torch.cuda.amp.autocast(enabled=amp):
-                # Forward pass through the model
                 detection_preds_wide, siamese_loss = model(wide_imgs, narrow_imgs)
-
-                # detection_preds_wide가 list/tuple이면 전체를 loss에 넘김
                 if isinstance(detection_preds_wide, (list, tuple)):
                     pred = detection_preds_wide
                 else:
                     pred = detection_preds_wide
-
-                
-                # 손실 가중치 설정
                 box_gain = opt.box_gain if hasattr(opt, 'box_gain') else 7.5
                 cls_gain = opt.cls_gain if hasattr(opt, 'cls_gain') else 0.5
                 dfl_gain = opt.dfl_gain if hasattr(opt, 'dfl_gain') else 1.5
-                
-                # pred가 list면 pred[0].device, 아니면 pred.device
                 if isinstance(pred, list):
                     device = pred[0].device
                 else:
                     device = pred.device
                 h = model.yolo_model.model[-1]
-                nc = model.nc  # 클래스 수
-                
-                # 공식 YOLOv8 detection loss 사용
+                nc = model.nc
                 if len(wide_targets):
                     loss_detect_val, loss_items_detect = detection_criterion(
-                        detection_preds_wide,  # preds가 첫 번째 인자
+                        detection_preds_wide,
                         {
                             'img': wide_imgs,
                             'cls': wide_targets[:, 1:2],
@@ -254,65 +204,42 @@ def train(opt):
                         }
                     )
                     loss_box, loss_cls, loss_dfl = loss_items_detect[0], loss_items_detect[1], loss_items_detect[2]
-                # else:
-                #     loss_detect_val = torch.tensor(0.0, device=device)
-                #     loss_box = torch.tensor(0.0, device=device)
-                #     loss_cls = torch.tensor(0.0, device=device)
-                #     loss_dfl = torch.tensor(0.0, device=device)
-            
-            # Combine losses using weights from opt (both should be scalars now)
-            total_loss = opt.detect_loss_weight * (box_gain * loss_box + cls_gain * loss_cls + dfl_gain * loss_dfl) + opt.siamese_loss_weight * siamese_loss
-
-            # 디버깅: 첫 배치에서 feature, label 등 shape/log 찍기
-            if epoch == 0 and i == 0:
-                print("[DEBUG] wide_imgs:", wide_imgs.shape, wide_imgs.min().item(), wide_imgs.max().item())
-                print("[DEBUG] wide_targets:", wide_targets[:5])
-                if 'detection_preds_wide' in locals():
-                    if isinstance(detection_preds_wide, (list, tuple)):
-                        print("[DEBUG] detection_preds_wide[0].shape:", detection_preds_wide[0].shape)
-                    else:
-                        print("[DEBUG] detection_preds_wide.shape:", detection_preds_wide.shape)
-                print("[DEBUG] loss_box:", loss_box.item(), "loss_cls:", loss_cls.item(), "loss_dfl:", loss_dfl.item())
-                print("[DEBUG] siamese_loss:", siamese_loss.item())
-                if wandb is not None:
-                    wandb.log({
-                        "debug/wide_imgs_min": wide_imgs.min().item(),
-                        "debug/wide_imgs_max": wide_imgs.max().item(),
-                        "debug/loss_box": loss_box.item(),
-                        "debug/loss_cls": loss_cls.item(),
-                        "debug/loss_dfl": loss_dfl.item(),
-                        "debug/siamese_loss": siamese_loss.item(),
-                    }, step=epoch*len(progress_bar)+i)
-
+                total_loss = opt.detect_loss_weight * (box_gain * loss_box + cls_gain * loss_cls + dfl_gain * loss_dfl) + opt.siamese_loss_weight * siamese_loss
             if not torch.all(torch.isfinite(total_loss)):
                 LOGGER.warning(f"WARNING: Non-finite loss detected: {total_loss} at epoch {epoch+1}, batch {i}. Skipping this batch.")
                 if wandb is not None:
-                    wandb.log({"warning/nonfinite_loss": total_loss.item()}, step=epoch*len(progress_bar)+i)
-                optimizer.zero_grad() # Clear gradients for this problematic batch
+                    wandb.log({"warning/nonfinite_loss": total_loss.item()}, step=epoch*len(train_loader)+i)
+                optimizer.zero_grad()
                 continue
-
-            # AMP Backward pass
             scaler.scale(total_loss).backward()
-
-            # 배치 동안의 손실 저장
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
             epoch_loss_total_sum += total_loss.item()
             epoch_loss_detect_sum += loss_detect_val.sum().item()
             epoch_loss_siamese_sum += siamese_loss.item()
-
-            # wandb 로깅 (매 배치)
             if wandb is not None:
                 wandb.log({
-                    "loss/total": total_loss.item(),
-                    "loss/detect": loss_detect_val.sum().item() if hasattr(loss_detect_val, 'sum') else float(loss_detect_val),
-                    "loss/box": loss_box.item() if hasattr(loss_box, 'item') else float(loss_box),
-                    "loss/cls": loss_cls.item() if hasattr(loss_cls, 'item') else float(loss_cls),
-                    "loss/dfl": loss_dfl.item() if hasattr(loss_dfl, 'item') else float(loss_dfl),
-                    "loss/siamese": siamese_loss.item() if hasattr(siamese_loss, 'item') else float(siamese_loss),
-                    "lr": optimizer.param_groups[0]['lr'],
-                    "batch": i,
-                    "epoch": epoch
-                }, step=epoch*len(progress_bar)+i)
-
+                    'step': epoch * len(train_loader) + i,
+                    'epoch': epoch + 1,
+                    'batch': i,
+                    'loss/total': total_loss.item(),
+                    'loss/detect': loss_detect_val.sum().item() if hasattr(loss_detect_val, 'sum') else float(loss_detect_val),
+                    'loss/box': loss_box.item() if hasattr(loss_box, 'item') else float(loss_box),
+                    'loss/cls': loss_cls.item() if hasattr(loss_cls, 'item') else float(loss_cls),
+                    'loss/dfl': loss_dfl.item() if hasattr(loss_dfl, 'item') else float(loss_dfl),
+                    'loss/siamese': siamese_loss.item() if hasattr(siamese_loss, 'item') else float(siamese_loss),
+                    'lr': optimizer.param_groups[0]['lr'],
+                })
+            progress_bar.set_postfix({
+                'total': f"{total_loss.item():.3f}",
+                'detect': f"{loss_detect_val.sum().item() if hasattr(loss_detect_val, 'sum') else float(loss_detect_val):.3f}",
+                'box': f"{loss_box.item() if hasattr(loss_box, 'item') else float(loss_box):.3f}",
+                'cls': f"{loss_cls.item() if hasattr(loss_cls, 'item') else float(loss_cls):.3f}",
+                'dfl': f"{loss_dfl.item() if hasattr(loss_dfl, 'item') else float(loss_dfl):.3f}",
+                'siamese': f"{siamese_loss.item() if hasattr(siamese_loss, 'item') else float(siamese_loss):.3f}"
+            })
+            LOGGER.info(f"Epoch {epoch+1}/{opt.epochs}, batch {i}/{len(train_loader)}, lr={optimizer.param_groups[0]['lr']:.6f}, total={total_loss.item():.3f}, siamese={siamese_loss.item() if hasattr(siamese_loss, 'item') else float(siamese_loss):.3f}, box={loss_box.item() if hasattr(loss_box, 'item') else float(loss_box):.3f}, cls={loss_cls.item() if hasattr(loss_cls, 'item') else float(loss_cls):.3f}, dfl={loss_dfl.item() if hasattr(loss_dfl, 'item') else float(loss_dfl):.3f}, siamese={siamese_loss.item() if hasattr(siamese_loss, 'item') else float(siamese_loss):.3f}")
             # 그래디언트 업데이트 및 옵티마이저 스텝
             if (i + 1) % opt.grad_accum_steps == 0 or i == len(progress_bar) - 1:
                 scaler.step(optimizer) # 모델 파라미터 업데이트
