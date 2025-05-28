@@ -19,6 +19,13 @@ from ultralytics.utils.torch_utils import de_parallel
 from ultralytics.utils.loss import v8DetectionLoss
 from dataload_dual import DualImageDataset, get_dual_train_transforms, get_dual_val_transforms, dual_collate_fn
 
+# wandb import with fallback
+try:
+    import wandb
+except ImportError:
+    wandb = None
+    LOGGER.warning("Wandb is not installed. Wandb logging is disabled.")
+
 # --- 모델 정의 ---
 class DualYOLOv8(nn.Module):
     def __init__(self, yolo_weights_path='yolov8s.pt', args=None):
@@ -74,8 +81,8 @@ class DualYOLOv8(nn.Module):
             else:
                 xw_in = y_wide[m.f] if isinstance(m.f, int) else [y_wide[j] for j in m.f]
                 xn_in = y_narrow[m.f] if isinstance(m.f, int) else [y_narrow[j] for j in m.f]
-            print(f"[DUAL][WIDE] Layer {i} ({type(m).__name__}): input shape {xw_in.shape if isinstance(xw_in, torch.Tensor) else [t.shape for t in xw_in]}")
-            print(f"[DUAL][NARROW] Layer {i} ({type(m).__name__}): input shape {xn_in.shape if isinstance(xn_in, torch.Tensor) else [t.shape for t in xn_in]}")
+            # print(f"[DUAL][WIDE] Layer {i} ({type(m).__name__}): input shape {xw_in.shape if isinstance(xw_in, torch.Tensor) else [t.shape for t in xw_in]}")
+            # print(f"[DUAL][NARROW] Layer {i} ({type(m).__name__}): input shape {xn_in.shape if isinstance(xn_in, torch.Tensor) else [t.shape for t in xn_in]}")
             xw_out = m(xw_in)
             xn_out = m(xn_in)
             y_wide.append(xw_out)
@@ -171,7 +178,7 @@ def train(opt):
     for k, v in defaults.items():
         if k not in hyp_dict or hyp_dict[k] is None:
             hyp_dict[k] = v
-    print("[DEBUG] Final hyp_dict:", hyp_dict)
+    # print("[DEBUG] Final hyp_dict:", hyp_dict)
     hyp = SimpleNamespace(**hyp_dict)
     # box, cls, dfl이 없으면 box_gain, cls_gain, dfl_gain에서 속성으로 할당
     for k, v in {"box": 7.5, "cls": 0.5, "dfl": 1.5}.items():
@@ -193,7 +200,24 @@ def train(opt):
                 setattr(loss_fn.hyp, k, getattr(loss_fn.hyp, alt_key))
             else:
                 setattr(loss_fn.hyp, k, v)
-    print("[DEBUG] patched loss_fn.hyp:", loss_fn.hyp)
+    # print("[DEBUG] patched loss_fn.hyp:", loss_fn.hyp)
+
+    # ... (학습 루프 및 기타 코드) ...
+    # 학습 종료 후 wandb 종료
+    if wandb is not None and opt.wandb:
+        wandb.finish()
+
+    # wandb experiment logging (학습 시작 직전!)
+    if wandb is not None and opt.wandb:
+        wandb_project = os.path.basename(opt.project.rstrip('/')) if hasattr(opt, 'project') else 'yolov8-dual'
+        wandb.init(
+            project=wandb_project,
+            name=opt.name if hasattr(opt, "name") else "exp",
+            config=vars(opt)
+        )
+        LOGGER.info(f"Initialized wandb run: {wandb.run.id}")
+    else:
+        LOGGER.warning("Wandb logging is disabled (either wandb is not installed or --wandb not set).")
 
     for epoch in range(opt.epochs):
         pbar = tqdm(train_loader, desc="Epoch {} / {}".format(epoch+1, opt.epochs))
@@ -227,10 +251,29 @@ def train(opt):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            log_dict = {
+                "train/loss": loss.item(),
+                "epoch": epoch + 1,
+                "step": batch_idx + 1,
+                "lr": optimizer.param_groups[0]['lr'],
+            }
+            if isinstance(loss_items, (list, tuple)):
+                for i, v in enumerate(loss_items):
+                    log_dict[f"train/loss_item_{i}"] = v
+            if wandb is not None and opt.wandb:
+                wandb.log(log_dict)
+                LOGGER.info(f"[wandb] Logged step={batch_idx+1}, epoch={epoch+1}, loss={loss.item():.4f}")
             pbar.set_postfix({"loss": loss.item()})
-        LOGGER.info("Epoch {} completed.".format(epoch+1))
-    torch.save(model.state_dict(), os.path.join(save_dir, "dual_yolov8_final.pth"))
-    LOGGER.info("Model saved to {}".format(os.path.join(save_dir, 'dual_yolov8_final.pth')))
+        LOGGER.info(f"Epoch {epoch+1} completed.")
+        # 모델 체크포인트 저장 (10의 배수 epoch만, .pt 확장자)
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == opt.epochs:
+            ckpt_path = os.path.join(save_dir, f"dual_yolov8_epoch{epoch+1}.pt")
+            torch.save(model.state_dict(), ckpt_path)
+            LOGGER.info(f"Model checkpoint saved to {ckpt_path}")
+    # 마지막 모델 저장 (.pt 확장자)
+    final_path = os.path.join(save_dir, "dual_yolov8_final.pt")
+    torch.save(model.state_dict(), final_path)
+    LOGGER.info(f"Final model saved to {final_path}")
 
 def parse_opt():
     parser = argparse.ArgumentParser()
@@ -246,6 +289,7 @@ def parse_opt():
     parser.add_argument('--project', type=str, default='runs/dual')
     parser.add_argument('--name', type=str, default='exp')
     parser.add_argument('--device', type=str, default='')
+    parser.add_argument('--wandb', action='store_true', help='use Weights & Biases logging')
     return parser.parse_args()
 
 if __name__ == '__main__':
