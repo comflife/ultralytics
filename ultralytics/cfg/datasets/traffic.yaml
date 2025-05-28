@@ -1,6 +1,4 @@
-path: /home/byounggun/ultralytics/traffics
-train: /home/byounggun/ultralytics/traffic_train/wide
-
+nc: 10
 # Classes
 names:
   0 : Green
