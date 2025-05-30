@@ -12,14 +12,23 @@ class DualImageDataset(Dataset):
     """
     Wide/Narrow 이미지 페어를 반환하는 데이터셋. 라벨은 wide에만 존재.
     """
-    def __init__(self, wide_img_dir, narrow_img_dir, label_dir, img_size=640, transform=None, prefix=""):
-        self.wide_img_dir = wide_img_dir
-        self.narrow_img_dir = narrow_img_dir
-        self.label_dir = label_dir  # For wide images only
+    def __init__(self, wide_img_dir=None, narrow_img_dir=None, label_dir=None, img_size=640, transform=None, prefix="", sample_ratio=1.0,
+                 wide_image_paths=None, narrow_image_paths=None, label_paths=None):
         self.img_size = img_size
         self.transform = transform
         self.prefix = prefix
+        self.sample_ratio = sample_ratio
 
+        # 리스트 직접 전달 시 (자동 분할/외부 split 등)
+        if wide_image_paths is not None and narrow_image_paths is not None and label_paths is not None:
+            self.wide_image_paths = wide_image_paths
+            self.narrow_image_paths = narrow_image_paths
+            self.label_paths = label_paths
+            return
+
+        self.wide_img_dir = wide_img_dir
+        self.narrow_img_dir = narrow_img_dir
+        self.label_dir = label_dir  # For wide images only
         self.wide_image_paths = []
         self.narrow_image_paths = []
         self.label_paths = []
@@ -53,6 +62,16 @@ class DualImageDataset(Dataset):
                 self.narrow_image_paths.append(narrow_path_found)
                 self.label_paths.append(label_path)
 
+        # 샘플 비율 적용 (random, deterministic)
+        if 0 < self.sample_ratio < 1.0:
+            import random
+            random.seed(42)
+            n = int(len(self.wide_image_paths) * self.sample_ratio)
+            idxs = random.sample(range(len(self.wide_image_paths)), n)
+            self.wide_image_paths = [self.wide_image_paths[i] for i in idxs]
+            self.narrow_image_paths = [self.narrow_image_paths[i] for i in idxs]
+            self.label_paths = [self.label_paths[i] for i in idxs]
+
     def __len__(self):
         return len(self.wide_image_paths)
 
@@ -81,21 +100,21 @@ class DualImageDataset(Dataset):
             "labels": torch.from_numpy(labels).float()
         }
 
-def get_dual_train_transforms(img_size):
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.HorizontalFlip(p=0.5),
-        A.ColorJitter(p=0.3),
-        A.Normalize(),
-        ToTensorV2(transpose_mask=True),
-    ], additional_targets={"image1": "image"})
+# def get_dual_train_transforms(img_size):
+#     return A.Compose([
+#         A.Resize(img_size, img_size),
+#         A.HorizontalFlip(p=0.5),
+#         A.ColorJitter(p=0.3),
+#         A.Normalize(),
+#         ToTensorV2(transpose_mask=True),
+#     ], additional_targets={"image1": "image"})
 
-def get_dual_val_transforms(img_size):
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(),
-        ToTensorV2(transpose_mask=True),
-    ], additional_targets={"image1": "image"})
+# def get_dual_val_transforms(img_size):
+#     return A.Compose([
+#         A.Resize(img_size, img_size),
+#         A.Normalize(),
+#         ToTensorV2(transpose_mask=True),
+#     ], additional_targets={"image1": "image"})
 
 def dual_collate_fn(batch):
     wide_imgs = torch.stack([b["wide_img"] for b in batch])
