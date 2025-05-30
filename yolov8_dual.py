@@ -29,6 +29,30 @@ except ImportError:
     LOGGER.warning("Wandb is not installed. Wandb logging is disabled.")
 
 # --- 모델 정의 ---
+def get_default_fusion_bbox(xw_out):
+    """
+    xw_out: (B, C, H, W) or (C, H, W)
+    Returns (fx_min, fx_max, fy_min, fy_max) for the central square region.
+    """
+    if isinstance(xw_out, torch.Tensor):
+        shape = xw_out.shape
+        if len(shape) == 4:
+            _, C, H, W = shape
+        elif len(shape) == 3:
+            C, H, W = shape
+        else:
+            raise ValueError("xw_out must be (B,C,H,W) or (C,H,W)")
+    else:
+        raise ValueError("xw_out must be a torch.Tensor")
+    region_size = min(H, W) // 2
+    fx_min = (W - region_size) // 2
+    fx_max = fx_min + region_size
+    fy_min = (H - region_size) // 2
+    fy_max = fy_min + region_size
+    return fx_min, fx_max, fy_min, fy_max
+
+__all__ = ["DualYOLOv8", "get_default_fusion_bbox"]
+
 class DualYOLOv8(nn.Module):
     def __init__(self, yolo_weights_path='yolov8s.pt', args=None,
                  wide_K=None, wide_P=None, narrow_K=None, narrow_P=None, img_w=1920, img_h=1080, img_size=640):
@@ -65,20 +89,18 @@ class DualYOLOv8(nn.Module):
         self.img_size = img_size if img_size is not None else (args.img_size if args and hasattr(args, 'img_size') else 640)
 
         # --- Feature Fusion Normalization & Learnable Weights (Multi-Scale) ---
-        # Use separate BN for wide/narrow at each fusion scale
-        # Try to get out_channels for each fusion point robustly
+        # Use separate BN for wide/narrow at each fusion scale (YOLOv8 official style)
         fusion_channels = []
         for i in self.save:
             layer = self.model[i]
-            # Try common attributes
             if hasattr(layer, 'out_channels'):
                 fusion_channels.append(layer.out_channels)
             elif hasattr(layer, 'cv2') and hasattr(layer.cv2, 'out_channels'):
                 fusion_channels.append(layer.cv2.out_channels)
-            
         self.fusion_bn_wide = nn.ModuleList([nn.BatchNorm2d(c) for c in fusion_channels])
         self.fusion_bn_narrow = nn.ModuleList([nn.BatchNorm2d(c) for c in fusion_channels])
         self.fusion_weight = nn.Parameter(torch.ones(len(self.save), 2) * 0.5, requires_grad=True)
+        # [Manual normalization (min-max, F.normalize, etc) is NOT used. Only BN as in YOLOv8.]
 
     def project_narrow_to_wide(self):
         """
@@ -145,23 +167,16 @@ class DualYOLOv8(nn.Module):
             y_narrow.append(xn_out)
             # --- 마지막 backbone output에서 spatial sum 적용 ---
             if i == self.save[-1]:
-                # wide_corners (img_size 기준 polygon) → bbox 변환
-                x_min, y_min = wide_corners.min(axis=0)
-                x_max, y_max = wide_corners.max(axis=0)
                 B, C, H, W = xw_out.shape
-                # feature map 좌표로 변환
-                scale_fx = W / self.img_size
-                scale_fy = H / self.img_size
-                fx_min = int(round(x_min * scale_fx))
-                fy_min = int(round(y_min * scale_fy))
-                fx_max = int(round(x_max * scale_fx))
-                fy_max = int(round(y_max * scale_fy))
+                fx_min, fx_max, fy_min, fy_max = get_default_fusion_bbox(xw_out)
+                region_w = fx_max - fx_min
+                region_h = fy_max - fy_min
+                print(f"[DEBUG] [NO PROJ] fusion bbox: fx_min={fx_min}, fx_max={fx_max}, fy_min={fy_min}, fy_max={fy_max}, width={region_w}, height={region_h}")
+                # === END [NO PROJ] ===
                 # narrow feature를 해당 영역 크기로 resize
                 narrow_region = torch.nn.functional.interpolate(
-                    xn_out, size=(fy_max-fy_min, fx_max-fx_min), mode='bilinear', align_corners=False
+                    xn_out, size=(region_h, region_w), mode='bilinear', align_corners=False
                 )
-                print(f"[DEBUG] narrow_region shape after resize: {narrow_region.shape}")
-                # narrow_region을 전체 zero tensor에 복사해서 shape 맞추기
                 narrow_full = torch.zeros_like(xw_out)
                 narrow_full[..., fy_min:fy_max, fx_min:fx_max] = narrow_region
                 # wide feature와 합성 (Multi-Scale BN, Learnable Weighted Sum)
