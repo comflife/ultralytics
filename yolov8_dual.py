@@ -17,7 +17,9 @@ from ultralytics.utils import LOGGER, colorstr
 from ultralytics.utils.checks import check_amp, print_args
 from ultralytics.utils.torch_utils import de_parallel
 from ultralytics.utils.loss import v8DetectionLoss
-from dataload_dual import DualImageDataset, get_dual_train_transforms, get_dual_val_transforms, dual_collate_fn
+# from dataload_dual import DualImageDataset, get_dual_train_transforms, get_dual_val_transforms, dual_collate_fn
+from dataload_dual import DualImageDataset, dual_collate_fn
+import numpy as np
 
 # wandb import with fallback
 try:
@@ -28,15 +30,14 @@ except ImportError:
 
 # --- 모델 정의 ---
 class DualYOLOv8(nn.Module):
-    def __init__(self, yolo_weights_path='yolov8s.pt', args=None):
+    def __init__(self, yolo_weights_path='yolov8s.pt', args=None,
+                 wide_K=None, wide_P=None, narrow_K=None, narrow_P=None, img_w=1920, img_h=1080):
         super().__init__()
         from ultralytics import YOLO
-        # 커스텀 yaml 사용 (dual 구조)
         yolo_model_full = YOLO('/home/byounggun/ultralytics/ultralytics/cfg/models/v8/yolov8.yaml')
         self.yolo_model = yolo_model_full.model  # DetectionModel
         self.model = self.yolo_model.model  # for v8DetectionLoss compatibility (nn.ModuleList)
         self.stride = self.yolo_model.stride
-        # --- 클래스 수 및 클래스명 traffic.yaml에서 로드 ---
         import yaml
         dataset_yaml = 'ultralytics/cfg/datasets/traffic.yaml'
         self.nc = None
@@ -47,7 +48,6 @@ class DualYOLOv8(nn.Module):
             if isinstance(data_yaml, dict):
                 self.nc = data_yaml.get('nc', None)
                 self.names = data_yaml.get('names', None)
-        # fallback: Detect head/YOLO wrapper에서 가져오기
         detect_head = self.model[-1]
         if self.nc is None:
             self.nc = getattr(detect_head, 'nc', getattr(self.yolo_model, 'nc', None))
@@ -55,7 +55,45 @@ class DualYOLOv8(nn.Module):
             self.names = getattr(detect_head, 'names', getattr(self.yolo_model, 'names', None))
         self.save = self.yolo_model.save  # backbone output indices for multi-scale features
         self.args = args
-        # Detect/neck 채널 자동 교체 코드 제거 (yaml에서 이미 구조 반영)
+        # --- 카메라 파라미터 저장 ---
+        self.wide_K = wide_K
+        self.wide_P = wide_P
+        self.narrow_K = narrow_K
+        self.narrow_P = narrow_P
+        self.img_w = img_w
+        self.img_h = img_h
+        # --- Feature Fusion Normalization & Learnable Weights ---
+        # Assume last backbone out channel is 256 (update if different)
+        self.fusion_bn = nn.BatchNorm2d(256)
+        self.fusion_weight = nn.Parameter(torch.tensor([0.5, 0.5]), requires_grad=True)
+
+    def project_narrow_to_wide(self):
+        """
+        narrow 이미지의 4개 코너를 wide 이미지 평면에 투영하여 wide_corners(1920x1080 기준, float32, (4,2)) 반환
+        """
+        narrow_corners = np.array([
+            [0, 0],
+            [self.img_w-1, 0],
+            [self.img_w-1, self.img_h-1],
+            [0, self.img_h-1]
+        ], dtype=np.float32)
+        narrow_K_inv = np.linalg.inv(self.narrow_K)
+        rays = []
+        for u, v in narrow_corners:
+            pixel = np.array([u, v, 1.0])
+            ray = narrow_K_inv @ pixel
+            ray = ray / ray[2]
+            rays.append(ray)
+        rays = np.stack(rays, axis=0)  # (4, 3)
+        wide_corners = []
+        for ray in rays:
+            X, Y, Z = ray[0], ray[1], 1.0
+            pt3d_wide = np.array([X, Y + 0.2, Z, 1.0])  # y축 오프셋(42mm=0.042m, 단위 맞춰서 조정)
+            proj = self.wide_P @ pt3d_wide
+            proj = proj / proj[2]
+            wide_corners.append([proj[0], proj[1]])
+        wide_corners = np.array(wide_corners, dtype=np.float32)  # (4,2)
+        return wide_corners
 
     def extract_single_backbone_feature(self, x, save_idx):
         # x를 backbone에 통과시켜 save_idx에 해당하는 feature만 추출
@@ -69,33 +107,82 @@ class DualYOLOv8(nn.Module):
                 return x
 
     def forward(self, wide_img, narrow_img):
-        # 1. backbone만 wide/narrow 각각 forward
+        """
+        wide_img, narrow_img: (B, 3, 640, 640)
+        카메라 파라미터 기반으로 narrow FOV가 wide feature map에서 어디에 위치하는지 계산 후 sum
+        """
+        # 1. narrow의 4개 코너를 wide로 투영
+        wide_corners = self.project_narrow_to_wide()  # (4,2) 1920x1080 기준
+        # 2. 640x640 변환
+        scale_x = 640 / 1920
+        scale_y = 640 / 1080
+        wide_corners_640 = np.stack([[x*scale_x, y*scale_y] for x, y in wide_corners], axis=0)  # (4,2)
         y_wide, y_narrow = [], []
-        y = [None] * len(self.model)
+        y = []
+        save_outputs = dict()  # model idx -> y idx
         x_wide, x_narrow = wide_img, narrow_img
         for i, m in enumerate(self.model[:self.save[-1]+1]):
-            # YOLOv8 공식 from(f) 해석: -1이면 직전 output, 아니면 y_wide[m.f]
             if not hasattr(m, 'f') or m.f == -1:
                 xw_in = y_wide[-1] if len(y_wide) > 0 else x_wide
                 xn_in = y_narrow[-1] if len(y_narrow) > 0 else x_narrow
             else:
                 xw_in = y_wide[m.f] if isinstance(m.f, int) else [y_wide[j] for j in m.f]
                 xn_in = y_narrow[m.f] if isinstance(m.f, int) else [y_narrow[j] for j in m.f]
-            # print(f"[DUAL][WIDE] Layer {i} ({type(m).__name__}): input shape {xw_in.shape if isinstance(xw_in, torch.Tensor) else [t.shape for t in xw_in]}")
-            # print(f"[DUAL][NARROW] Layer {i} ({type(m).__name__}): input shape {xn_in.shape if isinstance(xn_in, torch.Tensor) else [t.shape for t in xn_in]}")
             xw_out = m(xw_in)
             xn_out = m(xn_in)
             y_wide.append(xw_out)
             y_narrow.append(xn_out)
-            if i in self.save:
-                y[i] = xw_out + xn_out
+            # --- 마지막 backbone output에서 spatial sum 적용 ---
+            if i == self.save[-1]:
+                # wide_corners_640 polygon → bbox 변환
+                x_min, y_min = wide_corners_640.min(axis=0)
+                x_max, y_max = wide_corners_640.max(axis=0)
+                B, C, H, W = xw_out.shape
+                # feature map 좌표로 변환
+                scale_fx = W / 640
+                scale_fy = H / 640
+                fx_min = int(round(x_min * scale_fx))
+                fy_min = int(round(y_min * scale_fy))
+                fx_max = int(round(x_max * scale_fx))
+                fy_max = int(round(y_max * scale_fy))
+                # narrow feature를 해당 영역 크기로 resize
+                narrow_region = torch.nn.functional.interpolate(
+                    xn_out, size=(fy_max-fy_min, fx_max-fx_min), mode='bilinear', align_corners=False
+                )
+                print(f"[DEBUG] narrow_region shape after resize: {narrow_region.shape}")
+                # narrow_region을 전체 zero tensor에 복사해서 shape 맞추기
+                narrow_full = torch.zeros_like(xw_out)
+                narrow_full[..., fy_min:fy_max, fx_min:fx_max] = narrow_region
+                # wide feature와 합성
+                # --- BatchNorm, Learnable Weighted Sum ---
+                xw_out_bn = self.fusion_bn(xw_out)
+                narrow_full_bn = self.fusion_bn(narrow_full)
+                fusion_weight = torch.softmax(self.fusion_weight, dim=0)
+                xw_out_spatial = fusion_weight[0] * xw_out_bn + fusion_weight[1] * narrow_full_bn
+                print(f"[DEBUG] xw_out_spatial shape after sum: {xw_out_spatial.shape}")
+                y.append(xw_out_spatial)
+                save_outputs[i] = len(y) - 1
+            elif i in self.save:
+                y.append(xw_out)
+                save_outputs[i] = len(y) - 1
+        # neck/head 들어가기 전에 NoneType 체크
+        for idx, item in enumerate(y):
+            if item is None:
+                print(f"[ERROR] y[{idx}] is None before neck/head! y: {[type(x) for x in y]}")
+            elif hasattr(item, 'shape'):
+                print(f"[DEBUG] y[{idx}] shape: {item.shape}")
+            else:
+                print(f"[DEBUG] y[{idx}] type: {type(item)})")
         # 2. neck/head: summed_features부터 시작, y에 계속 append
         for i in range(self.save[-1]+1, len(self.model)):
             m = self.model[i]
             if not hasattr(m, 'f') or m.f == -1:
                 x_in = y[-1]
             else:
-                x_in = y[m.f] if isinstance(m.f, int) else [y[j] for j in m.f]
+                if isinstance(m.f, int):
+                    x_in = y[save_outputs[m.f]]
+                else:
+                    x_in = [y[save_outputs[j]] for j in m.f]
             out = m(x_in)
             y.append(out)
         return y[-1]
@@ -144,6 +231,31 @@ def train(opt):
             return list(wide), list(narrow), list(label)
         return unzip(train_files), unzip(val_files)
 
+    # --- 카메라 파라미터 직접 선언 ---
+    import numpy as np
+    # Wide 카메라
+    wide_K = np.array([
+        [559.258761, 0, 928.108242],
+        [0, 565.348774, 518.787048],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    wide_P = np.array([
+        [535.711792, 0, 924.086569, 0],
+        [0, 558.997375, 510.222325, 0],
+        [0, 0, 1, 0]
+    ], dtype=np.float32)
+    # Narrow 카메라
+    narrow_K = np.array([
+        [2651.127798, 0, 819.397071],
+        [0, 2635.360938, 896.163803],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    narrow_P = np.array([
+        [2407.709780, 0, 801.603047, 0],
+        [0, 2544.697607, 897.250521, 0],
+        [0, 0, 1, 0]
+    ], dtype=np.float32)
+
     # val 인자가 없으면 자동 분할, 있으면 기존 방식
     if (not hasattr(opt, 'wide_img_dir_val') or not opt.wide_img_dir_val) and \
        (not hasattr(opt, 'narrow_img_dir_val') or not opt.narrow_img_dir_val) and \
@@ -153,11 +265,11 @@ def train(opt):
             opt.wide_img_dir_train, opt.narrow_img_dir_train, opt.label_dir_train, split_ratio=0.1, seed=42)
         train_dataset = DualImageDataset(
             wide_image_paths=train_wide, narrow_image_paths=train_narrow, label_paths=train_label,
-            img_size=opt.img_size, transform=get_dual_train_transforms(opt.img_size)
+            img_size=opt.img_size, transform=None
         )
         val_dataset = DualImageDataset(
             wide_image_paths=val_wide, narrow_image_paths=val_narrow, label_paths=val_label,
-            img_size=opt.img_size, transform=get_dual_val_transforms(opt.img_size)
+            img_size=opt.img_size, transform=None
         )
         train_loader = DataLoader(
             train_dataset,
@@ -185,7 +297,7 @@ def train(opt):
             narrow_img_dir=opt.narrow_img_dir_train,
             label_dir=opt.label_dir_train,
             img_size=opt.img_size,
-            transform=get_dual_train_transforms(opt.img_size)
+            transform=None
         )
         train_loader = DataLoader(
             train_dataset,
@@ -213,27 +325,35 @@ def train(opt):
         names = data_yaml.get('names', None)
         if isinstance(names, (dict, list)):
             model_args['nc'] = len(names)
-    model = DualYOLOv8(yolo_weights_path=opt.weights, args=model_args).to(device)
+    model = DualYOLOv8(
+        yolo_weights_path=opt.weights,
+        args=opt,
+        wide_K=wide_K, wide_P=wide_P,
+        narrow_K=narrow_K, narrow_P=narrow_P,
+        img_w=1920, img_h=1080
+    ).to(device)
     model.train()
 
     # backbone freeze (선택)
     backbone_end = model.yolo_model.save[-1] + 1 if hasattr(model.yolo_model, 'save') else None
     if backbone_end:
         for param in model.yolo_model.model[:backbone_end].parameters():
-            param.requires_grad = False
+            param.requires_grad = True
         for param in model.yolo_model.model[backbone_end:].parameters():
             param.requires_grad = True
         trainable_params = [p for p in model.parameters() if p.requires_grad]
     else:
         trainable_params = model.parameters()
 
-    optimizer = optim.AdamW(trainable_params, lr=opt.lr)
+    optimizer = optim.AdamW(trainable_params, lr=1e-4, weight_decay=5e-4)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=len(train_loader), epochs=opt.epochs, pct_start=0.2, anneal_strategy='cos', final_div_factor=1e4)
+
     import yaml
     from types import SimpleNamespace
     hyp_path = "hyp_siamese_scratch.yaml"  # 필요시 opt.hyp 등으로 바꿔도 됨
     with open(hyp_path, 'r') as f:
         hyp_dict = yaml.safe_load(f)
-    # 필수 키 없으면 기본값 보충
+
     defaults = {
         "box": 7.5,
         "cls": 0.5,
@@ -247,9 +367,9 @@ def train(opt):
     for k, v in defaults.items():
         if k not in hyp_dict or hyp_dict[k] is None:
             hyp_dict[k] = v
-    # print("[DEBUG] Final hyp_dict:", hyp_dict)
+
     hyp = SimpleNamespace(**hyp_dict)
-    # box, cls, dfl이 없으면 box_gain, cls_gain, dfl_gain에서 속성으로 할당
+
     for k, v in {"box": 7.5, "cls": 0.5, "dfl": 1.5}.items():
         if not hasattr(hyp, k):
             alt_key = k + "_gain"
@@ -257,11 +377,14 @@ def train(opt):
                 setattr(hyp, k, getattr(hyp, alt_key))
             else:
                 setattr(hyp, k, v)
+
     model.hyp = hyp
+
     loss_fn = v8DetectionLoss(model)
+
     if isinstance(loss_fn.hyp, dict):
         loss_fn.hyp = SimpleNamespace(**loss_fn.hyp)
-    # loss_fn.hyp에도 box/cls/dfl 보장 (box_gain 등에서 매핑)
+
     for k, v in {"box": 7.5, "cls": 0.5, "dfl": 1.5}.items():
         if not hasattr(loss_fn.hyp, k):
             alt_key = k + "_gain"
@@ -269,7 +392,6 @@ def train(opt):
                 setattr(loss_fn.hyp, k, getattr(loss_fn.hyp, alt_key))
             else:
                 setattr(loss_fn.hyp, k, v)
-    # print("[DEBUG] patched loss_fn.hyp:", loss_fn.hyp)
 
     # ... (학습 루프 및 기타 코드) ...
     # 학습 종료 후 wandb 종료
@@ -368,7 +490,8 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
     Custom validation for DualYOLO: computes loss, mAP, precision, recall (ultralytics style).
     If custom_val_dataset is given, use it directly. Otherwise, build from dirs.
     """
-    from dataload_dual import DualImageDataset, get_dual_val_transforms, dual_collate_fn
+    # from dataload_dual import DualImageDataset, get_dual_val_transforms, dual_collate_fn
+    from dataload_dual import DualImageDataset, dual_collate_fn
     from ultralytics.utils.metrics import ap_per_class
     import torch
     import numpy as np
