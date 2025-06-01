@@ -58,7 +58,11 @@ class DualYOLOv8(nn.Module):
                  wide_K=None, wide_P=None, narrow_K=None, narrow_P=None, img_w=1920, img_h=1080, img_size=640):
         super().__init__()
         from ultralytics import YOLO
-        yolo_model_full = YOLO('/home/byounggun/ultralytics/ultralytics/cfg/models/v8/yolov8.yaml')
+        # 수정: pt 파일이면 가중치까지 로드, 아니면 구조만 생성
+        if yolo_weights_path and yolo_weights_path.endswith('.pt') and os.path.exists(yolo_weights_path):
+            yolo_model_full = YOLO(yolo_weights_path)
+        # else:
+        #     yolo_model_full = YOLO('/home/byounggun/ultralytics/ultralytics/cfg/models/v8/yolov8.yaml')
         self.yolo_model = yolo_model_full.model  # DetectionModel
         self.model = self.yolo_model.model  # for v8DetectionLoss compatibility (nn.ModuleList)
         self.stride = self.yolo_model.stride
