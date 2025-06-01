@@ -172,7 +172,7 @@ class DualYOLOv8(nn.Module):
             y_wide.append(xw_out)
             y_narrow.append(xn_out)
             # --- 마지막 backbone output에서 spatial sum 적용 ---
-            if i == self.save[-1]:
+            if i in self.save:
                 B, C, H, W = xw_out.shape
                 # === YOLO label 비율 기반 bbox 계산 ===
                 # 원하는 YOLO label 비율 (중앙, 1/4.494, 1/4.552)
@@ -194,8 +194,8 @@ class DualYOLOv8(nn.Module):
                 fy_max = min(fy_max, H)
                 region_w = fx_max - fx_min
                 region_h = fy_max - fy_min
-                print(f"[DEBUG] [YOLO BBOX] fusion bbox: fx_min={fx_min}, fx_max={fx_max}, fy_min={fy_min}, fy_max={fy_max}, width={region_w}, height={region_h}")
-                # narrow feature를 해당 영역 크기로 resize
+                # print(f"[DEBUG] [YOLO BBOX] fusion bbox: fx_min={fx_min}, fx_max={fx_max}, fy_min={fy_min}, fy_max={fy_max}, width={region_w}, height={region_h}")
+                # fusion
                 narrow_region = torch.nn.functional.interpolate(
                     xn_out, size=(region_h, region_w), mode='bilinear', align_corners=False
                 )
@@ -208,10 +208,10 @@ class DualYOLOv8(nn.Module):
                 # fusion_weight = torch.softmax(self.fusion_weight[fusion_idx], dim=0)
                 # xw_out_spatial = fusion_weight[0] * xw_out_bn + fusion_weight[1] * narrow_full_bn
                 xw_out_spatial = xw_out_bn + narrow_full_bn
-                print(f"[DEBUG] xw_out_spatial shape after sum: {xw_out_spatial.shape}")
+                # print(f"[DEBUG] xw_out_spatial shape after sum: {xw_out_spatial.shape}")
                 y.append(xw_out_spatial)
                 save_outputs[i] = len(y) - 1
-            elif i in self.save:
+            else:
                 y.append(xw_out)
                 save_outputs[i] = len(y) - 1
         # neck/head 들어가기 전에 NoneType 체크
@@ -578,6 +578,7 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
         model.args = types.SimpleNamespace(box=0.05, cls=0.5, dfl=1.5)
     loss_fn = v8DetectionLoss(model)
     stats = []
+    from ultralytics.utils.ops import non_max_suppression
     for batch_idx, batch in enumerate(val_loader):
         imgs_wide, imgs_narrow, labels_list = batch['wide_img'].to(device), batch['narrow_img'].to(device), batch['labels']
         # labels_list: list of [num_targets, 5] (class, x, y, w, h)
@@ -598,24 +599,42 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
         }
         with torch.no_grad():
             outputs = model(imgs_wide, imgs_narrow)
+            # Apply YOLOv8 NMS/postprocess to outputs
+            preds = non_max_suppression(outputs, conf_thres=0.001, iou_thres=0.6)
             loss, loss_items = loss_fn(outputs, val_targets)
             # loss: tensor of shape [3] (box, cls, dfl), sum for total
             total_loss += loss.sum().item()
             total_batches += 1
             # --- metric 계산 ---
-            # outputs: (batch, num_boxes, 6) [x1, y1, x2, y2, conf, cls]
-            # labels: (num_targets, 6) [batch_idx, cls, x, y, w, h]
-            metric_out = outputs[0] if isinstance(outputs, tuple) else outputs
-            for si in range(metric_out.shape[0]):
-                pred = metric_out[si]
-                pred = pred[pred[:, 4] > 0.001]  # conf threshold
-                if pred.shape[0] == 0:
-                    # pred_boxes: (0, 4), pred_conf: (0,), pred_cls: (0,), tcls: (0,)
+            for si, pred in enumerate(preds):
+                print(f"[VAL][img {si}] NMS pred shape: {None if pred is None else pred.shape}")
+                if pred is not None and pred.numel():
+                    print(f"[VAL][img {si}] NMS pred sample (first 2):\n{pred[:2].cpu().numpy()}")
+                else:
+                    print(f"[VAL][img {si}] NMS pred is EMPTY")
+                if pred is None or pred.shape[0] == 0:
                     stats.append((np.zeros((0, 4)), np.zeros((0,)), np.zeros((0,)), np.zeros((0,))) )
                     continue
                 # GT
                 tcls = labels[labels[:, 0] == si][:, 1].cpu().numpy() if labels.numel() else np.array([])
-                tbox = labels[labels[:, 0] == si][:, 2:6].cpu().numpy() if labels.numel() else np.array([])
+                tbox_norm = labels[labels[:, 0] == si][:, 2:6].cpu().numpy() if labels.numel() else np.array([])
+                img_h, img_w = imgs_wide.shape[2:]
+                # tbox_norm: (N, 4) [x_center, y_center, w, h] (정규화)
+                # 픽셀 좌표로 변환: [x1, y1, x2, y2]
+                if len(tbox_norm):
+                    x_c, y_c, w, h = tbox_norm[:, 0], tbox_norm[:, 1], tbox_norm[:, 2], tbox_norm[:, 3]
+                    x1 = (x_c - w / 2) * img_w
+                    y1 = (y_c - h / 2) * img_h
+                    x2 = (x_c + w / 2) * img_w
+                    y2 = (y_c + h / 2) * img_h
+                    tbox_pixel = np.stack([x1, y1, x2, y2], axis=1)
+                else:
+                    tbox_pixel = np.zeros((0, 4), dtype=np.float32)
+                print(f"[VAL][img {si}] GT labels count: {len(tcls)}")
+                if len(tcls):
+                    print(f"[VAL][img {si}] GT label sample: class={tcls[:2]}, box={tbox_pixel[:2]}")
+                else:
+                    print(f"[VAL][img {si}] GT label is EMPTY")
                 # Prediction
                 pred_cls = pred[:, 5].cpu().numpy() if pred.numel() else np.array([])
                 pred_boxes = pred[:, :4].cpu().numpy() if pred.numel() else np.array([])
@@ -625,12 +644,28 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
                 pred_conf = np.array(pred_conf)
                 pred_cls = np.array(pred_cls)
                 tcls = np.array(tcls)
-                stats.append((pred_boxes, pred_conf, pred_cls, tcls))
+                # stats: (pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel)
+                stats.append((pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel))
     model.train()
     avg_loss = total_loss / max(1, total_batches)
+    print(f"[VAL] stats collected: {len(stats)} entries")
+    if len(stats):
+        print(f"[VAL] stats sample (first entry):")
+        for i, arr in enumerate(stats[0]):
+            print(f"  stats[0][{i}] shape: {arr.shape}, sample: {arr[:2] if arr.size else arr}")
     # mAP/precision/recall 계산
-    if len(stats) and all(isinstance(x, np.ndarray) and x.size > 0 for x in stats[0]):
-        p, r, ap, f1, ap_class = ap_per_class(*zip(*stats))
+    # stats: (pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel)
+    # stats에서 gt가 없는 것(즉, tcls와 tbox_pixel이 비어있는 것)을 배제
+    filtered_stats = [s for s in stats if s[3].size > 0 and s[4].size > 0]
+    print(f"[VAL] filtered_stats: {len(filtered_stats)} (GT 있는 것만)")
+    if len(filtered_stats):
+        print(f"[VAL] filtered_stats sample (first entry):")
+        for i, arr in enumerate(filtered_stats[0]):
+            print(f"  filtered_stats[0][{i}] shape: {arr.shape}, sample: {arr[:2] if arr.size else arr}")
+        # ap_per_class expects: (pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel)
+        p, r, ap, f1, ap_class = ap_per_class(
+            *[tuple(x[i] for x in filtered_stats) for i in range(5)]
+        )
         metrics = {
             "val/loss": avg_loss,
             "val/precision": float(np.mean(p)) if len(p) else 0.0,
@@ -638,9 +673,11 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
             "val/mAP50": float(np.mean(ap[:, 0])) if ap.ndim > 1 else float(np.mean(ap)),
             "val/mAP50-95": float(np.mean(ap[:, 1])) if ap.ndim > 1 and ap.shape[1] > 1 else 0.0,
         }
+        print(f"[VAL] METRICS: {metrics}")
     else:
         p = r = ap = f1 = ap_class = np.array([])
         metrics = {"val/loss": avg_loss, "val/precision": 0.0, "val/recall": 0.0, "val/mAP50": 0.0, "val/mAP50-95": 0.0}
+        print(f"[VAL] METRICS: {metrics}")
     return metrics
 
 
