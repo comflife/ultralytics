@@ -62,10 +62,15 @@ class DualYOLOv8(nn.Module):
         super().__init__()
         from ultralytics import YOLO
         # 수정: pt 파일이면 가중치까지 로드, 아니면 구조만 생성
-        if yolo_weights_path and yolo_weights_path.endswith('.pt') and os.path.exists(yolo_weights_path):
+        if yolo_weights_path is not None and yolo_weights_path.endswith('.pt') and os.path.exists(yolo_weights_path):
             yolo_model_full = YOLO(yolo_weights_path)
-        # else:
-        #     yolo_model_full = YOLO('/home/byounggun/ultralytics/ultralytics/cfg/models/v8/yolov8.yaml')
+        elif yolo_weights_path is not None and yolo_weights_path.endswith('.yaml') and os.path.exists(yolo_weights_path):
+            yolo_model_full = YOLO(yolo_weights_path)
+        elif yolo_weights_path is None:
+            # 구조만 생성 (커스텀 구조 코드 기반)
+            yolo_model_full = YOLO('yolov8s.yaml')  # 또는 커스텀 구조 코드에 맞게 수정
+        else:
+            raise ValueError("올바른 yolo_weights_path가 필요합니다.")
         self.yolo_model = yolo_model_full.model  # DetectionModel
         self.model = self.yolo_model.model  # for v8DetectionLoss compatibility (nn.ModuleList)
         self.stride = self.yolo_model.stride
@@ -387,7 +392,7 @@ def train(opt):
     backbone_end = model.yolo_model.save[-1] + 1 if hasattr(model.yolo_model, 'save') else None
     if backbone_end:
         for param in model.yolo_model.model[:backbone_end].parameters():
-            param.requires_grad = False
+            param.requires_grad = True
         for param in model.yolo_model.model[backbone_end:].parameters():
             param.requires_grad = True
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -399,7 +404,7 @@ def train(opt):
 
     import yaml
     from types import SimpleNamespace
-    hyp_path = "hyp_siamese_scratch.yaml"  # 필요시 opt.hyp 등으로 바꿔도 됨
+    hyp_path = "hyp_scratch.yaml"  # 필요시 opt.hyp 등으로 바꿔도 됨
     with open(hyp_path, 'r') as f:
         hyp_dict = yaml.safe_load(f)
 
@@ -489,6 +494,7 @@ def train(opt):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()  # OneCycleLR 스케줄러 실제 적용 (step마다 호출)
             epoch_loss_sum += loss.item()
             log_dict = {
                 "train/loss": loss.item(),
@@ -648,24 +654,9 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
                 stats.append((pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel))
     model.train()
     avg_loss = total_loss / max(1, total_batches)
-    print(f"[VAL] stats collected: {len(stats)} entries")
-    if len(stats):
-        print(f"[VAL] stats sample (first entry):")
-        for i, arr in enumerate(stats[0]):
-            print(f"  stats[0][{i}] shape: {arr.shape}, sample: {arr[:2] if arr.size else arr}")
     # mAP/precision/recall 계산
-    # stats: (pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel)
-    # stats에서 gt가 없는 것(즉, tcls와 tbox_pixel이 비어있는 것)을 배제
-    filtered_stats = [s for s in stats if s[3].size > 0 and s[4].size > 0]
-    print(f"[VAL] filtered_stats: {len(filtered_stats)} (GT 있는 것만)")
-    if len(filtered_stats):
-        print(f"[VAL] filtered_stats sample (first entry):")
-        for i, arr in enumerate(filtered_stats[0]):
-            print(f"  filtered_stats[0][{i}] shape: {arr.shape}, sample: {arr[:2] if arr.size else arr}")
-        # ap_per_class expects: (pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel)
-        p, r, ap, f1, ap_class = ap_per_class(
-            *[tuple(x[i] for x in filtered_stats) for i in range(5)]
-        )
+    if len(stats) and all(isinstance(x, np.ndarray) and x.size > 0 for x in stats[0]):
+        p, r, ap, f1, ap_class = ap_per_class(*zip(*stats))
         metrics = {
             "val/loss": avg_loss,
             "val/precision": float(np.mean(p)) if len(p) else 0.0,
@@ -673,12 +664,12 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
             "val/mAP50": float(np.mean(ap[:, 0])) if ap.ndim > 1 else float(np.mean(ap)),
             "val/mAP50-95": float(np.mean(ap[:, 1])) if ap.ndim > 1 and ap.shape[1] > 1 else 0.0,
         }
-        print(f"[VAL] METRICS: {metrics}")
     else:
         p = r = ap = f1 = ap_class = np.array([])
         metrics = {"val/loss": avg_loss, "val/precision": 0.0, "val/recall": 0.0, "val/mAP50": 0.0, "val/mAP50-95": 0.0}
-        print(f"[VAL] METRICS: {metrics}")
     return metrics
+
+
 
 
 
