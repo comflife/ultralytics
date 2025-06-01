@@ -5,6 +5,9 @@ Dual YOLO 학습 스크립트
 - wide/narrow 이미지를 각각 backbone에 통과시켜 feature를 concat한 뒤 detection head에 입력
 - 라벨은 wide에만 존재
 - dataload_dual.py와 연동
+
+
+python yolov8_dual.py   --wide_img_dir_train /home/byounggun/ultralytics/traffic_train/wide/images   --narrow_img_dir_train /home/byounggun/ultralytics/traffic_train/narrow/images   --label_dir_train /home/byounggun/ultralytics/traffic_train/wide/labels   --weights yolov8s.pt   --img_size 640   --batch_size 12   --epochs 150   --wandb
 """
 import argparse
 import torch
@@ -101,8 +104,7 @@ class DualYOLOv8(nn.Module):
                 fusion_channels.append(layer.out_channels)
             elif hasattr(layer, 'cv2') and hasattr(layer.cv2, 'out_channels'):
                 fusion_channels.append(layer.cv2.out_channels)
-        self.fusion_bn_wide = nn.ModuleList([nn.BatchNorm2d(c) for c in fusion_channels])
-        self.fusion_bn_narrow = nn.ModuleList([nn.BatchNorm2d(c) for c in fusion_channels])
+
         self.fusion_weight = nn.Parameter(torch.ones(len(self.save), 2) * 0.5, requires_grad=True)
         # [Manual normalization (min-max, F.normalize, etc) is NOT used. Only BN as in YOLOv8.]
 
@@ -172,11 +174,27 @@ class DualYOLOv8(nn.Module):
             # --- 마지막 backbone output에서 spatial sum 적용 ---
             if i == self.save[-1]:
                 B, C, H, W = xw_out.shape
-                fx_min, fx_max, fy_min, fy_max = get_default_fusion_bbox(xw_out)
+                # === YOLO label 비율 기반 bbox 계산 ===
+                # 원하는 YOLO label 비율 (중앙, 1/4.494, 1/4.552)
+                x_center_norm = 0.5
+                y_center_norm = 0.5
+                width_norm = 1 / 4.494  # ≈ 0.2225
+                height_norm = 1 / 4.552 # ≈ 0.2197
+                cx = x_center_norm * W
+                cy = y_center_norm * H
+                w = width_norm * W
+                h = height_norm * H
+                fx_min = int(round(cx - w / 2))
+                fx_max = int(round(cx + w / 2))
+                fy_min = int(round(cy - h / 2))
+                fy_max = int(round(cy + h / 2))
+                fx_min = max(fx_min, 0)
+                fy_min = max(fy_min, 0)
+                fx_max = min(fx_max, W)
+                fy_max = min(fy_max, H)
                 region_w = fx_max - fx_min
                 region_h = fy_max - fy_min
-                print(f"[DEBUG] [NO PROJ] fusion bbox: fx_min={fx_min}, fx_max={fx_max}, fy_min={fy_min}, fy_max={fy_max}, width={region_w}, height={region_h}")
-                # === END [NO PROJ] ===
+                print(f"[DEBUG] [YOLO BBOX] fusion bbox: fx_min={fx_min}, fx_max={fx_max}, fy_min={fy_min}, fy_max={fy_max}, width={region_w}, height={region_h}")
                 # narrow feature를 해당 영역 크기로 resize
                 narrow_region = torch.nn.functional.interpolate(
                     xn_out, size=(region_h, region_w), mode='bilinear', align_corners=False
@@ -185,10 +203,11 @@ class DualYOLOv8(nn.Module):
                 narrow_full[..., fy_min:fy_max, fx_min:fx_max] = narrow_region
                 # wide feature와 합성 (Multi-Scale BN, Learnable Weighted Sum)
                 fusion_idx = list(self.save).index(i)
-                xw_out_bn = self.fusion_bn_wide[fusion_idx](xw_out)
-                narrow_full_bn = self.fusion_bn_narrow[fusion_idx](narrow_full)
-                fusion_weight = torch.softmax(self.fusion_weight[fusion_idx], dim=0)
-                xw_out_spatial = fusion_weight[0] * xw_out_bn + fusion_weight[1] * narrow_full_bn
+                xw_out_bn = xw_out
+                narrow_full_bn = narrow_full
+                # fusion_weight = torch.softmax(self.fusion_weight[fusion_idx], dim=0)
+                # xw_out_spatial = fusion_weight[0] * xw_out_bn + fusion_weight[1] * narrow_full_bn
+                xw_out_spatial = xw_out_bn + narrow_full_bn
                 print(f"[DEBUG] xw_out_spatial shape after sum: {xw_out_spatial.shape}")
                 y.append(xw_out_spatial)
                 save_outputs[i] = len(y) - 1
@@ -199,10 +218,10 @@ class DualYOLOv8(nn.Module):
         for idx, item in enumerate(y):
             if item is None:
                 print(f"[ERROR] y[{idx}] is None before neck/head! y: {[type(x) for x in y]}")
-            elif hasattr(item, 'shape'):
-                print(f"[DEBUG] y[{idx}] shape: {item.shape}")
-            else:
-                print(f"[DEBUG] y[{idx}] type: {type(item)})")
+            # elif hasattr(item, 'shape'):
+            #     print(f"[DEBUG] y[{idx}] shape: {item.shape}")
+            # else:
+            #     print(f"[DEBUG] y[{idx}] type: {type(item)})")
         # 2. neck/head: summed_features부터 시작, y에 계속 append
         for i in range(self.save[-1]+1, len(self.model)):
             m = self.model[i]
