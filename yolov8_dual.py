@@ -8,6 +8,7 @@ Dual YOLO 학습 스크립트
 
 
 python yolov8_dual.py   --wide_img_dir_train /home/byounggun/ultralytics/traffic_train/wide/images   --narrow_img_dir_train /home/byounggun/ultralytics/traffic_train/narrow/images   --label_dir_train /home/byounggun/ultralytics/traffic_train/wide/labels   --weights yolov8s.pt   --img_size 640   --batch_size 12   --epochs 150   --wandb
+python yolov8_dual.py   --wide_img_dir_train /home/byounggun/cococo/train_resized/images   --narrow_img_dir_train /home/byounggun/cococo/train_short/images   --label_dir_train /home/byounggun/cococo/train_resized/labels   --weights yolov8s.pt   --img_size 640   --batch_size 12   --epochs 150   --wandb
 """
 import argparse
 import torch
@@ -69,9 +70,10 @@ class DualYOLOv8(nn.Module):
         self.model = self.yolo_model.model  # for v8DetectionLoss compatibility (nn.ModuleList)
         self.stride = self.yolo_model.stride
         import yaml
-        dataset_yaml = 'ultralytics/cfg/datasets/traffic.yaml'
-        self.nc = None
-        self.names = None
+        # dataset_yaml = 'ultralytics/cfg/datasets/traffic.yaml'
+        dataset_yaml = 'ultralytics/cfg/datasets/cococo.yaml'
+        self.nc = 80
+        self.names = ['aeroplane', 'apple', 'backpack', 'banana', 'baseball bat', 'baseball glove', 'bear', 'bed', 'bench', 'bicycle', 'bird', 'boat', 'book', 'bottle', 'bowl', 'broccoli', 'bus', 'cake', 'car', 'carrot', 'cat', 'cell phone', 'chair', 'clock', 'cow', 'cup', 'diningtable', 'dog', 'donut', 'elephant', 'fire hydrant', 'fork', 'frisbee', 'giraffe', 'hair drier', 'handbag', 'horse', 'hot dog', 'keyboard', 'kite', 'knife', 'laptop', 'microwave', 'motorbike', 'mouse', 'orange', 'oven', 'parking meter', 'person', 'pizza', 'pottedplant', 'refrigerator', 'remote', 'sandwich', 'scissors', 'sheep', 'sink', 'skateboard', 'skis', 'snowboard', 'sofa', 'spoon', 'sports ball', 'stop sign', 'suitcase', 'surfboard', 'teddy bear', 'tennis racket', 'tie', 'toaster', 'toilet', 'toothbrush', 'traffic light', 'train', 'truck', 'tvmonitor', 'umbrella', 'vase', 'wine glass', 'zebra']
         if os.path.exists(dataset_yaml):
             with open(dataset_yaml, 'r') as f:
                 data_yaml = yaml.safe_load(f)
@@ -84,7 +86,8 @@ class DualYOLOv8(nn.Module):
         if self.names is None:
             self.names = getattr(detect_head, 'names', getattr(self.yolo_model, 'names', None))
         # self.save = self.yolo_model.save  # backbone output indices for multi-scale features
-        self.save = [4,6,9]
+        # self.save = [4,6,9]
+        self.save = [0,1,3,5,7]
         self.args = args
         # --- 카메라 파라미터 저장 ---
         # self.wide_K = wide_K
@@ -108,34 +111,7 @@ class DualYOLOv8(nn.Module):
         self.fusion_weight = nn.Parameter(torch.ones(len(self.save), 2) * 0.5, requires_grad=True)
         # [Manual normalization (min-max, F.normalize, etc) is NOT used. Only BN as in YOLOv8.]
 
-    # def project_narrow_to_wide(self):
-    #     """
-    #     narrow 이미지의 4개 코너를 wide 이미지 평면에 투영하여 wide_corners(img_size 기준, float32, (4,2)) 반환
-    #     (이미지와 feature는 dataloader에서 img_size로 resize되어 들어오므로, 추가 스케일링 불필요)
-    #     """
-    #     narrow_corners = np.array([
-    #         [0, 0],
-    #         [self.img_w-1, 0],
-    #         [self.img_w-1, self.img_h-1],
-    #         [0, self.img_h-1]
-    #     ], dtype=np.float32)
-    #     narrow_K_inv = np.linalg.inv(self.narrow_K)
-    #     rays = []
-    #     for u, v in narrow_corners:
-    #         pixel = np.array([u, v, 1.0])
-    #         ray = narrow_K_inv @ pixel
-    #         ray = ray / ray[2]
-    #         rays.append(ray)
-    #     rays = np.stack(rays, axis=0)  # (4, 3)
-    #     wide_corners = []
-    #     for ray in rays:
-    #         X, Y, Z = ray[0], ray[1], 1.0
-    #         pt3d_wide = np.array([X, Y + 0.2, Z, 1.0])
-    #         proj = self.wide_P @ pt3d_wide
-    #         proj = proj / proj[2]
-    #         wide_corners.append([proj[0], proj[1]])
-    #     wide_corners = np.array(wide_corners, dtype=np.float32)  # (4,2)
-    #     return wide_corners
+
 
     def extract_single_backbone_feature(self, x, save_idx):
         # x를 backbone에 통과시켜 save_idx에 해당하는 feature만 추출
@@ -178,8 +154,10 @@ class DualYOLOv8(nn.Module):
                 # 원하는 YOLO label 비율 (중앙, 1/4.494, 1/4.552)
                 x_center_norm = 0.5
                 y_center_norm = 0.5
-                width_norm = 1 / 4.494  # ≈ 0.2225
-                height_norm = 1 / 4.552 # ≈ 0.2197
+                # width_norm = 1 / 4.494  # ≈ 0.2225
+                width_norm = 0.5
+                # height_norm = 1 / 4.552 # ≈ 0.2197
+                height_norm = 0.5
                 cx = x_center_norm * W
                 cy = y_center_norm * H
                 w = width_norm * W
@@ -218,22 +196,7 @@ class DualYOLOv8(nn.Module):
         for idx, item in enumerate(y):
             if item is None:
                 print(f"[ERROR] y[{idx}] is None before neck/head! y: {[type(x) for x in y]}")
-            # elif hasattr(item, 'shape'):
-            #     print(f"[DEBUG] y[{idx}] shape: {item.shape}")
-            # else:
-            #     print(f"[DEBUG] y[{idx}] type: {type(item)})")
-        # 2. neck/head: summed_features부터 시작, y에 계속 append
-        # for i in range(self.save[-1]+1, len(self.model)):
-        #     m = self.model[i]
-        #     if not hasattr(m, 'f') or m.f == -1:
-        #         x_in = y[-1]
-        #     else:
-        #         if isinstance(m.f, int):
-        #             x_in = y[save_outputs[m.f]]
-        #         else:
-        #             x_in = [y[save_outputs[j]] for j in m.f]
-        #     out = m(x_in)
-        #     y.append(out)
+
         for i in range(self.save[-1]+1, len(self.model)):
             m = self.model[i]
             if not hasattr(m, 'f') or m.f == -1:
@@ -291,30 +254,6 @@ def train(opt):
             return list(wide), list(narrow), list(label)
         return unzip(train_files), unzip(val_files)
 
-    # --- 카메라 파라미터 직접 선언 ---
-    import numpy as np
-    # Wide 카메라
-    wide_K = np.array([
-        [559.258761, 0, 928.108242],
-        [0, 565.348774, 518.787048],
-        [0, 0, 1]
-    ], dtype=np.float32)
-    wide_P = np.array([
-        [535.711792, 0, 924.086569, 0],
-        [0, 558.997375, 510.222325, 0],
-        [0, 0, 1, 0]
-    ], dtype=np.float32)
-    # Narrow 카메라
-    narrow_K = np.array([
-        [2651.127798, 0, 819.397071],
-        [0, 2635.360938, 896.163803],
-        [0, 0, 1]
-    ], dtype=np.float32)
-    narrow_P = np.array([
-        [2407.709780, 0, 801.603047, 0],
-        [0, 2544.697607, 897.250521, 0],
-        [0, 0, 1, 0]
-    ], dtype=np.float32)
 
     # val 인자가 없으면 자동 분할, 있으면 기존 방식
     if (not hasattr(opt, 'wide_img_dir_val') or not opt.wide_img_dir_val) and \
@@ -388,13 +327,12 @@ def train(opt):
     model = DualYOLOv8(
         yolo_weights_path=opt.weights,
         args=opt,
-        wide_K=wide_K, wide_P=wide_P,
-        narrow_K=narrow_K, narrow_P=narrow_P,
-        img_w=1920, img_h=1080
+        # wide_K=wide_K, wide_P=wide_P,
+        # narrow_K=narrow_K, narrow_P=narrow_P,
+        # img_w=1920, img_h=1080
     ).to(device)
     model.train()
 
-    # backbone freeze (선택)
     backbone_end = model.yolo_model.save[-1] + 1 if hasattr(model.yolo_model, 'save') else None
     if backbone_end:
         for param in model.yolo_model.model[:backbone_end].parameters():
