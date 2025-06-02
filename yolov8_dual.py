@@ -64,13 +64,7 @@ class DualYOLOv8(nn.Module):
         # 수정: pt 파일이면 가중치까지 로드, 아니면 구조만 생성
         if yolo_weights_path is not None and yolo_weights_path.endswith('.pt') and os.path.exists(yolo_weights_path):
             yolo_model_full = YOLO(yolo_weights_path)
-        elif yolo_weights_path is not None and yolo_weights_path.endswith('.yaml') and os.path.exists(yolo_weights_path):
-            yolo_model_full = YOLO(yolo_weights_path)
-        elif yolo_weights_path is None:
-            # 구조만 생성 (커스텀 구조 코드 기반)
-            yolo_model_full = YOLO('yolov8s.yaml')  # 또는 커스텀 구조 코드에 맞게 수정
-        else:
-            raise ValueError("올바른 yolo_weights_path가 필요합니다.")
+
         self.yolo_model = yolo_model_full.model  # DetectionModel
         self.model = self.yolo_model.model  # for v8DetectionLoss compatibility (nn.ModuleList)
         self.stride = self.yolo_model.stride
@@ -89,16 +83,17 @@ class DualYOLOv8(nn.Module):
             self.nc = getattr(detect_head, 'nc', getattr(self.yolo_model, 'nc', None))
         if self.names is None:
             self.names = getattr(detect_head, 'names', getattr(self.yolo_model, 'names', None))
-        self.save = self.yolo_model.save  # backbone output indices for multi-scale features
+        # self.save = self.yolo_model.save  # backbone output indices for multi-scale features
+        self.save = [4,6,9]
         self.args = args
         # --- 카메라 파라미터 저장 ---
-        self.wide_K = wide_K
-        self.wide_P = wide_P
-        self.narrow_K = narrow_K
-        self.narrow_P = narrow_P
-        self.img_w = img_w
-        self.img_h = img_h
-        self.img_size = img_size if img_size is not None else (args.img_size if args and hasattr(args, 'img_size') else 640)
+        # self.wide_K = wide_K
+        # self.wide_P = wide_P
+        # self.narrow_K = narrow_K
+        # self.narrow_P = narrow_P
+        # self.img_w = img_w
+        # self.img_h = img_h
+        # self.img_size = img_size if img_size is not None else (args.img_size if args and hasattr(args, 'img_size') else 640)
 
         # --- Feature Fusion Normalization & Learnable Weights (Multi-Scale) ---
         # Use separate BN for wide/narrow at each fusion scale (YOLOv8 official style)
@@ -113,34 +108,34 @@ class DualYOLOv8(nn.Module):
         self.fusion_weight = nn.Parameter(torch.ones(len(self.save), 2) * 0.5, requires_grad=True)
         # [Manual normalization (min-max, F.normalize, etc) is NOT used. Only BN as in YOLOv8.]
 
-    def project_narrow_to_wide(self):
-        """
-        narrow 이미지의 4개 코너를 wide 이미지 평면에 투영하여 wide_corners(img_size 기준, float32, (4,2)) 반환
-        (이미지와 feature는 dataloader에서 img_size로 resize되어 들어오므로, 추가 스케일링 불필요)
-        """
-        narrow_corners = np.array([
-            [0, 0],
-            [self.img_w-1, 0],
-            [self.img_w-1, self.img_h-1],
-            [0, self.img_h-1]
-        ], dtype=np.float32)
-        narrow_K_inv = np.linalg.inv(self.narrow_K)
-        rays = []
-        for u, v in narrow_corners:
-            pixel = np.array([u, v, 1.0])
-            ray = narrow_K_inv @ pixel
-            ray = ray / ray[2]
-            rays.append(ray)
-        rays = np.stack(rays, axis=0)  # (4, 3)
-        wide_corners = []
-        for ray in rays:
-            X, Y, Z = ray[0], ray[1], 1.0
-            pt3d_wide = np.array([X, Y + 0.2, Z, 1.0])
-            proj = self.wide_P @ pt3d_wide
-            proj = proj / proj[2]
-            wide_corners.append([proj[0], proj[1]])
-        wide_corners = np.array(wide_corners, dtype=np.float32)  # (4,2)
-        return wide_corners
+    # def project_narrow_to_wide(self):
+    #     """
+    #     narrow 이미지의 4개 코너를 wide 이미지 평면에 투영하여 wide_corners(img_size 기준, float32, (4,2)) 반환
+    #     (이미지와 feature는 dataloader에서 img_size로 resize되어 들어오므로, 추가 스케일링 불필요)
+    #     """
+    #     narrow_corners = np.array([
+    #         [0, 0],
+    #         [self.img_w-1, 0],
+    #         [self.img_w-1, self.img_h-1],
+    #         [0, self.img_h-1]
+    #     ], dtype=np.float32)
+    #     narrow_K_inv = np.linalg.inv(self.narrow_K)
+    #     rays = []
+    #     for u, v in narrow_corners:
+    #         pixel = np.array([u, v, 1.0])
+    #         ray = narrow_K_inv @ pixel
+    #         ray = ray / ray[2]
+    #         rays.append(ray)
+    #     rays = np.stack(rays, axis=0)  # (4, 3)
+    #     wide_corners = []
+    #     for ray in rays:
+    #         X, Y, Z = ray[0], ray[1], 1.0
+    #         pt3d_wide = np.array([X, Y + 0.2, Z, 1.0])
+    #         proj = self.wide_P @ pt3d_wide
+    #         proj = proj / proj[2]
+    #         wide_corners.append([proj[0], proj[1]])
+    #     wide_corners = np.array(wide_corners, dtype=np.float32)  # (4,2)
+    #     return wide_corners
 
     def extract_single_backbone_feature(self, x, save_idx):
         # x를 backbone에 통과시켜 save_idx에 해당하는 feature만 추출
@@ -159,7 +154,7 @@ class DualYOLOv8(nn.Module):
         카메라 파라미터 기반으로 narrow FOV가 wide feature map에서 어디에 위치하는지 계산 후 sum
         """
         # 1. narrow의 4개 코너를 wide로 투영 (이미 img_size 기준으로 반환)
-        wide_corners = self.project_narrow_to_wide()  # (4,2) img_size 기준
+        # wide_corners = self.project_narrow_to_wide()  # (4,2) img_size 기준
 
         y_wide, y_narrow = [], []
         y = []
@@ -210,10 +205,10 @@ class DualYOLOv8(nn.Module):
                 fusion_idx = list(self.save).index(i)
                 xw_out_bn = xw_out
                 narrow_full_bn = narrow_full
-                # fusion_weight = torch.softmax(self.fusion_weight[fusion_idx], dim=0)
-                # xw_out_spatial = fusion_weight[0] * xw_out_bn + fusion_weight[1] * narrow_full_bn
-                xw_out_spatial = xw_out_bn + narrow_full_bn
-                # print(f"[DEBUG] xw_out_spatial shape after sum: {xw_out_spatial.shape}")
+                fusion_weight = torch.softmax(self.fusion_weight[fusion_idx], dim=0)
+                xw_out_spatial = fusion_weight[0] * xw_out_bn + fusion_weight[1] * narrow_full_bn
+                # xw_out_spatial = xw_out_bn + narrow_full_bn
+                # print(f"[DEBUG][fusion] Layer idx={i} | xw_out shape={xw_out_bn.shape}, narrow_full_bn shape={narrow_full_bn.shape}, fused shape={xw_out_spatial.shape}")
                 y.append(xw_out_spatial)
                 save_outputs[i] = len(y) - 1
             else:
@@ -228,15 +223,26 @@ class DualYOLOv8(nn.Module):
             # else:
             #     print(f"[DEBUG] y[{idx}] type: {type(item)})")
         # 2. neck/head: summed_features부터 시작, y에 계속 append
+        # for i in range(self.save[-1]+1, len(self.model)):
+        #     m = self.model[i]
+        #     if not hasattr(m, 'f') or m.f == -1:
+        #         x_in = y[-1]
+        #     else:
+        #         if isinstance(m.f, int):
+        #             x_in = y[save_outputs[m.f]]
+        #         else:
+        #             x_in = [y[save_outputs[j]] for j in m.f]
+        #     out = m(x_in)
+        #     y.append(out)
         for i in range(self.save[-1]+1, len(self.model)):
             m = self.model[i]
             if not hasattr(m, 'f') or m.f == -1:
                 x_in = y[-1]
             else:
                 if isinstance(m.f, int):
-                    x_in = y[save_outputs[m.f]]
+                    x_in = y[m.f] if m.f != -1 else y[-1]
                 else:
-                    x_in = [y[save_outputs[j]] for j in m.f]
+                    x_in = [y[j] if j != -1 else y[-1] for j in m.f]
             out = m(x_in)
             y.append(out)
         return y[-1]
