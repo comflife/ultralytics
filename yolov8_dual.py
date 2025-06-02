@@ -32,74 +32,45 @@ except ImportError:
     wandb = None
     LOGGER.warning("Wandb is not installed. Wandb logging is disabled.")
 
-# --- 모델 정의 ---
-def get_default_fusion_bbox(xw_out):
-    """
-    xw_out: (B, C, H, W) or (C, H, W)
-    Returns (fx_min, fx_max, fy_min, fy_max) for the central square region.
-    """
-    if isinstance(xw_out, torch.Tensor):
-        shape = xw_out.shape
-        if len(shape) == 4:
-            _, C, H, W = shape
-        elif len(shape) == 3:
-            C, H, W = shape
-        else:
-            raise ValueError("xw_out must be (B,C,H,W) or (C,H,W)")
-    else:
-        raise ValueError("xw_out must be a torch.Tensor")
-    region_size = min(H, W) // 2
-    fx_min = (W - region_size) // 2
-    fx_max = fx_min + region_size
-    fy_min = (H - region_size) // 2
-    fy_max = fy_min + region_size
-    return fx_min, fx_max, fy_min, fy_max
 
-__all__ = ["DualYOLOv8", "get_default_fusion_bbox"]
+__all__ = ["DualYOLOv8"]
 
 class DualYOLOv8(nn.Module):
-    def __init__(self, yolo_weights_path='yolov8s.pt', args=None,
-                 wide_K=None, wide_P=None, narrow_K=None, narrow_P=None, img_w=1920, img_h=1080, img_size=640):
+    def __init__(self, yolo_weights_path='yolov8s.pt', args=None, img_size=640):
         super().__init__()
         from ultralytics import YOLO
         # 수정: pt 파일이면 가중치까지 로드, 아니면 구조만 생성
-        if yolo_weights_path is not None and yolo_weights_path.endswith('.pt') and os.path.exists(yolo_weights_path):
-            yolo_model_full = YOLO(yolo_weights_path)
+        # if yolo_weights_path is not None and yolo_weights_path.endswith('.pt') and os.path.exists(yolo_weights_path):
+        yolo_model_full = YOLO(yolo_weights_path)
 
         self.yolo_model = yolo_model_full.model  # DetectionModel
         self.model = self.yolo_model.model  # for v8DetectionLoss compatibility (nn.ModuleList)
         self.stride = self.yolo_model.stride
         import yaml
         # dataset_yaml = 'ultralytics/cfg/datasets/traffic.yaml'
-        dataset_yaml = 'ultralytics/cfg/datasets/cococo.yaml'
+        dataset_yaml = '/home/byounggun/cococo/data.yaml'
         self.nc = 80
+        # self.nc = 10
         self.names = ['aeroplane', 'apple', 'backpack', 'banana', 'baseball bat', 'baseball glove', 'bear', 'bed', 'bench', 'bicycle', 'bird', 'boat', 'book', 'bottle', 'bowl', 'broccoli', 'bus', 'cake', 'car', 'carrot', 'cat', 'cell phone', 'chair', 'clock', 'cow', 'cup', 'diningtable', 'dog', 'donut', 'elephant', 'fire hydrant', 'fork', 'frisbee', 'giraffe', 'hair drier', 'handbag', 'horse', 'hot dog', 'keyboard', 'kite', 'knife', 'laptop', 'microwave', 'motorbike', 'mouse', 'orange', 'oven', 'parking meter', 'person', 'pizza', 'pottedplant', 'refrigerator', 'remote', 'sandwich', 'scissors', 'sheep', 'sink', 'skateboard', 'skis', 'snowboard', 'sofa', 'spoon', 'sports ball', 'stop sign', 'suitcase', 'surfboard', 'teddy bear', 'tennis racket', 'tie', 'toaster', 'toilet', 'toothbrush', 'traffic light', 'train', 'truck', 'tvmonitor', 'umbrella', 'vase', 'wine glass', 'zebra']
+        # self.names = ['Green', 'Red', 'Green-up', 'Empty-count-down', 'Count-down', 'Yellow', 'Empty', 'Green-right', 'Green-left', 'Red-yellow']
         if os.path.exists(dataset_yaml):
             with open(dataset_yaml, 'r') as f:
                 data_yaml = yaml.safe_load(f)
             if isinstance(data_yaml, dict):
                 self.nc = data_yaml.get('nc', None)
                 self.names = data_yaml.get('names', None)
-        detect_head = self.model[-1]
-        if self.nc is None:
-            self.nc = getattr(detect_head, 'nc', getattr(self.yolo_model, 'nc', None))
-        if self.names is None:
-            self.names = getattr(detect_head, 'names', getattr(self.yolo_model, 'names', None))
+        # detect_head = self.model[-1]
+        # if self.nc is None:
+        #     self.nc = getattr(detect_head, 'nc', getattr(self.yolo_model, 'nc', None))
+        # if self.names is None:
+        #     self.names = getattr(detect_head, 'names', getattr(self.yolo_model, 'names', None))
         # self.save = self.yolo_model.save  # backbone output indices for multi-scale features
         # self.save = [4,6,9]
         self.save = [0,1,3,5,7]
         self.args = args
-        # --- 카메라 파라미터 저장 ---
-        # self.wide_K = wide_K
-        # self.wide_P = wide_P
-        # self.narrow_K = narrow_K
-        # self.narrow_P = narrow_P
-        # self.img_w = img_w
-        # self.img_h = img_h
-        # self.img_size = img_size if img_size is not None else (args.img_size if args and hasattr(args, 'img_size') else 640)
 
-        # --- Feature Fusion Normalization & Learnable Weights (Multi-Scale) ---
-        # Use separate BN for wide/narrow at each fusion scale (YOLOv8 official style)
+
+
         fusion_channels = []
         for i in self.save:
             layer = self.model[i]
@@ -113,24 +84,18 @@ class DualYOLOv8(nn.Module):
 
 
 
-    def extract_single_backbone_feature(self, x, save_idx):
-        # x를 backbone에 통과시켜 save_idx에 해당하는 feature만 추출
-        y = []
-        for i, m in enumerate(self.model):
-            if hasattr(m, 'f') and m.f != -1:
-                x = y[m.f] if isinstance(m.f, int) else [y[j] for j in m.f]
-            x = m(x)
-            y.append(x)
-            if i == save_idx:
-                return x
+    # def extract_single_backbone_feature(self, x, save_idx):
+    #     # x를 backbone에 통과시켜 save_idx에 해당하는 feature만 추출
+    #     y = []
+    #     for i, m in enumerate(self.model):
+    #         if hasattr(m, 'f') and m.f != -1:
+    #             x = y[m.f] if isinstance(m.f, int) else [y[j] for j in m.f]
+    #         x = m(x)
+    #         y.append(x)
+    #         if i == save_idx:
+    #             return x
 
     def forward(self, wide_img, narrow_img):
-        """
-        wide_img, narrow_img: (B, 3, 640, 640)
-        카메라 파라미터 기반으로 narrow FOV가 wide feature map에서 어디에 위치하는지 계산 후 sum
-        """
-        # 1. narrow의 4개 코너를 wide로 투영 (이미 img_size 기준으로 반환)
-        # wide_corners = self.project_narrow_to_wide()  # (4,2) img_size 기준
 
         y_wide, y_narrow = [], []
         y = []
@@ -147,7 +112,7 @@ class DualYOLOv8(nn.Module):
             xn_out = m(xn_in)
             y_wide.append(xw_out)
             y_narrow.append(xn_out)
-            # --- 마지막 backbone output에서 spatial sum 적용 ---
+
             if i in self.save:
                 B, C, H, W = xw_out.shape
                 # === YOLO label 비율 기반 bbox 계산 ===
@@ -317,7 +282,7 @@ def train(opt):
             with open(opt.hyp, 'r') as f:
                 model_args = yaml.safe_load(f)
     # nc 자동 세팅 (옵션)
-    dataset_yaml = '/home/byounggun/ultralytics/ultralytics/cfg/datasets/coco.yaml'
+    dataset_yaml = '/home/byounggun/cococo/data.yaml'
     if os.path.exists(dataset_yaml):
         with open(dataset_yaml, 'r') as f:
             data_yaml = yaml.safe_load(f)
@@ -326,10 +291,7 @@ def train(opt):
             model_args['nc'] = len(names)
     model = DualYOLOv8(
         yolo_weights_path=opt.weights,
-        args=opt,
-        # wide_K=wide_K, wide_P=wide_P,
-        # narrow_K=narrow_K, narrow_P=narrow_P,
-        # img_w=1920, img_h=1080
+        args=opt
     ).to(device)
     model.train()
 
@@ -491,7 +453,7 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
     """
     # from dataload_dual import DualImageDataset, get_dual_val_transforms, dual_collate_fn
     from dataload_dual import DualImageDataset, dual_collate_fn
-    from ultralytics.utils.metrics import ap_per_class
+    from ultralytics.utils.metrics import DetMetrics
     import torch
     import numpy as np
 
@@ -527,8 +489,8 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
     if not hasattr(model, 'args') or not (hasattr(model.args, 'box') and hasattr(model.args, 'cls') and hasattr(model.args, 'dfl')):
         model.args = types.SimpleNamespace(box=0.05, cls=0.5, dfl=1.5)
     loss_fn = v8DetectionLoss(model)
-    stats = []
     from ultralytics.utils.ops import non_max_suppression
+    det_metrics = DetMetrics(names=getattr(model, 'names', None) or {})
     for batch_idx, batch in enumerate(val_loader):
         imgs_wide, imgs_narrow, labels_list = batch['wide_img'].to(device), batch['narrow_img'].to(device), batch['labels']
         # labels_list: list of [num_targets, 5] (class, x, y, w, h)
@@ -557,20 +519,12 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
             total_batches += 1
             # --- metric 계산 ---
             for si, pred in enumerate(preds):
-                print(f"[VAL][img {si}] NMS pred shape: {None if pred is None else pred.shape}")
-                if pred is not None and pred.numel():
-                    print(f"[VAL][img {si}] NMS pred sample (first 2):\n{pred[:2].cpu().numpy()}")
-                else:
-                    print(f"[VAL][img {si}] NMS pred is EMPTY")
-                if pred is None or pred.shape[0] == 0:
-                    stats.append((np.zeros((0, 4)), np.zeros((0,)), np.zeros((0,)), np.zeros((0,))) )
-                    continue
-                # GT
+                # pred: (N, 6) [x1, y1, x2, y2, conf, cls]
+                # gt: (M, 6) [batch_idx, class, x, y, w, h] (labels)
+                # Convert GT to [cls, x1, y1, x2, y2] in pixels
                 tcls = labels[labels[:, 0] == si][:, 1].cpu().numpy() if labels.numel() else np.array([])
                 tbox_norm = labels[labels[:, 0] == si][:, 2:6].cpu().numpy() if labels.numel() else np.array([])
                 img_h, img_w = imgs_wide.shape[2:]
-                # tbox_norm: (N, 4) [x_center, y_center, w, h] (정규화)
-                # 픽셀 좌표로 변환: [x1, y1, x2, y2]
                 if len(tbox_norm):
                     x_c, y_c, w, h = tbox_norm[:, 0], tbox_norm[:, 1], tbox_norm[:, 2], tbox_norm[:, 3]
                     x1 = (x_c - w / 2) * img_w
@@ -580,37 +534,128 @@ def validate_dual(model, opt, device, wide_img_dir=None, narrow_img_dir=None, la
                     tbox_pixel = np.stack([x1, y1, x2, y2], axis=1)
                 else:
                     tbox_pixel = np.zeros((0, 4), dtype=np.float32)
-                print(f"[VAL][img {si}] GT labels count: {len(tcls)}")
-                if len(tcls):
-                    print(f"[VAL][img {si}] GT label sample: class={tcls[:2]}, box={tbox_pixel[:2]}")
+                gt = np.concatenate([tcls[:, None], tbox_pixel], axis=1) if len(tcls) else np.zeros((0, 5), dtype=np.float32)
+                # pred: (N, 6) [x1, y1, x2, y2, conf, cls]
+                pred_np = pred.cpu().numpy() if pred is not None and pred.numel() else np.zeros((0, 6), dtype=np.float32)
+                # --- Official YOLOv8-style stats matching logic ---
+                import numpy as np
+                import torch
+                from ultralytics.utils.metrics import box_iou
+
+                # ===== DEBUG: Show prediction/GT stats for this image =====
+                print(f"[DEBUG] pred_np shape: {pred_np.shape}, gt shape: {gt.shape}")
+                if pred_np.shape[0] == 0:
+                    print(f"[DEBUG] No predictions for this image")
+                if gt.shape[0] == 0:
+                    print(f"[DEBUG] No ground-truth for this image")
+                if pred_np.shape[0]:
+                    print(f"[DEBUG] pred_cls unique: {np.unique(pred_np[:, 5])}")
+                if gt.shape[0]:
+                    print(f"[DEBUG] gt_cls unique: {np.unique(gt[:, 0])}")
+                # ======================================
+
+                if 'stats' not in locals():
+                    stats = []
+                iouv = np.linspace(0.5, 0.95, 10)
+                n_iouv = len(iouv)
+
+                # pred_np: (N, 6) [x1, y1, x2, y2, conf, cls]
+                # gt: (M, 5) [cls, x1, y1, x2, y2]
+                if pred_np.shape[0] == 0:
+                    continue
+                # Compute IoU between each prediction and GT
+                ious = box_iou(torch.from_numpy(pred_np[:, :4]), torch.from_numpy(gt[:, 1:5])).numpy()  # (num_preds, num_gts)
+                pred_cls = pred_np[:, 5]
+                gt_cls = gt[:, 0]
+                n_preds, n_gts = pred_np.shape[0], gt.shape[0]
+                # For each prediction, find the best matching GT (by IoU and class)
+                correct = np.zeros((n_preds, 1), dtype=bool)
+                detected = []  # indices of GTs already assigned
+                for pred_idx, (p_cls, ious_row) in enumerate(zip(pred_cls, ious)):
+                    # Only match to GTs of the same class
+                    candidates = np.where(gt_cls == p_cls)[0]
+                    if candidates.size == 0:
+                        continue
+                    # For each IoU threshold, check if there is a match
+                    ious_cand = ious_row[candidates]
+                    best_iou_idx = ious_cand.argmax() if ious_cand.size else -1
+                    if ious_cand.size and ious_cand[best_iou_idx] >= 0.5 and candidates[best_iou_idx] not in detected:
+                        correct[pred_idx, 0] = True
+                        detected.append(candidates[best_iou_idx])
+                # --- DEBUG: 클래스 인덱스, 박스 스케일, true positive ---
+                # GT와 pred 모두 있을 때만 stats에 append (ap_per_class 오류 방지)
+                if gt.shape[0] > 0 and pred_np.shape[0] > 0:
+                    correct = np.zeros((pred_np.shape[0], 1), dtype=bool)
+                    detected = []
+                    for pred_idx, (p_cls, ious_row) in enumerate(zip(pred_np[:, 5], box_iou(torch.from_numpy(pred_np[:, :4]), torch.from_numpy(gt[:, 1:5])).numpy())):
+                        candidates = np.where(gt[:, 0] == p_cls)[0]
+                        if candidates.size == 0:
+                            continue
+                        ious_cand = ious_row[candidates]
+                        best_iou_idx = ious_cand.argmax() if ious_cand.size else -1
+                        if ious_cand.size and ious_cand[best_iou_idx] >= 0.5 and candidates[best_iou_idx] not in detected:
+                            correct[pred_idx, 0] = True
+                            detected.append(candidates[best_iou_idx])
+                    # correct 전체(2D)를 저장해야 ap_per_class가 정상 동작함
+                    if 'stats' in locals():
+                        stats.append((correct, pred_np[:, 4], pred_np[:, 5], gt[:, 0]))
+                        print(f"[DEBUG][STATS] stats[-1] shapes: {[arr.shape for arr in stats[-1]]}, GT count: {gt.shape[0]}, pred count: {pred_np.shape[0]}")
                 else:
-                    print(f"[VAL][img {si}] GT label is EMPTY")
-                # Prediction
-                pred_cls = pred[:, 5].cpu().numpy() if pred.numel() else np.array([])
-                pred_boxes = pred[:, :4].cpu().numpy() if pred.numel() else np.array([])
-                pred_conf = pred[:, 4].cpu().numpy() if pred.numel() else np.array([])
-                # Ensure all are np.ndarray, not tuple
-                pred_boxes = np.array(pred_boxes)
-                pred_conf = np.array(pred_conf)
-                pred_cls = np.array(pred_cls)
-                tcls = np.array(tcls)
-                # stats: (pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel)
-                stats.append((pred_boxes, pred_conf, pred_cls, tcls, tbox_pixel))
+                    print(f"[DEBUG][STATS] Skipped stats append. GT count: {gt.shape[0]}, pred count: {pred_np.shape[0]}")
+
     model.train()
+    # Detection Head가 10개 클래스인지 확인
+    print(model.model[-1].nc)  # 10이어야 함
+    print(model.names)         # 10개여야 함
     avg_loss = total_loss / max(1, total_batches)
-    # mAP/precision/recall 계산
-    if len(stats) and all(isinstance(x, np.ndarray) and x.size > 0 for x in stats[0]):
-        p, r, ap, f1, ap_class = ap_per_class(*zip(*stats))
-        metrics = {
-            "val/loss": avg_loss,
-            "val/precision": float(np.mean(p)) if len(p) else 0.0,
-            "val/recall": float(np.mean(r)) if len(r) else 0.0,
-            "val/mAP50": float(np.mean(ap[:, 0])) if ap.ndim > 1 else float(np.mean(ap)),
-            "val/mAP50-95": float(np.mean(ap[:, 1])) if ap.ndim > 1 and ap.shape[1] > 1 else 0.0,
-        }
+    # Aggregate stats for metric calculation using ap_per_class (legacy Ultralytics style)
+    from ultralytics.utils.metrics import ap_per_class
+    mean_p, mean_r, mean_ap50, mean_map = 0.0, 0.0, 0.0, 0.0  # defaults in case of empty stats
+    if 'stats' in locals() and len(stats):
+        stats_np = [np.concatenate(x, 0) if len(x) and len(x[0]) else np.array([]) for x in zip(*stats)]
+        # --- DEBUG: stats_np concat shape, dtype, 값, GT 존재 여부 ---
+        for idx, arr in enumerate(stats_np):
+            print(f"[DEBUG][STATS] stats_np[{idx}] shape: {arr.shape}, dtype: {arr.dtype}, first 10: {arr[:10] if len(arr) else 'EMPTY'}")
+        print(f"[DEBUG][STATS] stats_np empty check: {[len(arr) for arr in stats_np]}")
+        print(f"[DEBUG][STATS] target_cls(GT) shape: {stats_np[3].shape}, GT sample: {stats_np[3][:10] if len(stats_np[3]) else 'EMPTY'}")
+        if len(stats_np) == 4 and len(stats_np[3]):
+            tp, conf, pred_cls, target_cls = stats_np
+            # tp: (N, num_iou_thrs) or (N,)
+            if tp.ndim == 1:
+                tp = tp[:, None]  # (N, 1)로 변환 (예외 방지)
+            pred_cls = pred_cls.astype(np.int32)
+            target_cls = target_cls.astype(np.int32)
+            try:
+                print(f"[DEBUG][AP] ap_per_class input shapes: {[arr.shape for arr in [tp, conf, pred_cls, target_cls]]}")
+                print(f"[DEBUG][AP] ap_per_class input dtypes: {[arr.dtype for arr in [tp, conf, pred_cls, target_cls]]}")
+                print(f"[DEBUG][AP] ap_per_class input samples: {[arr[:10] if len(arr) else 'EMPTY' for arr in [tp, conf, pred_cls, target_cls]]}")
+                p, r, ap, f1, ap_class, *_ = ap_per_class(tp, conf, pred_cls, target_cls)
+                print(f"[DEBUG][AP] ap_per_class output: p({p.shape}), r({r.shape}), ap({ap.shape})")
+                mean_p, mean_r = p.mean(), r.mean()
+                if ap.ndim == 2 and ap.shape[1] > 0:
+                    mean_ap50 = ap[:, 0].mean()
+                else:
+                    mean_ap50 = ap.mean()
+                mean_map = ap.mean()
+            except Exception as e:
+                print(f"[ERROR][AP] ap_per_class exception: {e}")
+                mean_p = mean_r = mean_ap50 = mean_map = 0.0
+        else:
+            print(f"[DEBUG][STATS] ap_per_class skipped: GT(target_cls) is empty (shape={stats_np[3].shape}). All metrics set to 0.0.")
+            mean_p = mean_r = mean_ap50 = mean_map = 0.0
     else:
-        p = r = ap = f1 = ap_class = np.array([])
-        metrics = {"val/loss": avg_loss, "val/precision": 0.0, "val/recall": 0.0, "val/mAP50": 0.0, "val/mAP50-95": 0.0}
+        print("[DEBUG][STATS] stats is empty or not found, setting all metrics to 0.0")
+        mean_p = mean_r = mean_ap50 = mean_map = 0.0
+
+    print(f"[DEBUG][METRICS] Final metrics: precision={mean_p}, recall={mean_r}, mAP50={mean_ap50}, mAP50-95={mean_map}")
+
+    metrics = {
+        "val/loss": avg_loss,
+        "val/precision": float(mean_p),
+        "val/recall": float(mean_r),
+        "val/mAP50": float(mean_ap50),
+        "val/mAP50-95": float(mean_map),
+    }
     return metrics
 
 
