@@ -66,7 +66,7 @@ class DualYOLOv8(nn.Module):
         #     self.names = getattr(detect_head, 'names', getattr(self.yolo_model, 'names', None))
         # self.save = self.yolo_model.save  # backbone output indices for multi-scale features
         # self.save = [4,6,9]
-        self.save = [0,1,3,5,7]
+        self.save = [0,1,3]
         self.args = args
 
 
