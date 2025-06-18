@@ -58,7 +58,6 @@ mlruns/
 # Translations
 *.mo
 *.pot
-
 # Django stuff:
 *.log
 local_settings.py
@@ -196,3 +195,6 @@ traffics/
 traffic_dataset/
 traffic_train/
 
+swm/
+*.cache
+*.txt
