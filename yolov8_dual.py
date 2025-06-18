@@ -25,12 +25,6 @@ from ultralytics.utils.loss import v8DetectionLoss
 from dataload_dual import DualImageDataset, dual_collate_fn
 import numpy as np
 
-# wandb import with fallback
-try:
-    import wandb
-except ImportError:
-    wandb = None
-    LOGGER.warning("Wandb is not installed. Wandb logging is disabled.")
 
 
 __all__ = ["DualYOLOv8"]
@@ -354,21 +348,7 @@ def train(opt):
                 setattr(loss_fn.hyp, k, v)
 
     # ... (학습 루프 및 기타 코드) ...
-    # 학습 종료 후 wandb 종료
-    if wandb is not None and opt.wandb:
-        wandb.finish()
-
-    # wandb experiment logging (학습 시작 직전!)
-    if wandb is not None and opt.wandb:
-        wandb_project = os.path.basename(opt.project.rstrip('/')) if hasattr(opt, 'project') else 'yolov8-dual'
-        wandb.init(
-            project=wandb_project,
-            name=opt.name if hasattr(opt, "name") else "exp",
-            config=vars(opt)
-        )
-        LOGGER.info(f"Initialized wandb run: {wandb.run.id}")
-    else:
-        LOGGER.warning("Wandb logging is disabled (either wandb is not installed or --wandb not set).")
+    # wandb functionality removed
 
     for epoch in range(opt.epochs):
         model.train()
@@ -412,8 +392,7 @@ def train(opt):
                 log_dict["train/box_loss"] = loss_items[0]
                 log_dict["train/cls_loss"] = loss_items[1]
                 log_dict["train/dfl_loss"] = loss_items[2]
-            if wandb is not None and opt.wandb:
-                wandb.log(log_dict)
+            # wandb logging removed
             pbar.set_postfix({"loss": loss.item(), "lr": optimizer.param_groups[0]['lr']})
         # lr scheduler step
         if hasattr(optimizer, 'param_groups') and hasattr(opt, 'epochs'):
@@ -433,8 +412,7 @@ def train(opt):
             for k, v in val_metrics.items():
                 print(f"  {k}: {v}")
         # Aggressively log all available metrics to wandb
-        if wandb is not None and opt.wandb and val_metrics:
-            wandb.log({f"val/{k}": v for k, v in val_metrics.items() if isinstance(v, (float, int))})
+        # wandb logging removed
         # ===================== Save checkpoint =====================
         if (epoch + 1) % 10 == 0 or (epoch + 1) == opt.epochs:
             ckpt_path = os.path.join(save_dir, f"dual_yolov8_epoch{epoch+1}.pt")
@@ -684,7 +662,6 @@ def parse_opt():
     parser.add_argument('--project', type=str, default='runs/dual')
     parser.add_argument('--name', type=str, default='exp')
     parser.add_argument('--device', type=str, default='')
-    parser.add_argument('--wandb', action='store_true', help='use Weights & Biases logging')
     return parser.parse_args()
 
 if __name__ == '__main__':
