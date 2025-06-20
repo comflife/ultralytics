@@ -101,6 +101,12 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .multistream import (
+    MultiStreamConv,
+    MultiStreamC3,
+    MultiStreamMaxPool2d,
+    Fusion,
+)
 
 __all__ = (
     "Conv",
@@ -179,4 +185,8 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "MultiStreamConv",
+    "MultiStreamC3",
+    "MultiStreamMaxPool2d",
+    "Fusion",
 )

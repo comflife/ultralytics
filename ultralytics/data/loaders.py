@@ -658,3 +658,293 @@ def get_best_youtube_url(url, method="pytube"):
 
 # Define constants
 LOADERS = (LoadStreams, LoadPilAndNumpy, LoadImagesAndVideos, LoadScreenshots)
+
+
+class LoadDualImagesAndVideos:
+    """
+    Dual-camera data loader for YOLOv8 multi-stream models.
+    
+    This class loads paired images/videos from two camera sources and returns them as a list of tensors.
+    The structure is similar to LoadImagesAndVideos but adapted for dual input streams.
+    
+    Attributes:
+        files1 (List[str]): List of file paths for the first camera stream (wide camera).
+        files2 (List[str]): List of file paths for the second camera stream (narrow camera).
+        nf1, nf2 (int): Number of files in each stream.
+        video_flag1, video_flag2 (List[bool]): Flags indicating whether files are videos.
+        mode (str): Current mode ('image' or 'video').
+        vid_stride (int): Video frame-rate stride.
+        bs (int): Batch size.
+        cap1, cap2 (cv2.VideoCapture): Video capture objects for each stream.
+        frame (int): Frame counter.
+        cv2_flag (int): OpenCV flag for image reading.
+        
+    Methods:
+        __init__: Initialize the dual-stream data loader.
+        __iter__: Returns an iterator object.
+        __next__: Returns batches of paired images/frames with paths and metadata.
+        _new_video: Creates new video capture objects.
+        __len__: Returns the number of batches.
+    """
+    
+    def __init__(self, path1, path2, batch=1, vid_stride=1, channels=3):
+        """
+        Initialize dual-stream dataloader for paired images and videos.
+        
+        Args:
+            path1 (str | list): Path or list of paths to first stream files (wide camera).
+            path2 (str | list): Path or list of paths to second stream files (narrow camera).
+            batch (int): Batch size.
+            vid_stride (int): Video frame-rate stride.
+            channels (int): Number of image channels (1=grayscale, 3=color).
+        """
+        self.vid_stride = vid_stride
+        self.bs = batch
+        self.cv2_flag = cv2.IMREAD_GRAYSCALE if channels == 1 else cv2.IMREAD_COLOR
+        self.count = 0
+        self.frame = 0
+        self.cap1 = None
+        self.cap2 = None
+        self.fps1 = 0
+        self.fps2 = 0
+        self.frames1 = 0
+        self.frames2 = 0
+        
+        # Process first stream paths (wide camera)
+        files1 = []
+        if isinstance(path1, str):
+            if Path(path1).suffix == ".txt":
+                parent1 = Path(path1).parent
+                with open(path1, 'r') as f:
+                    for line in f:
+                        p = line.strip()
+                        if os.path.isfile(p):
+                            files1.append(p)
+                        elif os.path.isfile(str(parent1 / p)):
+                            files1.append(str((parent1 / p).absolute()))
+            elif "*" in path1:
+                files1.extend(sorted(glob.glob(path1, recursive=True)))
+            elif os.path.isdir(path1):
+                files1.extend(sorted(glob.glob(os.path.join(path1, "*.*"))))
+            elif os.path.isfile(path1):
+                files1.append(path1)
+            else:
+                raise FileNotFoundError(f"{path1} does not exist")
+        elif isinstance(path1, (list, tuple)):
+            for p in sorted(path1):
+                if os.path.isfile(p):
+                    files1.append(p)
+                else:
+                    raise FileNotFoundError(f"{p} does not exist")
+        
+        # Process second stream paths (narrow camera)
+        files2 = []
+        if isinstance(path2, str):
+            if Path(path2).suffix == ".txt":
+                parent2 = Path(path2).parent
+                with open(path2, 'r') as f:
+                    for line in f:
+                        p = line.strip()
+                        if os.path.isfile(p):
+                            files2.append(p)
+                        elif os.path.isfile(str(parent2 / p)):
+                            files2.append(str((parent2 / p).absolute()))
+            elif "*" in path2:
+                files2.extend(sorted(glob.glob(path2, recursive=True)))
+            elif os.path.isdir(path2):
+                files2.extend(sorted(glob.glob(os.path.join(path2, "*.*"))))
+            elif os.path.isfile(path2):
+                files2.append(path2)
+            else:
+                raise FileNotFoundError(f"{path2} does not exist")
+        elif isinstance(path2, (list, tuple)):
+            for p in sorted(path2):
+                if os.path.isfile(p):
+                    files2.append(p)
+                else:
+                    raise FileNotFoundError(f"{p} does not exist")
+        
+        # Define files as images or videos for both streams
+        images1, videos1 = [], []
+        for f in files1:
+            suffix = f.split(".")[-1].lower()
+            if suffix in IMG_FORMATS:
+                images1.append(f)
+            elif suffix in VID_FORMATS:
+                videos1.append(f)
+        ni1, nv1 = len(images1), len(videos1)
+        
+        images2, videos2 = [], []
+        for f in files2:
+            suffix = f.split(".")[-1].lower()
+            if suffix in IMG_FORMATS:
+                images2.append(f)
+            elif suffix in VID_FORMATS:
+                videos2.append(f)
+        ni2, nv2 = len(images2), len(videos2)
+        
+        # Store attributes
+        self.files1 = images1 + videos1
+        self.files2 = images2 + videos2
+        self.nf1 = ni1 + nv1  # number of files in stream 1
+        self.nf2 = ni2 + nv2  # number of files in stream 2
+        self.video_flag1 = [False] * ni1 + [True] * nv1
+        self.video_flag2 = [False] * ni2 + [True] * nv2
+        self.mode = "video" if (ni1 == 0 and ni2 == 0) else "image"
+        
+        # Initialize video related attributes
+        self.cap1 = self.cap2 = None
+        if any(videos1) and any(videos2):
+            self._new_video(videos1[0], videos2[0])
+        
+        # Validate data
+        if self.nf1 == 0 or self.nf2 == 0:
+            raise FileNotFoundError(f"No images or videos found in one of the sources. {FORMATS_HELP_MSG}")
+        if self.nf1 != self.nf2:
+            LOGGER.warning(f"Stream 1 has {self.nf1} files and Stream 2 has {self.nf2} files. Dual stream should have equal number of files.")
+        
+    def __iter__(self):
+        """Iterates through dual-stream image/video files."""
+        self.count = 0
+        return self
+    
+    def __next__(self):
+        """Returns the next batch of paired images or video frames."""
+        paths1, paths2 = [], []
+        imgs1, imgs2 = [], []
+        info = []
+        
+        while len(imgs1) < self.bs and len(imgs2) < self.bs:
+            if self.count >= min(self.nf1, self.nf2):  # end of file list
+                if imgs1 and imgs2:
+                    return [paths1, paths2], [imgs1, imgs2], info  # return last partial batch
+                else:
+                    raise StopIteration
+            
+            # Process first stream
+            path1 = self.files1[min(self.count, self.nf1-1)]
+            if self.video_flag1[min(self.count, self.nf1-1)]:
+                self.mode = "video"
+                if not self.cap1 or not self.cap1.isOpened():
+                    self._new_video(path1, self.files2[min(self.count, self.nf2-1)])
+                
+                # Read frames from video 1
+                success1 = False
+                for _ in range(self.vid_stride):
+                    success1 = self.cap1.grab()
+                    if not success1:
+                        break
+                
+                if success1:
+                    success1, im01 = self.cap1.retrieve()
+                    if success1:
+                        self.frame += 1
+                        paths1.append(path1)
+                        imgs1.append(im01)
+                else:
+                    # Move to the next file if video ended
+                    self.count += 1
+                    if self.cap1:
+                        self.cap1.release()
+                        self.cap1 = None
+                    if self.count < self.nf1:
+                        continue
+            else:
+                # Handle image files for stream 1
+                self.mode = "image"
+                if path1.split(".")[-1].lower() == "heic":
+                    check_requirements("pillow-heif")
+                    from pillow_heif import register_heif_opener
+                    register_heif_opener()
+                    with Image.open(path1) as img:
+                        im01 = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+                else:
+                    im01 = imread(path1, flags=self.cv2_flag)  # BGR
+                
+                if im01 is None:
+                    LOGGER.warning(f"Image Read Error {path1}")
+                    self.count += 1
+                    continue
+                else:
+                    paths1.append(path1)
+                    imgs1.append(im01)
+            
+            # Process second stream
+            path2 = self.files2[min(self.count, self.nf2-1)]
+            if self.video_flag2[min(self.count, self.nf2-1)]:
+                # Read frames from video 2
+                success2 = False
+                for _ in range(self.vid_stride):
+                    success2 = self.cap2.grab()
+                    if not success2:
+                        break
+                
+                if success2:
+                    success2, im02 = self.cap2.retrieve()
+                    if success2:
+                        paths2.append(path2)
+                        imgs2.append(im02)
+                        info.append(f"dual video {self.count + 1}/{min(self.nf1, self.nf2)} (frame {self.frame}) {path1} {path2}: ")
+                        if self.frame >= min(self.frames1, self.frames2):  # end of videos
+                            self.count += 1
+                            self.cap1.release()
+                            self.cap2.release()
+                            self.cap1 = self.cap2 = None
+                else:
+                    # Move to the next file if video ended
+                    self.count += 1
+                    if self.cap2:
+                        self.cap2.release()
+                        self.cap2 = None
+                    if self.count < self.nf2:
+                        continue
+            else:
+                # Handle image files for stream 2
+                if path2.split(".")[-1].lower() == "heic":
+                    check_requirements("pillow-heif")
+                    from pillow_heif import register_heif_opener
+                    register_heif_opener()
+                    with Image.open(path2) as img:
+                        im02 = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+                else:
+                    im02 = imread(path2, flags=self.cv2_flag)  # BGR
+                
+                if im02 is None:
+                    LOGGER.warning(f"Image Read Error {path2}")
+                    self.count += 1
+                    continue
+                else:
+                    paths2.append(path2)
+                    imgs2.append(im02)
+                    info.append(f"dual image {self.count + 1}/{min(self.nf1, self.nf2)} {path1} {path2}: ")
+                    self.count += 1
+            
+            # For image mode, we can break after one iteration
+            if self.mode == "image":
+                break
+        
+        return [paths1, paths2], [imgs1, imgs2], info
+    
+    def _new_video(self, path1, path2):
+        """Creates new video capture objects for the given paths."""
+        self.frame = 0
+        self.cap1 = cv2.VideoCapture(path1)
+        self.cap2 = cv2.VideoCapture(path2)
+        self.fps1 = max(int(self.cap1.get(cv2.CAP_PROP_FPS)), 1)
+        self.fps2 = max(int(self.cap2.get(cv2.CAP_PROP_FPS)), 1)
+        
+        if not self.cap1.isOpened():
+            raise FileNotFoundError(f"Failed to open video {path1}")
+        if not self.cap2.isOpened():
+            raise FileNotFoundError(f"Failed to open video {path2}")
+        
+        self.frames1 = int(self.cap1.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_stride)
+        self.frames2 = int(self.cap2.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_stride)
+    
+    def __len__(self):
+        """Returns the number of file batches in the dual-stream dataset."""
+        return math.ceil(min(self.nf1, self.nf2) / self.bs)  # number of batches
+
+
+# Update the LOADERS tuple to include the new dual-stream loader
+LOADERS = (LoadStreams, LoadPilAndNumpy, LoadImagesAndVideos, LoadScreenshots, LoadDualImagesAndVideos)

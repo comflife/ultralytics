@@ -137,7 +137,7 @@ class BaseModel(torch.nn.Module):
         Perform a forward pass through the network.
 
         Args:
-            x (torch.Tensor): The input tensor to the model.
+            x (torch.Tensor | list): The input tensor to the model, or list [x1, x2] for dual-stream models.
             profile (bool): Print the computation time of each layer if True.
             visualize (bool): Save the feature maps of the model if True.
             embed (list, optional): A list of feature vectors/embeddings to return.
@@ -146,17 +146,71 @@ class BaseModel(torch.nn.Module):
             (torch.Tensor): The last output of the model.
         """
         y, dt, embeddings = [], [], []  # outputs
+        
+        # Check for dual-stream input (list of two tensors)
+        is_dual_stream = False
+        dual_stream_active = False
+        if isinstance(x, list) and len(x) == 2:
+            # Verify both elements are tensors
+            if all(isinstance(t, torch.Tensor) for t in x):
+                is_dual_stream = True
+        
         for m in self.model:
             if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-            if profile:
-                self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
+                x_input = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            else:
+                x_input = x
+                
+            # Handle MultiStream modules for dual-stream input
+            if is_dual_stream and not dual_stream_active:
+                if hasattr(m, '__class__') and 'MultiStream' in str(m.__class__.__name__):
+                    # First MultiStream module encountered - activate dual stream mode
+                    dual_stream_active = True
+                    # Process dual streams separately
+                    x1, x2 = x  # unpack the two streams
+                    if profile:
+                        self._profile_one_layer(m, x1, dt)
+                    x = [m(x1), m(x2)]  # Apply to each stream separately
+                    continue
+                    
+            if is_dual_stream and dual_stream_active:
+                if hasattr(m, '__class__') and 'Fusion' in str(m.__class__.__name__):
+                    # Fusion module - combine streams
+                    if profile:
+                        self._profile_one_layer(m, x, dt)
+                    x = m(x)  # Fusion merges the streams
+                    dual_stream_active = False  # Return to normal processing
+                elif hasattr(m, '__class__') and 'MultiStream' in str(m.__class__.__name__):
+                    # Continue processing dual streams
+                    if profile:
+                        self._profile_one_layer(m, x[0], dt)
+                    x = [m(x[0]), m(x[1])]  # Apply to each stream separately
+                else:
+                    # For regular modules during dual-stream processing, exit dual mode
+                    LOGGER.warning(f"Non-MultiStream module {m.__class__.__name__} encountered during dual-stream processing. Merging streams.")
+                    # Basic concatenation as fallback
+                    x = torch.cat(x, 1)
+                    dual_stream_active = False
+                    if profile:
+                        self._profile_one_layer(m, x, dt)
+                    x = m(x)
+            else:
+                # Normal single-stream processing
+                if profile:
+                    self._profile_one_layer(m, x_input, dt)
+                x = m(x_input)  # run
+                
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if embed and m.i in embed:
-                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                # Handle embeddings (for dual-stream or single-stream)
+                if isinstance(x, list):
+                    # For dual-stream, use first stream for embedding
+                    e = torch.nn.functional.adaptive_avg_pool2d(x[0], (1, 1)).squeeze(-1).squeeze(-1)
+                else:
+                    e = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1)
+                embeddings.append(e)  # flatten
                 if m.i == max(embed):
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
         return x
