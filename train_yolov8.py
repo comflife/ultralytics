@@ -3,11 +3,8 @@
 Train a YOLOv8 model on a custom dataset.
 
 Usage - Single-GPU training:
-    $ python train_yolov8.py --data swm.yaml --weights yolov8n.pt --img 640  # from pretrained (recommended)
     $ python train_yolov8.py --data swm.yaml --weights yolov8n.pt --cfg yolov8n.yaml --img 640 --epochs 20
 
-Usage - Multi-GPU DDP training:
-    $ torchrun --nproc_per_node 2 train_yolov8.py --data coco.yaml --weights yolov8s.pt --device 0,1
 """
 
 import argparse
