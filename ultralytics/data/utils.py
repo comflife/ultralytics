@@ -401,15 +401,25 @@ def check_det_dataset(dataset, autodownload=True):
     # Read YAML
     data = YAML.load(file, append_filename=True)  # dictionary
 
-    # Checks
-    for k in "train", "val":
-        if k not in data:
-            if k != "val" or "validation" not in data:
-                raise SyntaxError(
-                    emojis(f"{dataset} '{k}:' key missing ❌.\n'train' and 'val' are required in all data YAMLs.")
-                )
-            LOGGER.warning("renaming data YAML 'validation' key to 'val' to match YOLO format.")
-            data["val"] = data.pop("validation")  # replace 'validation' key with 'val' key
+    # Checks for standard keys or dual-stream keys
+    is_dual_stream = any(k.startswith(('train_', 'val_')) for k in data.keys())
+    
+    # Check if this is a dual-stream dataset with _wide and _narrow keys
+    if is_dual_stream and all(k in data for k in ['train_wide', 'train_narrow', 'val_wide', 'val_narrow']):
+        LOGGER.info(f"Detected dual-stream dataset with custom keys: train_wide/narrow, val_wide/narrow")
+        # Create virtual 'train' and 'val' keys that point to the wide camera paths
+        data["train"] = data["train_wide"]
+        data["val"] = data["val_wide"] 
+    else:
+        # Standard key checks
+        for k in "train", "val":
+            if k not in data:
+                if k != "val" or "validation" not in data:
+                    raise SyntaxError(
+                        emojis(f"{dataset} '{k}:' key missing ❌.\n'train' and 'val' are required in all data YAMLs.")
+                    )
+                LOGGER.warning("renaming data YAML 'validation' key to 'val' to match YOLO format.")
+                data["val"] = data.pop("validation")  # replace 'validation' key with 'val' key
     if "names" not in data and "nc" not in data:
         raise SyntaxError(emojis(f"{dataset} key missing ❌.\n either 'names' or 'nc' are required in all data YAMLs."))
     if "names" in data and "nc" in data and len(data["names"]) != data["nc"]:

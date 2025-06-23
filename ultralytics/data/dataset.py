@@ -55,6 +55,8 @@ class YOLODataset(BaseDataset):
         use_keypoints (bool): Indicates if keypoints should be used for pose estimation.
         use_obb (bool): Indicates if oriented bounding boxes should be used.
         data (dict): Dataset configuration dictionary.
+        is_dual_stream (bool): Indicates if the dataset is for dual-stream models.
+        narrow_path (str): Path to narrow camera images for dual-stream models.
 
     Methods:
         cache_labels: Cache dataset labels, check images and read shapes.
@@ -83,8 +85,14 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
+        # Initialize dual-stream attributes
+        self.is_dual_stream = False
+        self.narrow_path = None
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
-        super().__init__(*args, channels=self.data["channels"], **kwargs)
+        
+        # Get channels from data dict if available, else default to 3
+        channels = self.data.get("channels", 3) if self.data else 3
+        super().__init__(*args, channels=channels, **kwargs)
 
     def cache_labels(self, path=Path("./labels.cache")):
         """

@@ -114,10 +114,9 @@ def train(cfg, opt, device, callbacks=None):
         'amp': True,  # Automatic Mixed Precision
         'fraction': 1.0,  # dataset fraction to train on
         'profile': False,  # profile ONNX and TensorRT speeds
-        'val': not opt.noval,
-        'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
-        # Note: We handle dual-stream mode internally and don't pass it to the trainer
+        # Pass dual_stream flag to trainer to enable dual-stream loading
+        # 'dual_stream': is_dual_model or opt.dual_stream
     }
     
     # Start training
