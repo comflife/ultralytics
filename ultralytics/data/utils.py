@@ -10,9 +10,12 @@ from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from tarfile import is_tarfile
 
+import contextlib
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ExifTags
+from typing import Dict, List, Tuple, Union
+
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.utils import (
@@ -135,17 +138,18 @@ def get_hash(paths):
     return h.hexdigest()  # return hash
 
 
-def exif_size(img: Image.Image):
-    """Returns exif-corrected PIL size."""
+# Get orientation exif tag
+for orientation in ExifTags.TAGS.keys():
+    if ExifTags.TAGS[orientation] == 'Orientation':
+        break
+
+def exif_size(img):
+    """Returns corrected PIL image size (width, height) considering EXIF orientation."""
     s = img.size  # (width, height)
-    if img.format == "JPEG":  # only support JPEG images
-        try:
-            if exif := img.getexif():
-                rotation = exif.get(274, None)  # the EXIF key for the orientation tag is 274
-                if rotation in {6, 8}:  # rotation 270 or 90
-                    s = s[1], s[0]
-        except Exception:
-            pass
+    with contextlib.suppress(Exception):
+        rotation = dict(img._getexif().items())[orientation]
+        if rotation in [6, 8]:  # rotation 270 or 90
+            s = (s[1], s[0])
     return s
 
 
@@ -245,6 +249,59 @@ def verify_image_label(args):
         nc = 1
         msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
         return [None, None, None, None, None, nm, nf, ne, nc, msg]
+
+
+def verify_rgbt_image_label(modalities, args):
+    """Verifies a single image-label pair for dual-stream datasets, ensuring image format, size, and legal label values."""
+    im_file, lb_file, prefix = args
+    nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, "", []  # number (missing, found, empty, corrupt), message, segments
+    try:
+        for modality in modalities:
+            # verify images
+            im = Image.open(im_file.format(modality))
+            im.verify()  # PIL verify
+            shape = exif_size(im)  # image size
+            assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+            assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}"
+            if im.format.lower() in ("jpg", "jpeg"):
+                with open(im_file, "rb") as f:
+                    f.seek(-2, 2)
+                    if f.read() != b"\xff\xd9":  # corrupt JPEG
+                        ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
+                        msg = f"{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved"
+
+        # verify labels
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            with open(lb_file) as f:
+                lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                lb = np.array(lb, dtype=np.float32)
+            nl = len(lb)
+            if nl:
+                assert lb.shape[1] == 6, f"labels require 6 columns, {lb.shape[1]} columns detected"
+                assert (lb >= 0).all(), f"negative label values {lb[lb < 0]}"
+                assert (lb[:, 1:-1] <= 1).all(), f"non-normalized or out of bounds coordinates {lb[:, 1:-1][lb[:, 1:-1] > 1]}"
+                
+
+                
+                _, i = np.unique(lb, axis=0, return_index=True)
+                if len(i) < nl:  # duplicate row check
+                    lb = lb[i]  # remove duplicates
+                    msg = f"{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed"
+            else:
+                ne = 1  # label empty
+                lb = np.zeros((0, 6), dtype=np.float32)
+        else:
+            nm = 1  # label missing
+            lb = np.zeros((0, 6), dtype=np.float32)
+
+        # assuming lwir and vis images have same shape!
+        return im_file, lb, shape, segments, nm, nf, ne, nc, msg
+
+    except Exception as e:
+        nc = 1
+        msg = f"{prefix}WARNING ⚠️ {im_file} : ignoring corrupt image/label: {e}"
+        return [None, None, None, None, nm, nf, ne, nc, msg]
 
 
 def visualize_image_annotations(image_path, txt_path, label_map):
@@ -764,7 +821,7 @@ def compress_one_image(f, f_new=None, max_dim=1920, quality=50):
         cv2.imwrite(str(f_new or f), im)
 
 
-def load_dataset_cache_file(path):
+def load_dataset_cache_file(path: Path) -> Dict:
     """Load an Ultralytics *.cache dictionary from path."""
     import gc
 

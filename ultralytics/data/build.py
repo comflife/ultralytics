@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from torch.utils.data import dataloader, distributed
 
-from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
+from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset, YOLODualStreamDataset
 from ultralytics.data.loaders import (
     LOADERS,
     LoadImagesAndVideos,
@@ -104,7 +104,7 @@ def seed_worker(worker_id):  # noqa
     random.seed(worker_seed)
 
 
-def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, stride=32, multi_modal=False):
+def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, stride=32, multi_modal=False, dual_stream=True):
     """
     Build and return a YOLO dataset based on configuration parameters.
     
@@ -117,75 +117,40 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, str
         rect (bool): Enable rectangular inference.
         stride (int): Model stride.
         multi_modal (bool): Whether to use multi-modal dataset.
+        dual_stream (bool): Whether to use dual-stream dataset.
         
     Returns:
         (Dataset): Dataset object for the specified configuration.
     """
     # Check if this is a dual-stream configuration
-    is_dual = is_dual_stream_yaml(data) and getattr(cfg, 'dual_stream', False)
-    
-    # Override img_path if using dual-stream mode
-    if is_dual:
-        LOGGER.info(f"Using dual-stream paths from YAML configuration")
-        try:
-            img_path, _ = get_dual_stream_paths(data, mode)
-            LOGGER.info(f"Using wide camera path: {img_path}")
-        except KeyError:
-            LOGGER.warning(f"Could not find dual stream paths for mode '{mode}', using provided path")
-            # Continue with the provided img_path
+    is_dual = dual_stream or getattr(cfg, 'dual_stream', False)
     
     # If using dual-stream dataset
     if is_dual:
-        try:
-            # Get wide and narrow paths from the YAML
-            wide_path, narrow_path = get_dual_stream_paths(data, mode)
-            
-            # Use the wide camera path for the main dataset (it will contain the labels)
-            dataset = YOLODataset(
-                img_path=wide_path,  # Use wide camera path from the YAML
-                imgsz=cfg.imgsz,
-                batch_size=batch,
-                augment=mode == "train",  # augmentation
-                hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
-                rect=cfg.rect or rect,  # rectangular batches
-                cache=cfg.cache or None,
-                single_cls=cfg.single_cls or False,
-                stride=int(stride),
-                pad=0.0 if mode == "train" else 0.5,
-                prefix=colorstr(f"{mode} (wide): "),
-                task=cfg.task,
-                classes=cfg.classes,
-                data=data,
-                fraction=cfg.fraction if mode == "train" else 1.0,
-            )
-            # Add attribute to mark as dual stream (for use in trainer)
-            dataset.is_dual_stream = True
-            
-            # Store the narrow camera path in the dataset for later use
-            dataset.narrow_path = narrow_path
-            LOGGER.info(f"Dual stream configuration: using wide={wide_path}, narrow={narrow_path}")
-            
-        except KeyError as e:
-            LOGGER.warning(f"Dual stream configuration error: {e}. Defaulting to single stream.")
-            dataset = YOLODataset(
-                img_path=img_path,
-                imgsz=cfg.imgsz,
-                batch_size=batch,
-                augment=mode == "train",  # augmentation
-                hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
-                rect=cfg.rect or rect,  # rectangular batches
-                cache=cfg.cache or None,
-                single_cls=cfg.single_cls or False,
-                stride=int(stride),
-                pad=0.0 if mode == "train" else 0.5,
-                prefix=colorstr(f"{mode}: "),
-                task=cfg.task,
-                classes=cfg.classes,
-                data=data,
-                fraction=cfg.fraction if mode == "train" else 1.0,
-            )
-            dataset.is_dual_stream = False
+        LOGGER.info(f"Using dual-stream dataset for {mode}")
         
+        # Use the dual-stream dataset class
+        dataset = YOLODualStreamDataset(
+            img_path=img_path,  # This will contain {} placeholders
+            imgsz=cfg.imgsz,
+            batch_size=batch,
+            augment=mode == "train",  # augmentation
+            hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
+            rect=cfg.rect or rect,  # rectangular batches
+            cache=cfg.cache or None,
+            single_cls=cfg.single_cls or False,
+            stride=int(stride),
+            pad=0.0 if mode == "train" else 0.5,
+            prefix=colorstr(f"{mode} (dual): "),
+            task=cfg.task,
+            classes=cfg.classes,
+            data=data,
+            fraction=cfg.fraction if mode == "train" else 1.0,
+        )
+        # Add attribute to mark as dual stream (for use in trainer)
+        dataset.is_dual_stream = True
+        
+        LOGGER.info(f"Dual stream dataset created successfully")
         return dataset
     else:
         # Standard single-stream dataset loading
@@ -378,55 +343,55 @@ def load_inference_source(source=None, batch=1, vid_stride=1, buffer=False, chan
     return dataset
 
 
-def is_dual_stream_yaml(data):
-    """
-    Check if the data configuration is for a dual-stream setup.
-    
-    Args:
-        data (dict): Dataset configuration dictionary.
-        
-    Returns:
-        (bool): True if data contains dual-stream paths, False otherwise.
-    """
-    # Check for both train_wide/narrow and val_wide/narrow keys
-    has_train_dual = 'train_wide' in data and 'train_narrow' in data
-    has_val_dual = 'val_wide' in data and 'val_narrow' in data
-    
-    # Only return true if both train and val dual keys exist
-    return has_train_dual and has_val_dual
+# def is_dual_stream_yaml(data):
+#     """
+#     Check if the data configuration is for a dual-stream setup.
+#     
+#     Args:
+#         data (dict): Dataset configuration dictionary.
+#         
+#     Returns:
+#         (bool): True if data contains dual-stream paths, False otherwise.
+#     """
+#     # Check for both train_wide/narrow and val_wide/narrow keys
+#     has_train_dual = 'train_wide' in data and 'train_narrow' in data
+#     has_val_dual = 'val_wide' in data and 'val_narrow' in data
+#     
+#     # Only return true if both train and val dual keys exist
+#     return has_train_dual and has_val_dual
 
 
-def get_dual_stream_paths(data, mode='train'):
-    """
-    Extract dual-stream paths from data configuration.
-    
-    Args:
-        data (dict): Dataset configuration dictionary.
-        mode (str): Dataset mode ('train', 'val', 'test').
-        
-    Returns:
-        (tuple): Tuple containing paths for wide and narrow camera images.
-    """
-    wide_key = f"{mode}_wide"
-    narrow_key = f"{mode}_narrow"
-    
-    # Check if the dual-stream keys exist
-    if wide_key in data and narrow_key in data:
-        LOGGER.info(f"Using dual-stream paths: {wide_key}={data[wide_key]}, {narrow_key}={data[narrow_key]}")
-        return data[wide_key], data[narrow_key]
-    
-    # If dual-stream keys don't exist, but we have the standard key, use it for both (as fallback)
-    if mode in data:
-        LOGGER.warning(f"Dual-stream keys not found. Using '{mode}' for both wide and narrow paths.")
-        return data[mode], data[mode]
-    
-    # If we're using purely dual-stream keys without standard keys
-    if mode == 'train' and 'train_wide' in data:
-        # We are using exclusively dual-stream keys without standard keys
-        raise KeyError(f"Using dual-stream mode but '{mode}' key is missing. Make sure to call check_det_dataset first.")
-    
-    raise KeyError(f"Dual-stream configuration requires both '{wide_key}' and '{narrow_key}' keys " 
-                    f"or at least the standard '{mode}' key")
+# def get_dual_stream_paths(data, mode='train'):
+#     """
+#     Extract dual-stream paths from data configuration.
+#     
+#     Args:
+#         data (dict): Dataset configuration dictionary.
+#         mode (str): Dataset mode ('train', 'val', 'test').
+#         
+#     Returns:
+#         (tuple): Tuple containing paths for wide and narrow camera images.
+#     """
+#     wide_key = f"{mode}_wide"
+#     narrow_key = f"{mode}_narrow"
+#     
+#     # Check if the dual-stream keys exist
+#     if wide_key in data and narrow_key in data:
+#         LOGGER.info(f"Using dual-stream paths: {wide_key}={data[wide_key]}, {narrow_key}={data[narrow_key]}")
+#         return data[wide_key], data[narrow_key]
+#     
+#     # If dual-stream keys don't exist, but we have the standard key, use it for both (as fallback)
+#     if mode in data:
+#         LOGGER.warning(f"Dual-stream keys not found. Using '{mode}' for both wide and narrow paths.")
+#         return data[mode], data[mode]
+#     
+#     # If we're using purely dual-stream keys without standard keys
+#     if mode == 'train' and 'train_wide' in data:
+#         # We are using exclusively dual-stream keys without standard keys
+#         raise KeyError(f"Using dual-stream mode but '{mode}' key is missing. Make sure to call check_det_dataset first.")
+#     
+#     raise KeyError(f"Dual-stream configuration requires both '{wide_key}' and '{narrow_key}' keys " 
+#                     f"or at least the standard '{mode}' key")
 
 
 class DualStreamDataLoader(InfiniteDataLoader):

@@ -27,7 +27,6 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 from ultralytics.utils.callbacks import get_default_callbacks
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER, colorstr
-from ultralytics.utils.checks import check_file, check_yaml, print_args
 from ultralytics.utils.torch_utils import select_device
 from ultralytics.utils.files import increment_path
 import yaml
@@ -116,7 +115,7 @@ def train(cfg, opt, device, callbacks=None):
         'profile': False,  # profile ONNX and TensorRT speeds
         'save_period': opt.save_period,
         # Pass dual_stream flag to trainer to enable dual-stream loading
-        # 'dual_stream': is_dual_model or opt.dual_stream
+        'dual_stream': is_dual_model or opt.dual_stream
     }
     
     # Start training
@@ -151,7 +150,7 @@ def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov8n.pt", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="", help="model yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "ultralytics/cfg/datasets/swm_dual_updated.yaml", help="dataset.yaml path")
+    parser.add_argument("--data", type=str, default=ROOT / "ultralytics/cfg/datasets/swm_dual.yaml", help="dataset.yaml path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")

@@ -62,7 +62,9 @@ class DetectionTrainer(BaseTrainer):
             (Dataset): YOLO dataset object configured for the specified mode.
         """
         gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        # Pass dual_stream flag if available in args
+        dual_stream = getattr(self.args, 'dual_stream', False)
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs, dual_stream=dual_stream)
 
     def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
         """

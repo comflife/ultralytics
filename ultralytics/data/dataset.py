@@ -16,6 +16,9 @@ from ultralytics.utils import LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, colorstr
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.ops import resample_segments, segments2boxes
 from ultralytics.utils.torch_utils import TORCHVISION_0_18
+import os
+import glob
+import tqdm
 
 from .augment import (
     Compose,
@@ -638,6 +641,349 @@ class GroundingDataset(YOLODataset):
     def _get_neg_texts(category_freq, threshold=100):
         """Get negative text samples based on frequency threshold."""
         return [k for k, v in category_freq.items() if v >= threshold]
+
+
+class YOLODualStreamDataset(YOLODataset):
+    """
+    Dataset class for loading dual-stream RGBT (RGB-Thermal) data in YOLO format.
+    
+    This class extends YOLODataset to handle two image modalities (wide and narrow cameras)
+    for each training sample, supporting dual-stream model training.
+    
+    Attributes:
+        modalities (tuple): Image modalities ('wide', 'narrow').
+    """
+    
+    cache_version = "1.0.5"  # dataset labels *.cache version for dual stream
+    modalities = ('wide', 'narrow')
+
+    def __init__(self, *args, data=None, task="detect", **kwargs):
+        """Initialize YOLODualStreamDataset with dual-stream configuration."""
+        # Store original arguments
+        self.data = data
+        self.task = task
+        
+        # TODO: Disable mosaic for now - need to implement dual-stream mosaic
+        if 'hyp' in kwargs and kwargs['hyp'] is not None:
+            if hasattr(kwargs['hyp'], 'mosaic'):
+                kwargs['hyp'].mosaic = 0.0
+        
+        # Initialize parent class
+        super().__init__(*args, data=data, task=task, **kwargs)
+        
+        # Set dual-stream flag
+        self.is_dual_stream = True
+        
+        LOGGER.info(f"Dual-stream dataset initialized with {len(self.im_files)} samples")
+
+    def img2label_paths(self, img_paths):
+        """Generates label file paths from corresponding image file paths by replacing `/images/{}` with `/labels/` and
+        extension with `.txt`. Cleanly removes any {} placeholder in the label path.
+        """
+        label_paths = []
+        for img_path in img_paths:
+            if '{}' in img_path:
+                # Extract the base filename and root directory
+                # Example: from "/datasets/swm-data/train/images/{}/file.jpg" get "file" and "/datasets/swm-data/train/"
+                img_parts = img_path.split(os.sep)
+                file_name = img_parts[-1]
+                
+                # Find the 'images' directory index
+                try:
+                    images_idx = img_parts.index('images')
+                    # Build the path to the root directory (before 'images')
+                    root_dir = os.sep.join(img_parts[:images_idx])
+                    # Get base filename without extension
+                    base_name = os.path.splitext(file_name)[0]
+                    # Create the label path
+                    label_path = os.path.join(root_dir, 'labels', f"{base_name}.txt")
+                    label_paths.append(label_path)
+                except ValueError:
+                    # If 'images' not found, use a fallback method
+                    LOGGER.warning(f"Could not parse path correctly: {img_path}")
+                    # Use a regex-based replacement as fallback
+                    import re
+                    label_path = re.sub(r'[/\\]images[/\\]\{\}[/\\]', f'{os.sep}labels{os.sep}', img_path)
+                    label_path = os.path.splitext(label_path)[0] + '.txt'
+                    label_paths.append(label_path)
+            else:
+                # Standard path without placeholder - replace /images/ with /labels/
+                sa_standard = f"{os.sep}images{os.sep}"
+                sb = f"{os.sep}labels{os.sep}"
+                label_path = img_path.replace(sa_standard, sb).rsplit(".", 1)[0] + ".txt"
+                label_paths.append(label_path)
+        return label_paths
+
+    def cache_labels(self, path=Path("./labels.cache"), prefix=""):
+        """Caches dataset labels, verifies images, reads shapes, and tracks dataset integrity."""
+        x = {}  # dict
+        data = []  # use list to keep image orders
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
+        desc = f"{prefix}Scanning {path.parent / path.stem}..."
+
+        pbar = TQDM(
+            zip(self.im_files, self.label_files, repeat(prefix)),
+            desc=desc,
+            total=len(self.im_files))
+
+        for blob in pbar:
+            im_file, lb_file, prefix_str = blob
+            
+            # For dual-stream, manually verify both images exist
+            wide_path = im_file.format('wide')
+            narrow_path = im_file.format('narrow')
+            
+            both_images_exist = os.path.exists(wide_path) and os.path.exists(narrow_path)
+            label_exists = os.path.exists(lb_file)
+            
+            if both_images_exist and label_exists:
+                # Both images and label exist
+                nf += 1
+                # Get shape from wide image
+                from PIL import Image
+                try:
+                    img = Image.open(wide_path)
+                    shape = img.size[::-1]  # (h, w)
+                    # Read labels
+                    with open(lb_file, "r") as f:
+                        lb_content = f.read().strip().splitlines()
+                        if lb_content:
+                            lb = np.array([x.split() for x in lb_content], dtype=np.float32)
+                        else:
+                            ne += 1
+                            lb = np.zeros((0, 5), dtype=np.float32)
+                    
+                    segments = []  # No segment info
+                    # Use original placeholder path
+                    im_file_out = im_file
+                    msg = ""
+                
+                except Exception as e:
+                    nc += 1
+                    msg = f"{prefix_str}WARNING ⚠️ {im_file}: corrupt image/label: {e}"
+                    im_file_out, lb, shape, segments = None, None, None, None
+            
+            else:
+                # Missing images or label
+                if not label_exists:
+                    nm += 1
+                    msg = f"{prefix_str}WARNING ⚠️ {im_file}: missing label file {lb_file}"
+                else:
+                    nm += 1
+                    msg = f"{prefix_str}WARNING ⚠️ {im_file}: missing wide or narrow image"
+                
+                im_file_out, lb, shape, segments = None, None, None, None
+            
+            if msg:
+                msgs.append(msg)
+            pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            data.append([im_file_out, lb, shape, segments])
+        pbar.close()
+
+        if msgs:
+            LOGGER.info("\n".join(msgs))
+        if nf == 0:
+            LOGGER.warning(f"{prefix}WARNING ⚠️ No labels found in {path}.")
+        x["data"] = data
+        x["hash"] = get_hash(self.label_files + self.im_files)
+        x["results"] = nf, nm, ne, nc, len(self.im_files)
+        x["msgs"] = msgs  # warnings
+        x["version"] = self.cache_version  # cache version
+        try:
+            # Convert data structure to a json serializable format before saving
+            import pickle
+            with open(path, 'wb') as f:
+                pickle.dump(x, f)
+            LOGGER.info(f"{prefix}New cache created: {path}")
+        except Exception as e:
+            LOGGER.warning(f"{prefix}WARNING ⚠️ Cache directory {path.parent} is not writeable: {e}")  # not writeable
+        return x
+
+
+
+    def load_image(self, i, rect_mode=False):
+        """
+        Loads dual-stream images (wide and narrow) by index.
+        
+        Args:
+            i (int): Index of the image to load.
+            rect_mode (bool): Whether to use rectangular mode (for inference).
+            
+        Returns:
+            tuple: (imgs, hw0s, hw1s) where imgs is a tuple of [wide_img, narrow_img]
+        """
+        # Get image file path with {} placeholder
+        im_file = self.im_files[i]
+        if im_file is None:
+            # Invalid image file (likely corrupt)
+            return None, None, None
+        
+        # Load both modality images
+        imgs = []
+        
+        # Process both modalities (wide and narrow)
+        for modality in self.modalities:
+            # Replace {} with modality name
+            img_path = im_file.format(modality)
+            
+            try:
+                img = cv2.imread(img_path)
+                assert img is not None, f"Image not found: {img_path}"
+            except Exception as e:
+                LOGGER.warning(f"Error loading image {img_path}: {e}")
+                # Create a black placeholder image
+                img = np.zeros((640, 640, 3), dtype=np.uint8)
+            
+            # Add to the list
+            imgs.append(img)
+        
+        if len(imgs) != 2:
+            LOGGER.warning(f"Expected 2 images (wide, narrow) but got {len(imgs)}")
+            return None, None, None
+        
+        # Get original dimensions from both images
+        hw0 = [(img.shape[0], img.shape[1]) for img in imgs]
+        
+        # All images should use the same resize ratio (based on wide image)
+        r = self.imgsz / max(hw0[0])  # ratio from wide image
+        
+        # Process all images with same ratio
+        processed_imgs = []
+        hw1 = []
+        
+        for img, (h0, w0) in zip(imgs, hw0):
+            # Resize
+            if r != 1:
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            processed_imgs.append(img)
+            hw1.append(img.shape[:2])
+        
+        return (processed_imgs[0], processed_imgs[1]), (hw0[0], hw0[1]), (hw1[0], hw1[1])
+
+    def __getitem__(self, index):
+        """
+        Fetch dual-stream dataset item at given index.
+        
+        Returns:
+            tuple: (imgs, labels_out, path, shapes, index) where imgs is tuple of [wide_img, narrow_img]
+        """
+        # Load dual-stream images
+        imgs, hw0s, hw1s = self.load_image(index)
+        
+        # Process each image with letterbox and convert to tensors
+        processed_imgs = []
+        shapes = None
+        
+        for i, (img, (h0, w0), (h, w)) in enumerate(zip(imgs, hw0s, hw1s)):
+            # Letterbox
+            from ultralytics.data.augment import LetterBox
+            letterbox = LetterBox(new_shape=(self.imgsz, self.imgsz), auto=False, scaleup=self.augment)
+            transformed = letterbox(image=img)
+            img_processed = transformed['image']
+            
+            # Get transformation info from first image only
+            if i == 0:
+                shapes = (h0, w0), ((h / h0, w / w0), (0, 0))  # for COCO mAP rescaling
+            
+            # Convert to torch tensor
+            img_processed = img_processed.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+            img_processed = np.ascontiguousarray(img_processed)
+            processed_imgs.append(torch.from_numpy(img_processed).float() / 255.0)
+        
+        # Get labels
+        labels = self.labels[index].copy()
+        nl = len(labels)  # number of labels
+        labels_out = torch.zeros((nl, 6))  # 6 = batch_idx + cls + xywh
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+        
+        return tuple(processed_imgs), labels_out, self.im_files[index], shapes, index
+
+    @staticmethod
+    def collate_fn(batch):
+        """Collates batch into model input tuple"""
+        imgs, labels, paths, shapes, indices = zip(*batch)  # transposed
+        for i, lb in enumerate(labels):
+            lb[:, 0] = i  # add target image index for build_targets()
+        
+        wide_imgs = torch.stack([img[0] for img in imgs], 0)
+        narrow_imgs = torch.stack([img[1] for img in imgs], 0)
+
+        return (wide_imgs, narrow_imgs), torch.cat(labels, 0), paths, shapes, indices
+
+    def get_img_files(self, img_path):
+        """
+        Override the get_img_files method to handle image paths with {} placeholders.
+        
+        Args:
+            img_path (str | List[str]): Path or list of paths to image directories or files.
+            
+        Returns:
+            (List[str]): List of image file paths, possibly with {} placeholders.
+        """
+        try:
+            f = []  # image files
+            for p in img_path if isinstance(img_path, list) else [img_path]:
+                p = Path(p)  # os-agnostic
+                if p.is_dir():  # dir
+                    f += glob.glob(str(p / "**" / "*.*"), recursive=True)
+                elif p.is_file():  # file
+                    with open(p, encoding="utf-8") as t:
+                        t = t.read().strip().splitlines()
+                        parent = str(p.parent) + os.sep
+                        f += [x.replace("./", parent) if x.startswith("./") else x for x in t]
+                else:
+                    # For dual-stream paths with {}, check if both wide and narrow versions exist
+                    wide_path = str(p).format('wide') if '{}' in str(p) else None
+                    narrow_path = str(p).format('narrow') if '{}' in str(p) else None
+                    
+                    if wide_path and narrow_path and os.path.exists(wide_path) and os.path.exists(narrow_path):
+                        # Path with {} placeholder is valid if both modalities exist
+                        f.append(str(p))
+                    else:
+                        raise FileNotFoundError(f"{self.prefix}{p} does not exist or missing modalities")
+            
+            # Filter for valid image formats
+            from ultralytics.data.utils import IMG_FORMATS
+            im_files = sorted(x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS 
+                              or ('{}' in x and any(x.format(m).split(".")[-1].lower() in IMG_FORMATS for m in self.modalities)))
+            
+            assert im_files, f"{self.prefix}No images found in {img_path}"
+            
+            # For dual-stream inputs with {}, we need to skip the speed check or modify it
+            # We'll opt to skip it for paths containing {}
+            valid_im_files = []
+            placeholder_im_files = []
+            
+            for im_file in im_files:
+                if '{}' in im_file:
+                    # Verify both versions exist before adding
+                    if all(os.path.exists(im_file.format(m)) for m in self.modalities):
+                        placeholder_im_files.append(im_file)
+                else:
+                    valid_im_files.append(im_file)
+            
+            # Only run speed check on regular image files
+            if valid_im_files:
+                from ultralytics.data.utils import check_file_speeds
+                check_file_speeds(valid_im_files, prefix=self.prefix)
+            
+            # Combine both lists, prioritizing placeholder files
+            final_im_files = placeholder_im_files + valid_im_files
+            
+            if self.fraction < 1:
+                final_im_files = final_im_files[: round(len(final_im_files) * self.fraction)]
+                
+            return final_im_files
+            
+        except Exception as e:
+            # For debugging
+            LOGGER.error(f"Error in get_img_files: {e}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+            
+            raise FileNotFoundError(f"{self.prefix}Error loading data from {img_path}\n") from e
 
 
 class YOLOConcatDataset(ConcatDataset):
