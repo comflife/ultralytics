@@ -1,5 +1,32 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Add dual stream modules to global namespace for yaml parsing
+try:
+    from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+    from ultralytics.nn.modules.block import MultiStreamC3
+    
+    # Add to globals so yaml parsing can find them
+    globals()['MultiStreamConv'] = MultiStreamConv
+    globals()['MultiStreamC3'] = MultiStreamC3
+    globals()['Fusion'] = Fusion
+    
+except ImportError as e:
+    LOGGER.warning(f"Dual stream modules import failed: {e}")
+    # Create placeholder classes
+    class MultiStreamConv:
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError("MultiStreamConv not implemented")
+    class MultiStreamC3:
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError("MultiStreamC3 not implemented")
+    class Fusion:
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError("Fusion not implemented")
+    
+    globals()['MultiStreamConv'] = MultiStreamConv
+    globals()['MultiStreamC3'] = MultiStreamC3
+    globals()['Fusion'] = Fusion
 
+    
 import contextlib
 import pickle
 import re
@@ -69,6 +96,20 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     v10Detect,
 )
+
+try:
+    from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+    from ultralytics.nn.modules.block import MultiStreamC3
+except ImportError:
+    # Define placeholder classes if modules don't exist yet
+    class MultiStreamConv:
+        pass
+    class MultiStreamC3:
+        pass
+    class Fusion:
+        pass
+    LOGGER.warning("Dual stream modules not available. Please implement them in ultralytics.nn.modules.conv")
+
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -133,27 +174,28 @@ class BaseModel(torch.nn.Module):
         return self._predict_once(x, profile, visualize, embed)
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
-        """
-        Perform a forward pass through the network.
-
-        Args:
-            x (torch.Tensor | list): The input tensor to the model, or list [x1, x2] for dual-stream models.
-            profile (bool): Print the computation time of each layer if True.
-            visualize (bool): Save the feature maps of the model if True.
-            embed (list, optional): A list of feature vectors/embeddings to return.
-
-        Returns:
-            (torch.Tensor): The last output of the model.
-        """
+        """Perform a forward pass through the network."""
         y, dt, embeddings = [], [], []  # outputs
         
-        # Check for dual-stream input (list of two tensors)
-        is_dual_stream = False
-        dual_stream_active = False
-        if isinstance(x, list) and len(x) == 2:
-            # Verify both elements are tensors
-            if all(isinstance(t, torch.Tensor) for t in x):
-                is_dual_stream = True
+        # Check for dual-stream input
+        is_dual_stream_input = False
+        dual_stream_active = getattr(self, 'dual_stream', False)
+        
+        # Process different input formats
+        if isinstance(x, list) and len(x) == 2 and all(isinstance(t, torch.Tensor) for t in x):
+            # List of two tensors -> stack to [B, 2, C, H, W]
+            x = torch.stack(x, dim=1)
+            is_dual_stream_input = True
+            dual_stream_active = True
+        elif isinstance(x, torch.Tensor) and x.dim() == 5 and x.shape[1] == 2:
+            # Already in dual stream format [B, 2, C, H, W]
+            is_dual_stream_input = True
+            dual_stream_active = True
+        elif isinstance(x, torch.Tensor) and x.dim() == 4 and getattr(self, 'dual_stream', False):
+            # Single stream input to dual stream model - duplicate the input
+            x = x.unsqueeze(1).repeat(1, 2, 1, 1, 1)  # [B, C, H, W] -> [B, 2, C, H, W]
+            is_dual_stream_input = True
+            dual_stream_active = True
         
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -161,51 +203,47 @@ class BaseModel(torch.nn.Module):
             else:
                 x_input = x
                 
-            # Handle MultiStream modules for dual-stream input
-            if is_dual_stream and not dual_stream_active:
-                if hasattr(m, '__class__') and 'MultiStream' in str(m.__class__.__name__):
-                    # First MultiStream module encountered - activate dual stream mode
+            # Handle dual stream modules
+            module_name = m.__class__.__name__
+            
+            if 'MultiStream' in module_name:
+                if not dual_stream_active and is_dual_stream_input:
+                    # Activate dual stream mode
                     dual_stream_active = True
-                    # Process dual streams separately
-                    x1, x2 = x  # unpack the two streams
-                    if profile:
-                        self._profile_one_layer(m, x1, dt)
-                    x = [m(x1), m(x2)]  # Apply to each stream separately
-                    continue
-                    
-            if is_dual_stream and dual_stream_active:
-                if hasattr(m, '__class__') and 'Fusion' in str(m.__class__.__name__):
-                    # Fusion module - combine streams
-                    if profile:
-                        self._profile_one_layer(m, x, dt)
-                    x = m(x)  # Fusion merges the streams
-                    dual_stream_active = False  # Return to normal processing
-                elif hasattr(m, '__class__') and 'MultiStream' in str(m.__class__.__name__):
-                    # Continue processing dual streams
-                    if profile:
-                        self._profile_one_layer(m, x[0], dt)
-                    x = [m(x[0]), m(x[1])]  # Apply to each stream separately
-                else:
-                    # For regular modules during dual-stream processing, exit dual mode
-                    LOGGER.warning(f"Non-MultiStream module {m.__class__.__name__} encountered during dual-stream processing. Merging streams.")
-                    # Basic concatenation as fallback
-                    x = torch.cat(x, 1)
-                    dual_stream_active = False
-                    if profile:
-                        self._profile_one_layer(m, x, dt)
-                    x = m(x)
-            else:
-                # Normal single-stream processing
+                    LOGGER.debug(f"Dual stream activated at layer {m.i}: {module_name}")
+                
                 if profile:
                     self._profile_one_layer(m, x_input, dt)
-                x = m(x_input)  # run
+                x = m(x_input)
                 
+            elif 'Fusion' in module_name:
+                if dual_stream_active:
+                    # Fusion layer - merge streams
+                    if profile:
+                        self._profile_one_layer(m, x_input, dt)
+                    x = m(x_input)
+                    dual_stream_active = False
+                    LOGGER.debug(f"Dual streams fused at layer {m.i}: {module_name}")
+                else:
+                    LOGGER.warning(f"Fusion layer {module_name} encountered without active dual streams")
+                    if profile:
+                        self._profile_one_layer(m, x_input, dt)
+                    x = m(x_input)
+                    
+            else:
+                # Regular module processing
+                if profile:
+                    self._profile_one_layer(m, x_input, dt)
+                x = m(x_input)
+                    
             y.append(x if m.i in self.save else None)  # save output
+            
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+                
             if embed and m.i in embed:
-                # Handle embeddings (for dual-stream or single-stream)
-                if isinstance(x, list):
+                # Handle embeddings for dual-stream or single-stream
+                if isinstance(x, list) and len(x) == 2:
                     # For dual-stream, use first stream for embedding
                     e = torch.nn.functional.adaptive_avg_pool2d(x[0], (1, 1)).squeeze(-1).squeeze(-1)
                 else:
@@ -213,6 +251,7 @@ class BaseModel(torch.nn.Module):
                 embeddings.append(e)  # flatten
                 if m.i == max(embed):
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                    
         return x
 
     def _predict_augment(self, x):
@@ -374,47 +413,45 @@ class DetectionModel(BaseModel):
     """YOLO detection model."""
 
     def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
-        """
-        Initialize the YOLO detection model with the given config and parameters.
-
-        Args:
-            cfg (str | dict): Model configuration file path or dictionary.
-            ch (int): Number of input channels.
-            nc (int, optional): Number of classes.
-            verbose (bool): Whether to display model information.
-        """
+        """Initialize the YOLO detection model with the given config and parameters."""
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
-        if self.yaml["backbone"][0][2] == "Silence":
-            LOGGER.warning(
-                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
-                "Please delete local *.pt file and re-download the latest model checkpoint."
-            )
-            self.yaml["backbone"][0][2] = "nn.Identity"
-
+        
+        # Check for dual stream configuration
+        self.dual_stream = self._check_dual_stream_config()
+        if self.dual_stream and verbose:
+            LOGGER.info("Dual stream model detected")
+        
         # Define model
-        self.yaml["channels"] = ch  # save channels
+        ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        if self.dual_stream:
+            self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose, dual_stream=True)
+        else:
+            self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose, dual_stream=False)
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
-        self.end2end = getattr(self.model[-1], "end2end", False)
 
         # Build strides
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+        if isinstance(self.model[-1], (Detect, YOLOEDetect, WorldDetect, v10Detect)):  # Detect()
             s = 256  # 2x min stride
-            m.inplace = self.inplace
-
+            m = self.model[-1]  # Detect()
+            
             def _forward(x):
-                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
-                if self.end2end:
-                    return self.forward(x)["one2many"]
+                """Forward pass through the model."""
                 return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
-
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            
+            # Use dual stream input for stride calculation if it's a dual stream model
+            if self.dual_stream:
+                # Create dual stream test input: [1, 2, ch, s, s]
+                test_input = torch.zeros(1, 2, ch, s, s)
+            else:
+                # Standard single stream test input: [1, ch, s, s]  
+                test_input = torch.zeros(1, ch, s, s)
+                
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(test_input)])  # forward
             self.stride = m.stride
             m.bias_init()  # only run once
         else:
@@ -425,6 +462,16 @@ class DetectionModel(BaseModel):
         if verbose:
             self.info()
             LOGGER.info("")
+
+    def _check_dual_stream_config(self):
+        """Check if model configuration indicates dual stream architecture."""
+        backbone = self.yaml.get('backbone', [])
+        for layer in backbone:
+            if len(layer) > 2:  # [from, number, module, args]
+                module_name = layer[2]
+                if any(keyword in module_name for keyword in ['MultiStream', 'Fusion']):
+                    return True
+        return False
 
     def _predict_augment(self, x):
         """
@@ -1392,7 +1439,7 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
     return model, ckpt
 
 
-def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
+def parse_model(d, ch, verbose=True, dual_stream=False):  # model_dict, input_channels(3)
     """
     Parse a YOLO model.yaml dictionary into a PyTorch model.
 
@@ -1411,6 +1458,22 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     max_channels = float("inf")
     nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
+
+    # 여기에 dual_stream 정보 저장 추가
+    is_dual_stream_model = dual_stream
+    if is_dual_stream_model and verbose:
+        LOGGER.info("Parsing dual-stream model")
+
+    # Import dual stream modules from correct locations
+    try:
+        from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+        from ultralytics.nn.modules.block import MultiStreamC3
+        dual_stream_modules = {MultiStreamConv, MultiStreamC3, Fusion}
+    except ImportError:
+        LOGGER.warning("Dual stream modules not found.")
+        dual_stream_modules = set()
+
+
     if scales:
         scale = d.get("scale")
         if not scale:
@@ -1463,6 +1526,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             SCDown,
             C2fCIB,
             A2C2f,
+            *dual_stream_modules,  # include dual stream modules
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1482,26 +1546,130 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2fCIB,
             C2PSA,
             A2C2f,
+            MultiStreamC3,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
+        try:
+            m = (
+                getattr(torch.nn, m[3:])
+                if "nn." in m
+                else getattr(__import__("torchvision").ops, m[16:])
+                if "torchvision.ops." in m
+                else globals().get(m)  # Try globals first
+            )
+            
+            # If not found in globals, try importing from correct modules
+            if m is None and any(x in str(m) for x in ["MultiStream", "Fusion"]):
+                try:
+                    if m == "MultiStreamConv" or m == "Fusion":
+                        from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+                        module_map = {
+                            "MultiStreamConv": MultiStreamConv,
+                            "Fusion": Fusion,
+                        }
+                    elif m == "MultiStreamC3":
+                        from ultralytics.nn.modules.block import MultiStreamC3
+                        module_map = {
+                            "MultiStreamC3": MultiStreamC3,
+                        }
+                    
+                    m = module_map.get(str(m))
+                except ImportError:
+                    LOGGER.error(f"Could not import dual stream module: {m}")
+                    raise
+                    
+            if m is None:
+                raise ValueError(f"Module {m} not found")
+                
+        except Exception as e:
+            LOGGER.error(f"Error loading module {m}: {e}")
+            raise
+
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
-                    args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+                    try:
+                        # Try to evaluate as literal first
+                        args[j] = ast.literal_eval(a)
+                    except (ValueError, SyntaxError):
+                        # If that fails, try to get from locals
+                        args[j] = locals().get(a, a)
+
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
+
+        # 여기에 첫 번째 레이어 특별 처리 추가
+        if i == 0 and is_dual_stream_model and m.__name__ == 'MultiStreamConv':
+            # 첫 번째 dual stream 레이어
+            LOGGER.info(f"First dual stream layer: {m.__name__}, input channels: {ch[-1]}")
             c1, c2 = ch[f], args[0]
-            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+            if isinstance(c2, str):
+                c2 = ast.literal_eval(c2)
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+
+        elif m.__name__ == 'Fusion':
+            # Fusion module: args = [method, scale]
+            # For concat fusion, output channels = sum of input channels
+            # For add fusion, output channels = input channels (same)
+            method = args[0] if args else 'concat'
+            input_channels = ch[f] if isinstance(f, int) else ch[-1]
+
+            
+            if method == 'concat':
+                c2 = input_channels * 2
+            else:
+                c2 = input_channels
+            
+            if verbose:
+                LOGGER.info(f"Fusion layer: {method}, input_ch={input_channels}, output_ch={c2}")
+            
+        elif m.__name__ in ['MultiStreamConv', 'MultiStreamC3']:
+            # 다른 dual stream 모듈들
+            c1, c2 = ch[f], args[0]
+            if isinstance(c2, str):
+                c2 = ast.literal_eval(c2)
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+            
+        elif m in base_modules:
+            # 기존 표준 모듈 처리 코드 그대로 유지
+            c1, c2 = ch[f], args[0]
+            if isinstance(c2, str):
+                try:
+                    c2 = ast.literal_eval(c2)
+                except (ValueError, SyntaxError):
+                    c2 = locals().get(c2, c2)
+            
+            if not isinstance(c2, (int, float)):
+                LOGGER.error(f"Invalid channel value c2={c2} (type: {type(c2)}) for module {m}")
+                raise TypeError(f"Channel value must be numeric, got {type(c2)}")
+            
+            if c2 != nc:
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
+            if m is C2fAttn:
+                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
+                args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
+
+            args = [c1, c2, *args[1:]]
+
+        elif m in base_modules:
+            # Standard modules
+            c1, c2 = ch[f], args[0]
+            
+            if isinstance(c2, str):
+                try:
+                    c2 = ast.literal_eval(c2)
+                except (ValueError, SyntaxError):
+                    c2 = locals().get(c2, c2)
+            
+            if not isinstance(c2, (int, float)):
+                LOGGER.error(f"Invalid channel value c2={c2} (type: {type(c2)}) for module {m}")
+                raise TypeError(f"Channel value must be numeric, got {type(c2)}")
+            
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            if m is C2fAttn:
                 args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
                 args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
 
@@ -1556,18 +1724,19 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
-        m_.np = sum(x.numel() for x in m_.parameters())  # number params
+        m.np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
         if verbose:
-            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m.np:10.0f}  {t:<45}{str(args):<30}")  # print
+        save.extend(x % (i + 1) for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
-    return torch.nn.Sequential(*layers), sorted(save)
+
+    return nn.Sequential(*layers), sorted(save)
 
 
 def yaml_model_load(path):

@@ -689,6 +689,13 @@ def plot_images(
         kpts = kpts.cpu().numpy()
     if isinstance(batch_idx, torch.Tensor):
         batch_idx = batch_idx.cpu().numpy()
+
+
+    # Handle dual stream images
+    if len(images.shape) == 5:  # Dual stream: [B, 2, C, H, W]
+        # Use only the first stream (wide) for visualization
+        images = images[:, 0]  # Take wide stream: [B, C, H, W]
+
     if images.shape[1] > 3:
         images = images[:, :3]  # crop multispectral images to first 3 channels
 

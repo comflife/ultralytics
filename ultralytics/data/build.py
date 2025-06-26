@@ -105,55 +105,36 @@ def seed_worker(worker_id):  # noqa
 
 
 def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, stride=32, multi_modal=False):
-    """
-    Build and return a YOLO dataset based on configuration parameters.
-    
-    Args:
-        cfg (dict): Configuration parameters from model args.
-        img_path (str): Path to the images.
-        batch (int): Batch size for the dataloader.
-        data (dict): Dataset configuration dictionary.
-        mode (str): Dataset mode ('train', 'val', 'test').
-        rect (bool): Enable rectangular inference.
-        stride (int): Model stride.
-        multi_modal (bool): Whether to use multi-modal dataset.
-        
-    Returns:
-        (Dataset): Dataset object for the specified configuration.
-    """
+    """Build and return a YOLO dataset based on configuration parameters."""
     is_dual = is_dual_stream_yaml(data) and getattr(cfg, 'dual_stream', False)
     
     # If using dual-stream dataset
     if is_dual:
-        dataset = YOLODataset(
-            img_path=img_path,  # Use wide camera path for labels (as specified in the YAML file)
-            imgsz=cfg.imgsz,
-            batch_size=batch,
-            augment=mode == "train",  # augmentation
-            hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
-            rect=cfg.rect or rect,  # rectangular batches
-            cache=cfg.cache or None,
-            single_cls=cfg.single_cls or False,
-            stride=int(stride),
-            pad=0.0 if mode == "train" else 0.5,
-            prefix=colorstr(f"{mode}: "),
-            task=cfg.task,
-            classes=cfg.classes,
-            data=data,
-            fraction=cfg.fraction if mode == "train" else 1.0,
-        )
-        # Add attribute to mark as dual stream (for use in trainer)
-        dataset.is_dual_stream = True
-        
-        # Store the narrow camera path in the dataset for later use
         try:
             wide_path, narrow_path = get_dual_stream_paths(data, mode)
-            dataset.narrow_path = narrow_path
+            
+            dataset = YOLODataset(
+                img_path=wide_path,  # Use wide_path instead of img_path
+                narrow_path=narrow_path,  # Pass narrow_path to dataset
+                imgsz=cfg.imgsz,
+                batch_size=batch,
+                augment=mode == "train",
+                hyp=cfg,
+                rect=cfg.rect or rect,
+                cache=cfg.cache or None,
+                single_cls=cfg.single_cls or False,
+                stride=int(stride),
+                pad=0.0 if mode == "train" else 0.5,
+                prefix=colorstr(f"{mode}: "),
+                task=cfg.task,
+                classes=cfg.classes,
+                data=data,
+                fraction=cfg.fraction if mode == "train" else 1.0,
+            )
+            return dataset
+            
         except KeyError as e:
             LOGGER.warning(f"Dual stream configuration error: {e}. Defaulting to single stream.")
-            dataset.is_dual_stream = False
-        
-        return dataset
     else:
         # Standard single-stream dataset loading
         dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
@@ -198,29 +179,31 @@ def build_grounding(cfg, img_path, json_file, batch, mode="train", rect=False, s
 
 
 def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
-    """
-    Create and return an InfiniteDataLoader or DataLoader for training or validation.
-
-    Args:
-        dataset (Dataset): Dataset to load data from.
-        batch (int): Batch size for the dataloader.
-        workers (int): Number of worker threads for loading data.
-        shuffle (bool): Whether to shuffle the dataset.
-        rank (int): Process rank in distributed training. -1 for single-GPU training.
-
-    Returns:
-        (InfiniteDataLoader): A dataloader that can be used for training or validation.
-    """
-    # Handle dual-stream dataset
-    if hasattr(dataset, 'is_dual_stream') and dataset.is_dual_stream and hasattr(dataset, 'narrow_path'):
-        return DualStreamDataLoader(
+    """Create and return an InfiniteDataLoader or DataLoader for training or validation."""
+    
+    # Check if it's a dual-stream dataset
+    if hasattr(dataset, 'is_dual_stream') and dataset.is_dual_stream:
+        # For dual stream, use regular InfiniteDataLoader
+        # The dual stream logic is handled in YOLODataset.__getitem__
+        batch = min(batch, len(dataset))
+        nd = torch.cuda.device_count()
+        nw = min((os.cpu_count() or 8) // max(nd, 1), workers)
+        sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
+        generator = torch.Generator()
+        generator.manual_seed(6148914691236517205 + RANK)
+        return InfiniteDataLoader(
             dataset=dataset,
-            batch_size=min(batch, len(dataset)),
-            narrow_path=dataset.narrow_path,
-            workers=workers,
-            shuffle=shuffle and rank == -1
+            batch_size=batch,
+            shuffle=shuffle and sampler is None,
+            num_workers=nw,
+            sampler=sampler,
+            pin_memory=PIN_MEMORY,
+            collate_fn=getattr(dataset, "collate_fn", None),
+            worker_init_fn=seed_worker,
+            generator=generator,
         )
-        
+    
+    # Standard single-stream dataloader
     batch = min(batch, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min((os.cpu_count() or 8) // max(nd, 1), workers)  # number of workers
@@ -243,30 +226,27 @@ def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1):
 def check_source(source):
     """
     Check the type of input source and return corresponding flag values.
-
-    Args:
-        source (str | int | Path | List | Tuple | np.ndarray | PIL.Image | torch.Tensor): The input source to check.
-
-    Returns:
-        source (str | int | Path | List | Tuple | np.ndarray | PIL.Image | torch.Tensor): The processed source.
-        webcam (bool): Whether the source is a webcam.
-        screenshot (bool): Whether the source is a screenshot.
-        from_img (bool): Whether the source is an image or list of images.
-        in_memory (bool): Whether the source is an in-memory object.
-        tensor (bool): Whether the source is a torch.Tensor.
-
-    Raises:
-        TypeError: If the source type is unsupported.
     """
+    # Handle dual source input (list of two sources)
+    if isinstance(source, list) and len(source) == 2:
+        # For dual stream, check the first source type and assume second is similar
+        source_to_check = source[0]
+    else:
+        source_to_check = source
+    
     webcam, screenshot, from_img, in_memory, tensor = False, False, False, False, False
-    if isinstance(source, (str, int, Path)):  # int for local usb camera
-        source = str(source)
-        is_file = Path(source).suffix[1:] in (IMG_FORMATS | VID_FORMATS)
-        is_url = source.lower().startswith(("https://", "http://", "rtsp://", "rtmp://", "tcp://"))
-        webcam = source.isnumeric() or source.endswith(".streams") or (is_url and not is_file)
-        screenshot = source.lower() == "screen"
+    if isinstance(source_to_check, (str, int, Path)):  # int for local usb camera
+        source_to_check = str(source_to_check)
+        is_file = Path(source_to_check).suffix[1:] in (IMG_FORMATS | VID_FORMATS)
+        is_url = source_to_check.lower().startswith(("https://", "http://", "rtsp://", "rtmp://", "tcp://"))
+        webcam = source_to_check.isnumeric() or source_to_check.endswith(".streams") or (is_url and not is_file)
+        screenshot = source_to_check.lower() == "screen"
         if is_url and is_file:
-            source = check_file(source)  # download
+            if isinstance(source, list):
+                source[0] = check_file(source[0])  # download first source
+                source[1] = check_file(source[1])  # download second source
+            else:
+                source = check_file(source)  # download
     elif isinstance(source, LOADERS):
         in_memory = True
     elif isinstance(source, (list, tuple)):
@@ -284,63 +264,46 @@ def check_source(source):
 
 def load_inference_source(source=None, batch=1, vid_stride=1, buffer=False, channels=3, source2=None):
     """
-    Load an inference source for object detection and apply necessary transformations.
+    Loads an inference source for object detection and applies necessary transformations.
 
     Args:
-        source (str | Path | torch.Tensor | PIL.Image | np.ndarray, optional): The input source for inference.
-        batch (int, optional): Batch size for dataloaders.
-        vid_stride (int, optional): The frame interval for video sources.
-        buffer (bool, optional): Whether stream frames will be buffered.
-        channels (int): The number of input channels for the model.
-        source2 (str | Path, optional): The second input source for dual-stream inference.
+        source (str, Path, Tensor, PIL.Image, np.ndarray): The input source for inference.
+        batch (int): Batch size for dataloaders.
+        vid_stride (int): The frame interval for video sources.
+        buffer (bool): Determined whether stream frames will be buffered.
+        channels (int): Number of image channels (1=grayscale, 3=color).
+        source2 (str, Path, optional): Second source for dual-stream inference.
 
     Returns:
-        (Dataset): A dataset object for the specified input source with attached source_type attribute.
+        dataset (Dataset): A dataset object for the specified source(s).
     """
+    source = str(source)
+    
+    # Handle dual stream input
     if source2 is not None:
-        # Handle dual-stream inputs
-        source1, stream1, screenshot1, from_img1, in_memory1, tensor1 = check_source(source)
-        source2, stream2, screenshot2, from_img2, in_memory2, tensor2 = check_source(source2)
+        source2 = str(source2)
+        source_type = check_source([source, source2])
         
-        # Check if both sources are compatible
-        if (stream1 and not stream2) or (not stream1 and stream2):
-            raise ValueError("Both sources must be of the same type for dual-stream loading")
-        if (screenshot1 and not screenshot2) or (not screenshot1 and screenshot2):
-            raise ValueError("Both sources must be of the same type for dual-stream loading")
-            
-        # Create dual-source loader
-        dataset = LoadDualImagesAndVideos(source1, source2, batch=batch, vid_stride=vid_stride, channels=channels)
-        
-        # Create source type for dual-stream (treat as image-type for compatibility)
-        source_type = SourceTypes(False, False, True, False)
+        # For dual stream, both sources should be similar types
+        if source_type.stream or source_type.screenshot:
+            raise NotImplementedError("Dual stream not supported for live streams or screenshots")
+        elif source_type.from_img:
+            dataset = LoadDualImagesAndVideos(source, source2, batch=batch, vid_stride=vid_stride, channels=channels)
+        else:
+            raise ValueError(f"Unsupported dual stream source types")
     else:
-        # Standard single-stream processing
-        source, stream, screenshot, from_img, in_memory, tensor = check_source(source)
+        # Original single stream logic
+        source_type = check_source(source)
         
-        # Create source type
-        if in_memory:
-            # For in-memory datasets that already have source_type attribute
-            source_type = getattr(source, "source_type", SourceTypes(stream, screenshot, from_img, tensor))
-        else:
-            source_type = SourceTypes(stream, screenshot, from_img, tensor)
-
-        # Dataloader
-        if tensor:
-            dataset = LoadTensor(source)
-        elif in_memory:
-            dataset = source
-        elif stream:
+        if source_type.stream or source_type.screenshot:
             dataset = LoadStreams(source, vid_stride=vid_stride, buffer=buffer)
-        elif screenshot:
-            dataset = LoadScreenshots(source)
-        elif from_img:
-            dataset = LoadPilAndNumpy(source, channels=channels)
-        else:
+        elif source_type.from_img:
             dataset = LoadImagesAndVideos(source, batch=batch, vid_stride=vid_stride, channels=channels)
-
-    # Attach source types to the dataset
-    setattr(dataset, "source_type", source_type)
-
+        elif source_type.tensor:
+            dataset = LoadTensor(source)
+        else:
+            dataset = LoadPilAndNumpy(source, channels=channels)
+    
     return dataset
 
 
@@ -379,39 +342,11 @@ def get_dual_stream_paths(data, mode='train'):
 
 
 class DualStreamDataLoader(InfiniteDataLoader):
-    """
-    DataLoader for dual-stream datasets.
-    
-    This class extends InfiniteDataLoader to handle dual-stream datasets with wide and narrow camera inputs.
-    Instead of just loading images from a single source, this dataloader loads paired images from both
-    wide and narrow camera sources.
-    
-    Attributes:
-        dataset (YOLODataset): The wide camera dataset with labels.
-        narrow_path (str): Path to the narrow camera images.
-    """
+    """DataLoader for dual-stream datasets."""
     
     def __init__(self, dataset, batch_size, narrow_path, workers=8, shuffle=False):
-        """
-        Initialize the DualStreamDataLoader.
-        
-        Args:
-            dataset (YOLODataset): The dataset for the wide camera with labels.
-            batch_size (int): Number of samples per batch.
-            narrow_path (str): Path to narrow camera images.
-            workers (int): Number of worker threads for loading data.
-            shuffle (bool): Whether to shuffle the dataset.
-        """
-        self.dataset = dataset
-        self.narrow_path = narrow_path
-        # Create a dual-stream dataloader using LoadDualImagesAndVideos
-        self.dual_loader = LoadDualImagesAndVideos(
-            path1=dataset.im_files,  # wide camera images
-            path2=narrow_path,        # narrow camera images
-            batch=batch_size,
-            channels=3
-        )
-        # Initialize with original dataset, but we'll override __iter__
+        """Initialize the DualStreamDataLoader."""
+        # Standard initialization
         super().__init__(
             dataset, 
             batch_size=batch_size, 
@@ -420,27 +355,5 @@ class DualStreamDataLoader(InfiniteDataLoader):
             pin_memory=PIN_MEMORY,
             collate_fn=dataset.collate_fn
         )
-    
-    def __iter__(self):
-        """
-        Return an iterator over the dual-stream dataset.
-        
-        This method overrides the default iterator to use the dual-stream loader.
-        """
-        for (paths_wide, paths_narrow), (imgs_wide, imgs_narrow), info in self.dual_loader:
-            # Use original dataset iterator for labels and preprocessing
-            original_iter = super().__iter__()
-            batch = next(original_iter)
-            
-            # Replace the images with our dual-stream images
-            if isinstance(batch, dict):
-                # For dictionary-style batches
-                batch['img'] = torch.stack([torch.from_numpy(img).to(batch['img'].device) for img in imgs_wide])
-                batch['img2'] = torch.stack([torch.from_numpy(img).to(batch['img'].device) for img in imgs_narrow])
-            else:
-                # For tuple/list-style batches, assume images are the first element
-                images = torch.stack([torch.from_numpy(img) for img in imgs_wide])
-                narrow_images = torch.stack([torch.from_numpy(img) for img in imgs_narrow])
-                batch = (images, *batch[1:], narrow_images)
-            
-            yield batch
+        # Just store narrow_path - the actual dual loading is handled in YOLODataset.__getitem__
+        self.narrow_path = narrow_path

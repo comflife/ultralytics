@@ -52,15 +52,20 @@ def train(cfg, opt, device, callbacks=None):
     # Loggers
     LOGGER.info(f"Starting YOLOv8 training in {save_dir}")
     
-    # Load model
-    from ultralytics.nn.modules.dual_model import DualStreamWrapper
-    
+   # Load model
     if opt.resume:
         LOGGER.info(f"Resuming training from {opt.weights}")
         model = YOLO(opt.weights)
     else:
-        LOGGER.info(f"Loading model {opt.weights}")
-        model = YOLO(opt.weights if opt.weights.endswith('.pt') else opt.cfg)
+        if opt.cfg and Path(opt.cfg).exists():
+            LOGGER.info(f"Loading model from config {opt.cfg}")
+            model = YOLO(opt.cfg)  # Load from yaml config
+            if opt.weights and opt.weights.endswith('.pt') and Path(opt.weights).exists():
+                LOGGER.info(f"Loading weights from {opt.weights}")
+                model.load(opt.weights)  # Load pretrained weights
+        else:
+            LOGGER.info(f"Loading pretrained model {opt.weights}")
+            model = YOLO(opt.weights)
     
     # Check if using a dual-stream model
     is_dual_model = False
@@ -82,10 +87,15 @@ def train(cfg, opt, device, callbacks=None):
             LOGGER.warning(f"Error checking model configuration: {e}")
             is_dual_model = False
             
-    # If dual-stream flag is explicitly set, mark as dual_stream
-    if opt.dual_stream and not is_dual_model:
-        LOGGER.info(f"Dual-stream mode explicitly enabled")
-        is_dual_model = True
+    # Set dual stream attribute on model if needed
+    if is_dual_model or opt.dual_stream:
+        LOGGER.info(f"Enabling dual-stream mode for training")
+        # Set dual_stream attribute on the model
+        if hasattr(model, 'model'):
+            model.model.dual_stream = True
+        # Also set on the trainer args
+        model.overrides = getattr(model, 'overrides', {})
+        model.overrides['dual_stream'] = True
     
     # Configure training settings
     model_training_args = {
@@ -117,6 +127,7 @@ def train(cfg, opt, device, callbacks=None):
         'val': not opt.noval,
         'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
+        'dual_stream': is_dual_model or opt.dual_stream,  # Enable dual-stream mode if detected or explicitly set
         # Note: We handle dual-stream mode internally and don't pass it to the trainer
     }
     
@@ -132,18 +143,26 @@ def train(cfg, opt, device, callbacks=None):
     
     # Train the model using the Ultralytics YOLO API
     try:
+        LOGGER.info(f"Training arguments: {model_training_args}")
         results = model.train(**model_training_args)
         LOGGER.info(f"Training completed in {(time.time() - t0) / 3600:.3f} hours")
         
         # Evaluate on validation set
         if not opt.noval:
             LOGGER.info("Running final validation...")
-            results = model.val(data=opt.data, batch=opt.batch_size * 2)
-            # LOGGER.info(f"Validation results: {results}")
+            val_args = {
+                'data': opt.data,
+                'batch': opt.batch_size * 2,
+            }
+            if is_dual_model or opt.dual_stream:
+                val_args['dual_stream'] = True
+            results = model.val(**val_args)
         
         return results
     except Exception as e:
         LOGGER.error(f"Training error: {e}")
+        import traceback
+        traceback.print_exc()
         raise e
 
 

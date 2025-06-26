@@ -97,7 +97,9 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (dict): Preprocessed batch with normalized images.
         """
+        # Handle dual stream images: [B, 2, C, H, W] or single stream: [B, C, H, W]
         batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+        
         if self.args.multi_scale:
             imgs = batch["img"]
             sz = (
@@ -105,12 +107,28 @@ class DetectionTrainer(BaseTrainer):
                 // self.stride
                 * self.stride
             )  # size
-            sf = sz / max(imgs.shape[2:])  # scale factor
-            if sf != 1:
-                ns = [
-                    math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
-                ]  # new shape (stretched to gs-multiple)
-                imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+            
+            # Handle dual stream multi-scale
+            if imgs.dim() == 5 and imgs.shape[1] == 2:  # Dual stream: [B, 2, C, H, W]
+                sf = sz / max(imgs.shape[3:])  # scale factor based on H, W
+                if sf != 1:
+                    ns = [
+                        math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[3:]
+                    ]  # new shape
+                    # Reshape for interpolation: [B*2, C, H, W]
+                    b, streams, c, h, w = imgs.shape
+                    imgs = imgs.view(b * streams, c, h, w)
+                    imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+                    # Reshape back: [B, 2, C, H, W]
+                    imgs = imgs.view(b, streams, c, ns[0], ns[1])
+            else:  # Single stream: [B, C, H, W]
+                sf = sz / max(imgs.shape[2:])  # scale factor
+                if sf != 1:
+                    ns = [
+                        math.ceil(x * sf / self.stride) * self.stride for x in imgs.shape[2:]
+                    ]  # new shape
+                    imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+            
             batch["img"] = imgs
         return batch
 
@@ -123,6 +141,10 @@ class DetectionTrainer(BaseTrainer):
         self.model.nc = self.data["nc"]  # attach number of classes to model
         self.model.names = self.data["names"]  # attach class names to model
         self.model.args = self.args  # attach hyperparameters to model
+
+        # Add dual stream information if available
+        if hasattr(self.args, 'dual_stream') and self.args.dual_stream:
+            self.model.dual_stream = True
         # TODO: self.model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
 
     def get_model(self, cfg=None, weights=None, verbose=True):
@@ -137,9 +159,25 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (DetectionModel): YOLO detection model.
         """
-        model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        # Check if using dual stream configuration
+        is_dual_stream = cfg and 'dual' in str(cfg).lower()
+        
+        # For dual stream, we still use the same number of channels per stream
+        # The dual stream handling is done in the model architecture itself
+        model = DetectionModel(
+            cfg, 
+            nc=self.data["nc"], 
+            ch=self.data["channels"], 
+            verbose=verbose and RANK == -1
+        )
+        
         if weights:
             model.load(weights)
+        
+        # Add dual stream flag to model if needed
+        if is_dual_stream:
+            model.dual_stream = True
+        
         return model
 
     def get_validator(self):
@@ -185,15 +223,43 @@ class DetectionTrainer(BaseTrainer):
             batch (dict): Dictionary containing batch data.
             ni (int): Number of iterations.
         """
-        plot_images(
-            images=batch["img"],
-            batch_idx=batch["batch_idx"],
-            cls=batch["cls"].squeeze(-1),
-            bboxes=batch["bboxes"],
-            paths=batch["im_file"],
-            fname=self.save_dir / f"train_batch{ni}.jpg",
-            on_plot=self.on_plot,
-        )
+        images = batch["img"]
+        
+        # Handle dual stream visualization
+        if images.dim() == 5 and images.shape[1] == 2:  # Dual stream: [B, 2, C, H, W]
+            # Plot wide images (first stream)
+            wide_images = images[:, 0]  # [B, C, H, W]
+            plot_images(
+                images=wide_images,
+                batch_idx=batch["batch_idx"],
+                cls=batch["cls"].squeeze(-1),
+                bboxes=batch["bboxes"],
+                paths=batch["im_file"],
+                fname=self.save_dir / f"train_batch{ni}_wide.jpg",
+                on_plot=self.on_plot,
+            )
+            
+            # Plot narrow images (second stream)
+            narrow_images = images[:, 1]  # [B, C, H, W]
+            plot_images(
+                images=narrow_images,
+                batch_idx=batch["batch_idx"],
+                cls=batch["cls"].squeeze(-1),
+                bboxes=batch["bboxes"],
+                paths=[path.replace('|', '_narrow|') if '|' in path else f"{path}_narrow" for path in batch["im_file"]],
+                fname=self.save_dir / f"train_batch{ni}_narrow.jpg",
+                on_plot=self.on_plot,
+            )
+        else:  # Single stream
+            plot_images(
+                images=images,
+                batch_idx=batch["batch_idx"],
+                cls=batch["cls"].squeeze(-1),
+                bboxes=batch["bboxes"],
+                paths=batch["im_file"],
+                fname=self.save_dir / f"train_batch{ni}.jpg",
+                on_plot=self.on_plot,
+            )
 
     def plot_metrics(self):
         """Plot metrics from a CSV file."""

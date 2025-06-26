@@ -810,25 +810,28 @@ class LoadDualImagesAndVideos:
     
     def __next__(self):
         """Returns the next batch of paired images or video frames."""
-        paths1, paths2 = [], []
-        imgs1, imgs2 = [], []
-        info = []
+        paths, imgs, info = [], [], []
         
-        while len(imgs1) < self.bs and len(imgs2) < self.bs:
+        while len(imgs) < self.bs:
             if self.count >= min(self.nf1, self.nf2):  # end of file list
-                if imgs1 and imgs2:
-                    return [paths1, paths2], [imgs1, imgs2], info  # return last partial batch
+                if imgs:
+                    return paths, imgs, info  # return last partial batch
                 else:
                     raise StopIteration
             
-            # Process first stream
+            # Get corresponding file paths
             path1 = self.files1[min(self.count, self.nf1-1)]
+            path2 = self.files2[min(self.count, self.nf2-1)]
+            
+            # Load images from both streams
+            im01, im02 = None, None
+            
+            # Process first stream (wide)
             if self.video_flag1[min(self.count, self.nf1-1)]:
-                self.mode = "video"
+                # Video processing for stream 1
                 if not self.cap1 or not self.cap1.isOpened():
-                    self._new_video(path1, self.files2[min(self.count, self.nf2-1)])
+                    self._new_video(path1, path2)
                 
-                # Read frames from video 1
                 success1 = False
                 for _ in range(self.vid_stride):
                     success1 = self.cap1.grab()
@@ -837,42 +840,13 @@ class LoadDualImagesAndVideos:
                 
                 if success1:
                     success1, im01 = self.cap1.retrieve()
-                    if success1:
-                        self.frame += 1
-                        paths1.append(path1)
-                        imgs1.append(im01)
-                else:
-                    # Move to the next file if video ended
-                    self.count += 1
-                    if self.cap1:
-                        self.cap1.release()
-                        self.cap1 = None
-                    if self.count < self.nf1:
-                        continue
             else:
-                # Handle image files for stream 1
-                self.mode = "image"
-                if path1.split(".")[-1].lower() == "heic":
-                    check_requirements("pillow-heif")
-                    from pillow_heif import register_heif_opener
-                    register_heif_opener()
-                    with Image.open(path1) as img:
-                        im01 = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
-                else:
-                    im01 = imread(path1, flags=self.cv2_flag)  # BGR
-                
-                if im01 is None:
-                    LOGGER.warning(f"Image Read Error {path1}")
-                    self.count += 1
-                    continue
-                else:
-                    paths1.append(path1)
-                    imgs1.append(im01)
+                # Image processing for stream 1
+                im01 = imread(path1, flags=self.cv2_flag)
             
-            # Process second stream
-            path2 = self.files2[min(self.count, self.nf2-1)]
+            # Process second stream (narrow)
             if self.video_flag2[min(self.count, self.nf2-1)]:
-                # Read frames from video 2
+                # Video processing for stream 2
                 success2 = False
                 for _ in range(self.vid_stride):
                     success2 = self.cap2.grab()
@@ -881,49 +855,36 @@ class LoadDualImagesAndVideos:
                 
                 if success2:
                     success2, im02 = self.cap2.retrieve()
-                    if success2:
-                        paths2.append(path2)
-                        imgs2.append(im02)
-                        info.append(f"dual video {self.count + 1}/{min(self.nf1, self.nf2)} (frame {self.frame}) {path1} {path2}: ")
-                        if self.frame >= min(self.frames1, self.frames2):  # end of videos
-                            self.count += 1
-                            self.cap1.release()
-                            self.cap2.release()
-                            self.cap1 = self.cap2 = None
-                else:
-                    # Move to the next file if video ended
-                    self.count += 1
-                    if self.cap2:
-                        self.cap2.release()
-                        self.cap2 = None
-                    if self.count < self.nf2:
-                        continue
             else:
-                # Handle image files for stream 2
-                if path2.split(".")[-1].lower() == "heic":
-                    check_requirements("pillow-heif")
-                    from pillow_heif import register_heif_opener
-                    register_heif_opener()
-                    with Image.open(path2) as img:
-                        im02 = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
-                else:
-                    im02 = imread(path2, flags=self.cv2_flag)  # BGR
-                
-                if im02 is None:
-                    LOGGER.warning(f"Image Read Error {path2}")
-                    self.count += 1
-                    continue
-                else:
-                    paths2.append(path2)
-                    imgs2.append(im02)
-                    info.append(f"dual image {self.count + 1}/{min(self.nf1, self.nf2)} {path1} {path2}: ")
-                    self.count += 1
+                # Image processing for stream 2
+                im02 = imread(path2, flags=self.cv2_flag)
             
-            # For image mode, we can break after one iteration
-            if self.mode == "image":
-                break
+            # If both images loaded successfully
+            if im01 is not None and im02 is not None:
+                # Stack images as [2, H, W, C] - dual stream format
+                dual_img = np.stack([im01, im02], axis=0)
+                
+                paths.append(f"{path1}|{path2}")  # Combined path for tracking
+                imgs.append(dual_img)
+                info.append(f"dual {self.count + 1}/{min(self.nf1, self.nf2)} {path1}|{path2}: ")
+                
+                self.count += 1
+                
+                # Handle end of video
+                if self.mode == "video" and hasattr(self, 'frame'):
+                    self.frame += 1
+                    if self.frame >= min(self.frames1, self.frames2):
+                        if self.cap1:
+                            self.cap1.release()
+                        if self.cap2:
+                            self.cap2.release()
+                        self.cap1 = self.cap2 = None
+            else:
+                LOGGER.warning(f"Failed to load dual images: {path1}, {path2}")
+                self.count += 1
+                continue
         
-        return [paths1, paths2], [imgs1, imgs2], info
+        return paths, imgs, info
     
     def _new_video(self, path1, path2):
         """Creates new video capture objects for the given paths."""

@@ -33,6 +33,150 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
+class MultiStreamConv(nn.Module):
+    """Multi-stream convolution for processing dual camera inputs."""
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """Initialize MultiStreamConv with dual stream processing capability."""
+        super().__init__()
+        self.conv = Conv(c1, c2, k, s, p, g=g, d=d, act=act)
+
+    def forward(self, x):
+        """
+        Forward pass for multi-stream convolution.
+        
+        Args:
+            x (torch.Tensor): Input tensor. Can be:
+                - 4D: [B, C, H, W] (single stream)
+                - 5D: [B, 2, C, H, W] (dual stream)
+        
+        Returns:
+            torch.Tensor: Output tensor in dual stream format [B, 2, C_out, H_out, W_out]
+        """
+        if x.dim() == 5 and x.shape[1] == 2:
+            # Dual stream input: [B, 2, C, H, W]
+            B, streams, C, H, W = x.shape
+            
+            # Reshape to process both streams: [B*2, C, H, W]
+            x_reshaped = x.view(B * streams, C, H, W)
+            
+            # Apply convolution
+            out = self.conv(x_reshaped)  # [B*2, C_out, H_out, W_out]
+            
+            # Reshape back to dual stream format: [B, 2, C_out, H_out, W_out]
+            _, C_out, H_out, W_out = out.shape
+            out = out.view(B, streams, C_out, H_out, W_out)
+            
+            return out
+            
+        elif x.dim() == 4:
+            # Single stream input: [B, C, H, W]
+            # Convert to dual stream by duplicating
+            out = self.conv(x)  # [B, C_out, H_out, W_out]
+            # Duplicate for dual stream: [B, 2, C_out, H_out, W_out]
+            out = out.unsqueeze(1).repeat(1, 2, 1, 1, 1)
+            return out
+            
+        else:
+            raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D input with shape {x.shape}")
+
+class MultiStreamMaxPool2d(nn.Module):
+    """Multi-stream MaxPool2d module for multi-sensor inputs."""
+
+    def __init__(self, k=2, s=2):
+        """
+        Initialize MultiStreamMaxPool2d with given kernel size and stride.
+        
+        Args:
+            k (int): Kernel size.
+            s (int): Stride.
+        """
+        super().__init__()
+        self.pool = nn.MaxPool2d(kernel_size=k, stride=s)
+
+    def forward(self, x):
+        """
+        Apply max pooling to input tensor.
+        
+        For multi-stream models, this is called separately on each stream.
+        
+        Args:
+            x (torch.Tensor): Input tensor.
+            
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.pool(x)
+
+
+
+class Fusion(nn.Module):
+    """
+    Fusion module to combine features from multiple streams.
+    
+    Supports different fusion strategies: 'concat', 'add', 'max', 'weighted_sum'
+    """
+
+    def __init__(self, fusion_type='concat', scale_factor=1.0):
+        """
+        Initialize Fusion module.
+        
+        Args:
+            fusion_type (str): Type of fusion - 'concat', 'add', 'max', 'weighted_sum'
+            scale_factor (float): Scale factor for the output (multiplier).
+        """
+        super().__init__()
+        self.fusion_type = fusion_type
+        self.scale_factor = scale_factor
+        
+        # For weighted sum, create learnable weights
+        if fusion_type == 'weighted_sum':
+            self.weights = nn.Parameter(torch.ones(2))  # Initialize with equal weights
+            
+    def forward(self, x):
+        """
+        Fuse multiple input streams.
+        
+        Args:
+            x (torch.Tensor or list): Input tensor with dual streams [B, 2, C, H, W] 
+                                     or list of tensors from multiple streams.
+            
+        Returns:
+            (torch.Tensor): Fused output tensor.
+        """
+        # Handle tensor input with dual streams: [B, 2, C, H, W]
+        if isinstance(x, torch.Tensor) and x.dim() == 5 and x.shape[1] == 2:
+            # Split dual stream tensor into list
+            stream1 = x[:, 0]  # [B, C, H, W]
+            stream2 = x[:, 1]  # [B, C, H, W]
+            streams = [stream1, stream2]
+        # Handle list input (multiple separate tensors)
+        elif isinstance(x, list) and len(x) >= 2:
+            streams = x
+        else:
+            # Single stream input - just return as is (no fusion needed)
+            return x
+        
+        if self.fusion_type == 'concat':
+            # Concatenate along channel dimension
+            output = torch.cat(streams, dim=1)
+        elif self.fusion_type == 'add':
+            # Element-wise addition
+            output = sum(streams)
+        elif self.fusion_type == 'max':
+            # Element-wise maximum
+            output = torch.maximum(streams[0], streams[1])
+            for i in range(2, len(streams)):
+                output = torch.maximum(output, streams[i])
+        elif self.fusion_type == 'weighted_sum':
+            # Weighted sum with learnable weights
+            normalized_weights = torch.softmax(self.weights, dim=0)
+            output = sum(normalized_weights[i] * tensor for i, tensor in enumerate(streams[:len(normalized_weights)]))
+        else:
+            raise ValueError(f"Unsupported fusion type: {self.fusion_type}")
+        
+        return output
+
 
 class Conv(nn.Module):
     """

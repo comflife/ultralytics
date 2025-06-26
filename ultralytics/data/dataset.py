@@ -5,6 +5,8 @@ from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
+from copy import deepcopy
+
 
 import cv2
 import numpy as np
@@ -79,12 +81,248 @@ class YOLODataset(BaseDataset):
             *args (Any): Additional positional arguments for the parent class.
             **kwargs (Any): Additional keyword arguments for the parent class.
         """
+        import os
+        from pathlib import Path
+        
         self.use_segments = task == "segment"
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
+        
+        # Dual stream detection
+        self.is_dual_stream = False
+        self.narrow_path = None
+        
+        if data and isinstance(data, dict):
+            # Check for dual stream configuration
+            # Extract prefix from kwargs or args to determine train/val
+            prefix = kwargs.get('prefix', '')
+            if 'train' in str(kwargs.get('img_path', '')).lower() or 'train' in prefix.lower():
+                # Training dataset
+                wide_key = 'train_wide'
+                narrow_key = 'train_narrow'
+            elif 'val' in str(kwargs.get('img_path', '')).lower() or 'val' in prefix.lower():
+                # Validation dataset  
+                wide_key = 'val_wide'
+                narrow_key = 'val_narrow'
+            else:
+                # Default to train
+                wide_key = 'train_wide'
+                narrow_key = 'train_narrow'
+            
+            if wide_key in data and narrow_key in data:
+                self.is_dual_stream = True
+                self.narrow_path = data[narrow_key]
+                LOGGER.info(f"Dual stream detected: wide={data[wide_key]}, narrow={data[narrow_key]}")
+        
         super().__init__(*args, channels=self.data["channels"], **kwargs)
+        
+        if self.is_dual_stream:
+            # Build narrow image file list after parent initialization
+            self.narrow_files = self.get_narrow_files()
+            LOGGER.info(f"Mapped {len(self.narrow_files)} narrow images")
+
+    def get_narrow_files(self):
+        """Get corresponding narrow image files."""
+        narrow_files = []
+        narrow_dir = Path(self.narrow_path)
+        
+        for wide_file in self.im_files:
+            # Convert wide image path to narrow image path
+            # Assuming same filename structure in different directories
+            wide_path = Path(wide_file)
+            narrow_file = narrow_dir / wide_path.name
+            
+            if narrow_file.exists():
+                narrow_files.append(str(narrow_file))
+            else:
+                # If narrow file doesn't exist, use wide file as fallback
+                LOGGER.warning(f"Narrow file not found: {narrow_file}, using wide file")
+                narrow_files.append(wide_file)
+        
+        return narrow_files
+
+
+    def __getitem__(self, index):
+        """Returns transformed label information for given index."""
+        if self.is_dual_stream:
+            return self._get_dual_item(index)
+        else:
+            # Use parent class method for single stream
+            return super().__getitem__(index)
+    
+    def _get_dual_item(self, index):
+        """Get dual stream item (wide + narrow images)."""
+        try:
+            # Load wide image and labels
+            wide_label = deepcopy(self.labels[index])
+            
+            # Load images
+            img_result = self.load_image(index)
+            
+            if isinstance(img_result, tuple) and len(img_result) == 3:
+                imgs, ori_shape, resized_shape = img_result
+                
+                if isinstance(imgs, list) and len(imgs) == 2:
+                    wide_img, narrow_img = imgs
+                else:
+                    wide_img = imgs
+                    narrow_img = imgs.copy()
+            else:
+                raise ValueError(f"Unexpected return format from load_image: {type(img_result)}")
+            
+            # Process images
+            target_size = (640, 640)
+            wide_resized = cv2.resize(wide_img, target_size)
+            narrow_resized = cv2.resize(narrow_img, target_size)
+            
+            wide_tensor = torch.from_numpy(wide_resized).permute(2, 0, 1).float() / 255.0
+            narrow_tensor = torch.from_numpy(narrow_resized).permute(2, 0, 1).float() / 255.0
+            dual_tensor = torch.stack([wide_tensor, narrow_tensor], dim=0)
+            
+            # Process labels
+            cls = wide_label.get('cls', np.array([]))
+            bboxes = wide_label.get('bboxes', np.array([]).reshape(0, 4))
+            segments = wide_label.get('segments', [])
+            keypoints = wide_label.get('keypoints')
+            
+            # Convert to tensors
+            if cls is None:
+                cls_tensor = torch.tensor([], dtype=torch.float32)
+            elif isinstance(cls, np.ndarray):
+                cls_tensor = torch.from_numpy(cls.astype(np.float32))
+            elif isinstance(cls, (list, tuple)):
+                cls_tensor = torch.tensor(cls, dtype=torch.float32)
+            else:
+                cls_tensor = torch.tensor([], dtype=torch.float32)
+            
+            if bboxes is None:
+                bboxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            elif isinstance(bboxes, np.ndarray):
+                bboxes_tensor = torch.from_numpy(bboxes.astype(np.float32))
+            elif isinstance(bboxes, (list, tuple)):
+                bboxes_tensor = torch.tensor(bboxes, dtype=torch.float32).reshape(-1, 4)
+            else:
+                bboxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            
+            if segments is None:
+                segments = []
+            elif not isinstance(segments, list):
+                segments = []
+            
+            # Calculate ratio_pad for validation
+            # ratio_pad is needed for proper coordinate conversion during validation
+            h_orig, w_orig = ori_shape
+            h_new, w_new = target_size
+            
+            # Calculate scale and padding (like LetterBox does)
+            scale = min(h_new / h_orig, w_new / w_orig)
+            pad_w = (w_new - w_orig * scale) / 2
+            pad_h = (h_new - h_orig * scale) / 2
+            
+            ratio_pad = torch.tensor([scale, scale, pad_w, pad_h], dtype=torch.float32)
+            
+            # Create result with all required keys
+            result = {
+                'img': dual_tensor,
+                'im_file': f"{self.im_files[index]}|{self.narrow_files[index]}",
+                'ori_shape': torch.tensor(ori_shape, dtype=torch.int64),
+                'resized_shape': torch.tensor(target_size, dtype=torch.int64),
+                # 'ratio_pad': ratio_pad,  # Add this for validation
+                'cls': cls_tensor,
+                'bboxes': bboxes_tensor,
+                'segments': segments,
+                'keypoints': keypoints,
+                'bbox_format': wide_label.get('bbox_format', 'xywh'),
+                'normalized': wide_label.get('normalized', True),
+                'batch_idx': torch.tensor([], dtype=torch.long),
+            }
+            
+            return result
+            
+        except Exception as e:
+            LOGGER.error(f"ERROR in _get_dual_item for index {index}: {e}")
+            raise e
+
+    def build_transforms(self, hyp=None):
+        """
+        Builds and appends transforms to the list.
+        
+        Args:
+            hyp (dict, optional): Hyperparameters for transforms.
+            
+        Returns:
+            (Compose): Composed transforms.
+        """
+        # For dual stream, use minimal transforms to avoid issues
+        if self.is_dual_stream:
+            # Only basic transforms - no augmentation
+            transforms = Compose([
+                LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False),
+                Format(
+                    bbox_format="xywh",
+                    normalize=True,
+                    return_mask=self.use_segments,
+                    return_keypoint=self.use_keypoints,
+                    return_obb=self.use_obb,
+                    batch_idx=True,
+                    mask_ratio=4,
+                    mask_overlap=True,
+                    bgr=0.0,  # No BGR augmentation
+                )
+            ])
+            return transforms
+        
+        # Original transforms for single stream
+        if self.augment:
+            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
+            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
+            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
+            transforms = v8_transforms(self, self.imgsz, hyp)
+        else:
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                return_mask=self.use_segments,
+                return_keypoint=self.use_keypoints,
+                return_obb=self.use_obb,
+                batch_idx=True,
+                mask_ratio=hyp.mask_ratio,
+                mask_overlap=hyp.overlap_mask,
+                bgr=hyp.bgr if self.augment else 0.0,
+            )
+        )
+        return transforms
+
+    def _apply_basic_transforms_to_narrow(self, narrow_data, wide_result):
+        """Apply basic transforms to narrow image to match wide image format."""
+        from ultralytics.data.augment import LetterBox, Format
+        
+        # Get target size from wide result
+        target_size = wide_result['img'].shape[-2:]  # (H, W)
+        
+        # Create basic transform pipeline (no augmentation)
+        basic_transforms = Compose([
+            LetterBox(new_shape=target_size, scaleup=False),
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                return_mask=self.use_segments,
+                return_keypoint=self.use_keypoints,
+                return_obb=self.use_obb,
+                batch_idx=True,
+                mask_ratio=4,
+                mask_overlap=True,
+                bgr=0.0,  # No BGR augmentation
+            )
+        ])
+        
+        # Apply transforms
+        return basic_transforms(narrow_data)
+
 
     def cache_labels(self, path=Path("./labels.cache")):
         """
@@ -204,37 +442,37 @@ class YOLODataset(BaseDataset):
             LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
         return labels
 
-    def build_transforms(self, hyp=None):
-        """
-        Builds and appends transforms to the list.
+    # def build_transforms(self, hyp=None):
+    #     """
+    #     Builds and appends transforms to the list.
 
-        Args:
-            hyp (dict, optional): Hyperparameters for transforms.
+    #     Args:
+    #         hyp (dict, optional): Hyperparameters for transforms.
 
-        Returns:
-            (Compose): Composed transforms.
-        """
-        if self.augment:
-            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
-            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
-            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
-            transforms = v8_transforms(self, self.imgsz, hyp)
-        else:
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
-        transforms.append(
-            Format(
-                bbox_format="xywh",
-                normalize=True,
-                return_mask=self.use_segments,
-                return_keypoint=self.use_keypoints,
-                return_obb=self.use_obb,
-                batch_idx=True,
-                mask_ratio=hyp.mask_ratio,
-                mask_overlap=hyp.overlap_mask,
-                bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
-            )
-        )
-        return transforms
+    #     Returns:
+    #         (Compose): Composed transforms.
+    #     """
+    #     if self.augment:
+    #         hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
+    #         hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
+    #         hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
+    #         transforms = v8_transforms(self, self.imgsz, hyp)
+    #     else:
+    #         transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+    #     transforms.append(
+    #         Format(
+    #             bbox_format="xywh",
+    #             normalize=True,
+    #             return_mask=self.use_segments,
+    #             return_keypoint=self.use_keypoints,
+    #             return_obb=self.use_obb,
+    #             batch_idx=True,
+    #             mask_ratio=hyp.mask_ratio,
+    #             mask_overlap=hyp.overlap_mask,
+    #             bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+    #         )
+    #     )
+    #     return transforms
 
     def close_mosaic(self, hyp):
         """
@@ -284,34 +522,73 @@ class YOLODataset(BaseDataset):
 
     @staticmethod
     def collate_fn(batch):
-        """
-        Collates data samples into batches.
-
-        Args:
-            batch (List[dict]): List of dictionaries containing sample data.
-
-        Returns:
-            (dict): Collated batch with stacked tensors.
-        """
-        new_batch = {}
-        batch = [dict(sorted(b.items())) for b in batch]  # make sure the keys are in the same order
-        keys = batch[0].keys()
-        values = list(zip(*[list(b.values()) for b in batch]))
-        for i, k in enumerate(keys):
-            value = values[i]
-            if k in {"img", "text_feats"}:
-                value = torch.stack(value, 0)
-            elif k == "visuals":
-                value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
-                value = torch.cat(value, 0)
-            new_batch[k] = value
-        new_batch["batch_idx"] = list(new_batch["batch_idx"])
-        for i in range(len(new_batch["batch_idx"])):
-            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
-        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
-        return new_batch
-
+        """Collates data samples into batches."""
+        try:
+            new_batch = {}
+            batch = [dict(sorted(b.items())) for b in batch]
+            keys = batch[0].keys()
+            values = list(zip(*[list(b.values()) for b in batch]))
+            
+            for i, k in enumerate(keys):
+                value = values[i]
+                
+                if k == "img":
+                    # Handle dual stream images
+                    if len(value[0].shape) == 4 and value[0].shape[0] == 2:
+                        value = torch.stack(value, 0)  # [B, 2, C, H, W]
+                    else:
+                        value = torch.stack(value, 0)  # [B, C, H, W]
+                elif k in {"cls", "bboxes"}:
+                    # Only process non-empty tensors
+                    valid_tensors = [v for v in value if len(v) > 0]
+                    if valid_tensors:
+                        value = torch.cat(valid_tensors, 0)
+                    else:
+                        # All tensors are empty
+                        if k == "cls":
+                            value = torch.tensor([], dtype=torch.float32)
+                        else:  # bboxes
+                            value = torch.zeros((0, 4), dtype=torch.float32)
+                elif k in {"ori_shape", "resized_shape", "ratio_pad"}:
+                    # Stack tensor values
+                    value = torch.stack(value, 0)
+                elif k == "segments":
+                    # Keep as list, flatten nested lists
+                    value = [item for sublist in value for item in (sublist if isinstance(sublist, list) else [])]
+                elif k == "keypoints":
+                    # Handle None keypoints properly
+                    value = [v for v in value if v is not None]
+                    if not value:  # All None
+                        value = None
+                elif k in {"bbox_format", "normalized"}:
+                    # Take first value (should be same for all)
+                    value = value[0]
+                elif k == "im_file":
+                    # Keep all filenames as list
+                    value = list(value)
+                else:
+                    # Keep as-is
+                    value = value
+                
+                new_batch[k] = value
+            
+            # Create batch_idx
+            batch_idx_list = []
+            for i, item in enumerate(batch):
+                n_objects = len(item['cls'])
+                if n_objects > 0:
+                    batch_idx_list.append(torch.full((n_objects,), i, dtype=torch.long))
+            
+            if batch_idx_list:
+                new_batch["batch_idx"] = torch.cat(batch_idx_list, 0)
+            else:
+                new_batch["batch_idx"] = torch.tensor([], dtype=torch.long)
+            
+            return new_batch
+            
+        except Exception as e:
+            LOGGER.error(f"ERROR in collate_fn: {e}")
+            raise e
 
 class YOLOMultiModalDataset(YOLODataset):
     """

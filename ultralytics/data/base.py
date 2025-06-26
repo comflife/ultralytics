@@ -80,6 +80,7 @@ class BaseDataset(Dataset):
         classes=None,
         fraction=1.0,
         channels=3,
+        narrow_path=None,  # deprecated, use img_path instead
     ):
         """
         Initialize BaseDataset with given configuration and options.
@@ -102,6 +103,8 @@ class BaseDataset(Dataset):
         """
         super().__init__()
         self.img_path = img_path
+        self.narrow_path = narrow_path
+        self.is_dual_stream = narrow_path is not None
         self.imgsz = imgsz
         self.augment = augment
         self.single_cls = single_cls
@@ -125,6 +128,13 @@ class BaseDataset(Dataset):
         self.buffer = []  # buffer size = batch size
         self.max_buffer_length = min((self.ni, self.batch_size * 8, 1000)) if self.augment else 0
 
+
+        self.im_files = self.get_img_files(self.img_path)
+
+        # Get narrow image files if dual stream
+        if self.is_dual_stream:
+            self.narrow_files = self.get_narrow_files()
+
         # Cache images (options are cache = True, False, None, "ram", "disk")
         self.ims, self.im_hw0, self.im_hw = [None] * self.ni, [None] * self.ni, [None] * self.ni
         self.npy_files = [Path(f).with_suffix(".npy") for f in self.im_files]
@@ -141,6 +151,30 @@ class BaseDataset(Dataset):
 
         # Transforms
         self.transforms = self.build_transforms(hyp=hyp)
+
+    def get_narrow_files(self):
+        """
+        Get corresponding narrow image files for dual stream.
+        
+        Returns:
+            (List[str]): List of narrow image file paths corresponding to wide images.
+        """
+        if not self.narrow_path:
+            return []
+        
+        narrow_files = []
+        for wide_file in self.im_files:
+            # Convert wide image path to narrow image path
+            wide_path = Path(wide_file)
+            narrow_file = Path(self.narrow_path) / wide_path.name
+            
+            if narrow_file.exists():
+                narrow_files.append(str(narrow_file))
+            else:
+                LOGGER.warning(f"Narrow image not found: {narrow_file}")
+                narrow_files.append(wide_file)  # Fallback to wide image
+        
+        return narrow_files
 
     def get_img_files(self, img_path):
         """
@@ -207,19 +241,23 @@ class BaseDataset(Dataset):
     def load_image(self, i, rect_mode=True):
         """
         Load an image from dataset index 'i'.
-
+        
         Args:
             i (int): Index of the image to load.
             rect_mode (bool, optional): Whether to use rectangular resizing.
-
+            
         Returns:
-            (np.ndarray): Loaded image as a NumPy array.
-            (Tuple[int, int]): Original image dimensions in (height, width) format.
-            (Tuple[int, int]): Resized image dimensions in (height, width) format.
-
-        Raises:
-            FileNotFoundError: If the image file is not found.
+            For single stream: (np.ndarray, Tuple[int, int], Tuple[int, int])
+            For dual stream: (List[np.ndarray], Tuple[int, int], Tuple[int, int])
         """
+        if self.is_dual_stream:
+            return self.load_dual_image(i, rect_mode)
+        else:
+            return self.load_single_image(i, rect_mode)
+
+    def load_single_image(self, i, rect_mode=True):
+        """Load single image (original behavior)."""
+        # ...existing load_image logic...
         im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
@@ -257,6 +295,34 @@ class BaseDataset(Dataset):
             return im, (h0, w0), im.shape[:2]
 
         return self.ims[i], self.im_hw0[i], self.im_hw[i]
+
+    def load_dual_image(self, i, rect_mode=True):
+        """Load dual images (wide + narrow)."""
+        # Load wide image
+        wide_im, (h0, w0), (h, w) = self.load_single_image(i, rect_mode)
+        
+        # Load narrow image
+        narrow_file = self.narrow_files[i]
+        narrow_im = imread(narrow_file, flags=self.cv2_flag)
+        
+        if narrow_im is None:
+            LOGGER.warning(f"Failed to load narrow image: {narrow_file}, using wide image")
+            narrow_im = wide_im.copy()
+        else:
+            # Apply same resizing to narrow image
+            if rect_mode:
+                r = self.imgsz / max(h0, w0)
+                if r != 1:
+                    w_new, h_new = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                    narrow_im = cv2.resize(narrow_im, (w_new, h_new), interpolation=cv2.INTER_LINEAR)
+            elif not (h0 == w0 == self.imgsz):
+                narrow_im = cv2.resize(narrow_im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+            
+            if narrow_im.ndim == 2:
+                narrow_im = narrow_im[..., None]
+        
+        # Return list of images for dual stream
+        return [wide_im, narrow_im], (h0, w0), (h, w)
 
     def cache_images(self):
         """Cache images to memory or disk for faster training."""
@@ -376,22 +442,25 @@ class BaseDataset(Dataset):
         return self.transforms(self.get_image_and_label(index))
 
     def get_image_and_label(self, index):
-        """
-        Get and return label information from the dataset.
-
-        Args:
-            index (int): Index of the image to retrieve.
-
-        Returns:
-            (dict): Label dictionary with image and metadata.
-        """
-        label = deepcopy(self.labels[index])  # requires deepcopy() https://github.com/ultralytics/ultralytics/pull/1948
+        """Get and return label information from the dataset."""
+        label = deepcopy(self.labels[index])
         label.pop("shape", None)  # shape is for rect, remove it
-        label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(index)
+        
+        # Load image(s)
+        if self.is_dual_stream:
+            imgs, ori_shape, resized_shape = self.load_image(index)
+            label["img"] = imgs  # List of [wide_img, narrow_img]
+        else:
+            img, ori_shape, resized_shape = self.load_image(index)
+            label["img"] = img  # Single image
+        
+        label["ori_shape"] = ori_shape
+        label["resized_shape"] = resized_shape
         label["ratio_pad"] = (
-            label["resized_shape"][0] / label["ori_shape"][0],
-            label["resized_shape"][1] / label["ori_shape"][1],
+            resized_shape[0] / ori_shape[0],
+            resized_shape[1] / ori_shape[1],
         )  # for evaluation
+        
         if self.rect:
             label["rect_shape"] = self.batch_shapes[self.batch[index]]
         return self.update_labels_info(label)

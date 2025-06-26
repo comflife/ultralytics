@@ -231,27 +231,7 @@ class Model(torch.nn.Module):
         return model.startswith(f"{HUB_WEB_ROOT}/models/")
 
     def _new(self, cfg: str, task=None, model=None, verbose=False) -> None:
-        """
-        Initialize a new model and infer the task type from model definitions.
-
-        Creates a new model instance based on the provided configuration file. Loads the model configuration, infers
-        the task type if not specified, and initializes the model using the appropriate class from the task map.
-
-        Args:
-            cfg (str): Path to the model configuration file in YAML format.
-            task (str | None): The specific task for the model. If None, it will be inferred from the config.
-            model (torch.nn.Module | None): A custom model instance. If provided, it will be used instead of creating
-                a new one.
-            verbose (bool): If True, displays model information during loading.
-
-        Raises:
-            ValueError: If the configuration file is invalid or the task cannot be inferred.
-            ImportError: If the required dependencies for the specified task are not installed.
-
-        Examples:
-            >>> model = Model()
-            >>> model._new("yolo11n.yaml", task="detect", verbose=True)
-        """
+        """Initialize a new model and infer the task type from model definitions."""
         cfg_dict = yaml_model_load(cfg)
         self.cfg = cfg
         self.task = task or guess_model_task(cfg_dict)
@@ -259,10 +239,30 @@ class Model(torch.nn.Module):
         self.overrides["model"] = self.cfg
         self.overrides["task"] = self.task
 
+        # Check if this is a dual stream model based on yaml config
+        is_dual_model = self._check_dual_stream_config(cfg_dict)
+        if is_dual_model:
+            self.overrides["dual_stream"] = True
+            if hasattr(self.model, 'model'):
+                self.model.model.dual_stream = True
+            else:
+                self.model.dual_stream = True
+
         # Below added to allow export from YAMLs
         self.model.args = {**DEFAULT_CFG_DICT, **self.overrides}  # combine default and model args (prefer model args)
         self.model.task = self.task
         self.model_name = cfg
+
+    def _check_dual_stream_config(self, cfg_dict):
+        """Check if the model configuration indicates dual stream architecture."""
+        # Check backbone for dual stream modules
+        backbone = cfg_dict.get('backbone', [])
+        for layer in backbone:
+            if len(layer) > 2:  # [from, number, module, args]
+                module_name = layer[2]
+                if 'MultiStream' in module_name or 'Fusion' in module_name:
+                    return True
+        return False
 
     def _load(self, weights: str, task=None) -> None:
         """
@@ -497,37 +497,7 @@ class Model(torch.nn.Module):
         predictor=None,
         **kwargs: Any,
     ) -> List[Results]:
-        """
-        Performs predictions on the given image source using the YOLO model.
-
-        This method facilitates the prediction process, allowing various configurations through keyword arguments.
-        It supports predictions with custom predictors or the default predictor method. The method handles different
-        types of image sources and can operate in a streaming mode.
-
-        Args:
-            source (str | Path | int | PIL.Image | np.ndarray | torch.Tensor | List | Tuple): The source
-                of the image(s) to make predictions on. Accepts various types including file paths, URLs, PIL
-                images, numpy arrays, and torch tensors.
-            stream (bool): If True, treats the input source as a continuous stream for predictions.
-            predictor (BasePredictor | None): An instance of a custom predictor class for making predictions.
-                If None, the method uses a default predictor.
-            **kwargs (Any): Additional keyword arguments for configuring the prediction process.
-
-        Returns:
-            (List[ultralytics.engine.results.Results]): A list of prediction results, each encapsulated in a
-                Results object.
-
-        Examples:
-            >>> model = YOLO("yolo11n.pt")
-            >>> results = model.predict(source="path/to/image.jpg", conf=0.25)
-            >>> for r in results:
-            ...     print(r.boxes.data)  # print detection bounding boxes
-
-        Notes:
-            - If 'source' is not provided, it defaults to the ASSETS constant with a warning.
-            - The method sets up a new predictor if not already present and updates its arguments with each call.
-            - For SAM-type models, 'prompts' can be passed as a keyword argument.
-        """
+        """Performs predictions on the given image source using the YOLO model."""
         if source is None:
             source = "https://ultralytics.com/images/boats.jpg" if self.task == "obb" else ASSETS
             LOGGER.warning(f"'source' is missing. Using 'source={source}'.")
@@ -540,6 +510,14 @@ class Model(torch.nn.Module):
         args = {**self.overrides, **custom, **kwargs}  # highest priority args on the right
         prompts = args.pop("prompts", None)  # for SAM-type models
 
+        # Check if using dual stream model
+        is_dual_model = getattr(self.model, 'dual_stream', False) or args.get('dual_stream', False)
+        
+        # Handle dual stream source (second source for narrow images)
+        source2 = kwargs.pop("source2", None)
+        if is_dual_model and source2:
+            args["source2"] = source2
+
         if not self.predictor:
             self.predictor = (predictor or self._smart_load("predictor"))(overrides=args, _callbacks=self.callbacks)
             self.predictor.setup_model(model=self.model, verbose=is_cli)
@@ -547,8 +525,10 @@ class Model(torch.nn.Module):
             self.predictor.args = get_cfg(self.predictor.args, args)
             if "project" in args or "name" in args:
                 self.predictor.save_dir = get_save_dir(self.predictor.args)
+        
         if prompts and hasattr(self.predictor, "set_prompts"):  # for SAM-type models
             self.predictor.set_prompts(prompts)
+        
         return self.predictor.predict_cli(source=source) if is_cli else self.predictor(source=source, stream=stream)
 
     def track(
@@ -600,31 +580,13 @@ class Model(torch.nn.Module):
         validator=None,
         **kwargs: Any,
     ):
-        """
-        Validate the model using a specified dataset and validation configuration.
-
-        This method facilitates the model validation process, allowing for customization through various settings. It
-        supports validation with a custom validator or the default validation approach. The method combines default
-        configurations, method-specific defaults, and user-provided arguments to configure the validation process.
-
-        Args:
-            validator (ultralytics.engine.validator.BaseValidator | None): An instance of a custom validator class for
-                validating the model.
-            **kwargs (Any): Arbitrary keyword arguments for customizing the validation process.
-
-        Returns:
-            (ultralytics.utils.metrics.DetMetrics): Validation metrics obtained from the validation process.
-
-        Raises:
-            AssertionError: If the model is not a PyTorch model.
-
-        Examples:
-            >>> model = YOLO("yolo11n.pt")
-            >>> results = model.val(data="coco8.yaml", imgsz=640)
-            >>> print(results.box.map)  # Print mAP50-95
-        """
+        """Validate the model using a specified dataset and validation configuration."""
         custom = {"rect": True}  # method defaults
         args = {**self.overrides, **custom, **kwargs, "mode": "val"}  # highest priority args on the right
+
+        # Propagate dual stream setting for validation
+        if hasattr(self.model, 'dual_stream') and self.model.dual_stream:
+            args["dual_stream"] = True
 
         validator = (validator or self._smart_load("validator"))(args=args, _callbacks=self.callbacks)
         validator(model=self.model)
@@ -734,37 +696,7 @@ class Model(torch.nn.Module):
         trainer=None,
         **kwargs: Any,
     ):
-        """
-        Trains the model using the specified dataset and training configuration.
-
-        This method facilitates model training with a range of customizable settings. It supports training with a
-        custom trainer or the default training approach. The method handles scenarios such as resuming training
-        from a checkpoint, integrating with Ultralytics HUB, and updating model and configuration after training.
-
-        When using Ultralytics HUB, if the session has a loaded model, the method prioritizes HUB training
-        arguments and warns if local arguments are provided. It checks for pip updates and combines default
-        configurations, method-specific defaults, and user-provided arguments to configure the training process.
-
-        Args:
-            trainer (BaseTrainer | None): Custom trainer instance for model training. If None, uses default.
-            **kwargs (Any): Arbitrary keyword arguments for training configuration. Common options include:
-                data (str): Path to dataset configuration file.
-                epochs (int): Number of training epochs.
-                batch_size (int): Batch size for training.
-                imgsz (int): Input image size.
-                device (str): Device to run training on (e.g., 'cuda', 'cpu').
-                workers (int): Number of worker threads for data loading.
-                optimizer (str): Optimizer to use for training.
-                lr0 (float): Initial learning rate.
-                patience (int): Epochs to wait for no observable improvement for early stopping of training.
-
-        Returns:
-            (Dict | None): Training metrics if available and training is successful; otherwise, None.
-
-        Examples:
-            >>> model = YOLO("yolo11n.pt")
-            >>> results = model.train(data="coco8.yaml", epochs=3)
-        """
+        """Trains the model using the specified dataset and training configuration."""
         self._check_is_pytorch_model()
         if hasattr(self.session, "model") and self.session.model.id:  # Ultralytics HUB session with loaded model
             if any(kwargs):
@@ -784,10 +716,28 @@ class Model(torch.nn.Module):
         if args.get("resume"):
             args["resume"] = self.ckpt_path
 
+        # Check if using dual stream model and propagate the setting
+        if hasattr(self.model, 'dual_stream') and self.model.dual_stream:
+            args["dual_stream"] = True
+        elif kwargs.get("dual_stream"):
+            args["dual_stream"] = True
+            # Set dual_stream attribute on model
+            if hasattr(self.model, 'model'):
+                self.model.model.dual_stream = True
+            else:
+                self.model.dual_stream = True
+
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
         if not args.get("resume"):  # manually set model only if not resuming
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
+
+        # Ensure dual stream setting is preserved on the trainer's model
+        if args.get("dual_stream"):
+            if hasattr(self.trainer.model, 'model'):
+                self.trainer.model.model.dual_stream = True
+            else:
+                self.trainer.model.dual_stream = True
 
         self.trainer.hub_session = self.session  # attach optional HUB session
         self.trainer.train()

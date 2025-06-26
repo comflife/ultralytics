@@ -43,6 +43,21 @@ FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID
 def img2label_paths(img_paths):
     """Define label paths as a function of image paths."""
     sa, sb = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"  # /images/, /labels/ substrings
+    
+    # Handle dual stream paths (combined with '|')
+    if isinstance(img_paths, list) and any('|' in str(path) for path in img_paths):
+        # For dual stream, use the wide image path (first part) for labels
+        label_paths = []
+        for img_path in img_paths:
+            if '|' in str(img_path):
+                wide_path = str(img_path).split('|')[0]  # Use wide image path for labels
+                label_path = sb.join(wide_path.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt"
+            else:
+                label_path = sb.join(str(img_path).rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt"
+            label_paths.append(label_path)
+        return label_paths
+    
+    # Standard single stream
     return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt" for x in img_paths]
 
 
@@ -150,23 +165,33 @@ def exif_size(img: Image.Image):
 
 
 def verify_image(args):
-    """Verify one image."""
+    """Verify one image (or dual stream images)."""
     (im_file, cls), prefix = args
     # Number (found, corrupt), message
     nf, nc, msg = 0, 0, ""
+    
+    # Handle dual stream image paths
+    if isinstance(im_file, str) and '|' in im_file:
+        wide_file, narrow_file = im_file.split('|')
+        files_to_check = [wide_file, narrow_file]
+        im_file = wide_file  # Use wide image for class info
+    else:
+        files_to_check = [im_file]
+    
     try:
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        shape = (shape[1], shape[0])  # hw
-        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"Invalid image format {im.format}. {FORMATS_HELP_MSG}"
-        if im.format.lower() in {"jpg", "jpeg"}:
-            with open(im_file, "rb") as f:
-                f.seek(-2, 2)
-                if f.read() != b"\xff\xd9":  # corrupt JPEG
-                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
-                    msg = f"{prefix}{im_file}: corrupt JPEG restored and saved"
+        for file_path in files_to_check:
+            im = Image.open(file_path)
+            im.verify()  # PIL verify
+            shape = exif_size(im)  # image size
+            shape = (shape[1], shape[0])  # hw
+            assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+            assert im.format.lower() in IMG_FORMATS, f"Invalid image format {im.format}. {FORMATS_HELP_MSG}"
+            if im.format.lower() in {"jpg", "jpeg"}:
+                with open(file_path, "rb") as f:
+                    f.seek(-2, 2)
+                    if f.read() != b"\xff\xd9":  # corrupt JPEG
+                        ImageOps.exif_transpose(Image.open(file_path)).save(file_path, "JPEG", subsampling=0, quality=100)
+                        msg = f"{prefix}{file_path}: corrupt JPEG restored and saved"
         nf = 1
     except Exception as e:
         nc = 1
@@ -438,6 +463,17 @@ def check_det_dataset(dataset, autodownload=True):
                 data[k] = str(x)
             else:
                 data[k] = [str((path / x).resolve()) for x in data[k]]
+    
+    # Handle dual stream specific paths
+    for k in ["train_wide", "train_narrow", "val_wide", "val_narrow"]:
+        if data.get(k):
+            if isinstance(data[k], str):
+                x = (path / data[k]).resolve()
+                if not x.exists() and data[k].startswith("../"):
+                    x = (path / data[k][3:]).resolve()
+                data[k] = str(x)
+            else:
+                data[k] = [str((path / x).resolve()) for x in data[k]]
 
     # Parse YAML
     val, s = (data.get(x) for x in ("val", "download"))
@@ -647,6 +683,16 @@ class HUBDatasetStats:
         for split in "train", "val", "test":
             self.stats[split] = None  # predefine
             path = self.data.get(split)
+
+            # Check for dual stream paths
+            if path is None:
+                # Try dual stream paths
+                wide_path = self.data.get(f"{split}_wide")
+                narrow_path = self.data.get(f"{split}_narrow")
+                if wide_path and narrow_path:
+                    path = wide_path  # Use wide path for statistics
+                else:
+                    continue
 
             # Check split
             if path is None:  # no split
