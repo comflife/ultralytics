@@ -386,7 +386,15 @@ class BaseTrainer:
 
                 # Forward
                 with autocast(self.amp):
+                    # print(f"DEBUG: ===== TRAINER _DO_TRAIN DEBUG =====")
+                    # print(f"DEBUG: Raw batch from dataloader - img shape: {batch['img'].shape}")
+                    # print(f"DEBUG: Raw batch from dataloader - img range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+                
                     batch = self.preprocess_batch(batch)
+                    # print(f"DEBUG: After preprocess_batch - img shape: {batch['img'].shape}")
+                    # print(f"DEBUG: After preprocess_batch - img range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+                    # print(f"DEBUG: ===== END TRAINER DEBUG =====")
+                
                     loss, self.loss_items = self.model(batch)
                     self.loss = loss.sum()
                     if RANK != -1:

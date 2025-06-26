@@ -146,11 +146,12 @@ class YOLODataset(BaseDataset):
 
     def __getitem__(self, index):
         """Returns transformed label information for given index."""
-        if self.is_dual_stream:
-            return self._get_dual_item(index)
+        if hasattr(self, 'narrow_files'):
+            result = self._get_dual_item(index)
+            # print(f"DEBUG: __getitem__ returning dual tensor with shape: {result['img'].shape}")
+            return result
         else:
-            # Use parent class method for single stream
-            return super().__getitem__(index)
+            return self._get_item(index)
     
     def _get_dual_item(self, index):
         """Get dual stream item (wide + narrow images)."""
@@ -172,14 +173,33 @@ class YOLODataset(BaseDataset):
             else:
                 raise ValueError(f"Unexpected return format from load_image: {type(img_result)}")
             
+            # Debug original image values
+            # print(f"DEBUG: Original wide_img - shape: {wide_img.shape}, range: min={wide_img.min()}, max={wide_img.max()}, dtype={wide_img.dtype}")
+            # print(f"DEBUG: Original narrow_img - shape: {narrow_img.shape}, range: min={narrow_img.min()}, max={narrow_img.max()}, dtype={narrow_img.dtype}")
+            
             # Process images
             target_size = (640, 640)
             wide_resized = cv2.resize(wide_img, target_size)
             narrow_resized = cv2.resize(narrow_img, target_size)
             
-            wide_tensor = torch.from_numpy(wide_resized).permute(2, 0, 1).float() / 255.0
-            narrow_tensor = torch.from_numpy(narrow_resized).permute(2, 0, 1).float() / 255.0
+            # print(f"DEBUG: After resize - wide: min={wide_resized.min()}, max={wide_resized.max()}")
+            # print(f"DEBUG: After resize - narrow: min={narrow_resized.min()}, max={narrow_resized.max()}")
+            
+            # Check if images are already normalized or need normalization
+            if wide_resized.max() <= 1.0:
+                # print("DEBUG: Images already normalized (0-1), using as-is")
+                wide_tensor = torch.from_numpy(wide_resized).permute(2, 0, 1).float()
+                narrow_tensor = torch.from_numpy(narrow_resized).permute(2, 0, 1).float()
+            else:
+                # print("DEBUG: Images in 0-255 range, normalizing")
+                wide_tensor = torch.from_numpy(wide_resized).permute(2, 0, 1).float() / 255.0
+                narrow_tensor = torch.from_numpy(narrow_resized).permute(2, 0, 1).float() / 255.0
+            
+            # print(f"DEBUG: Final tensors - wide: min={wide_tensor.min():.4f}, max={wide_tensor.max():.4f}")
+            # print(f"DEBUG: Final tensors - narrow: min={narrow_tensor.min():.4f}, max={narrow_tensor.max():.4f}")
+            
             dual_tensor = torch.stack([wide_tensor, narrow_tensor], dim=0)
+            
             
             # Process labels
             cls = wide_label.get('cls', np.array([]))

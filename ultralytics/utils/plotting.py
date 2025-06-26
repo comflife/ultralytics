@@ -690,20 +690,53 @@ def plot_images(
     if isinstance(batch_idx, torch.Tensor):
         batch_idx = batch_idx.cpu().numpy()
 
-
-    # Handle dual stream images
-    if len(images.shape) == 5:  # Dual stream: [B, 2, C, H, W]
+    # Handle dual stream images with debug info
+    # print(f"DEBUG: ===== PLOTTING DEBUG =====")
+    # print(f"DEBUG: Original images shape: {images.shape}")
+    
+    if len(images.shape) == 5 and images.shape[1] == 2:  # Dual stream: [B, 2, C, H, W]
+        # print("DEBUG: ✅ DUAL STREAM DETECTED in plotting!")
+        # print(f"DEBUG: Input shape: {images.shape}")
+        # print(f"DEBUG: Wide stream ([:, 0]) range: min={images[:, 0].min():.4f}, max={images[:, 0].max():.4f}")
+        # print(f"DEBUG: Narrow stream ([:, 1]) range: min={images[:, 1].min():.4f}, max={images[:, 1].max():.4f}")
+        
         # Use only the first stream (wide) for visualization
         images = images[:, 0]  # Take wide stream: [B, C, H, W]
-
+        # print(f"DEBUG: After selecting wide stream - shape: {images.shape}")
+        # print(f"DEBUG: Selected stream value range: min={images.min():.4f}, max={images.max():.4f}")
+        
+    # elif len(images.shape) == 4:  # Regular single stream: [B, C, H, W]
+        # print(f"DEBUG: Single stream detected - shape: {images.shape}")
+        
+    # else:
+    #     print(f"DEBUG: ❌ Unexpected input shape: {images.shape}")
+    #     print("DEBUG: Expected [B, C, H, W] or [B, 2, C, H, W]")
+    
+    # print(f"DEBUG: Final image value range: min={images.min():.4f}, max={images.max():.4f}")
+    
+    # Crop multispectral images to first 3 channels if needed
     if images.shape[1] > 3:
-        images = images[:, :3]  # crop multispectral images to first 3 channels
+        images = images[:, :3]
+        print(f"DEBUG: Cropped to 3 channels - final shape: {images.shape}")
 
     bs, _, h, w = images.shape  # batch size, _, height, width
     bs = min(bs, max_subplots)  # limit plot images
     ns = np.ceil(bs**0.5)  # number of subplots (square)
+    
+    # print(f"DEBUG: Before normalization check - sample pixel values: {images[0, :, 0, 0]}")
+    # print(f"DEBUG: Image dtype: {images.dtype}")
+    
+    # Handle normalization based on value range
     if np.max(images[0]) <= 1:
+        # print("DEBUG: Denormalizing images (0-1 -> 0-255)")
         images *= 255  # de-normalise (optional)
+    # else:
+    #     print("DEBUG: Images already in 0-255 range")
+    
+    # print(f"DEBUG: After normalization - range: min={images.min():.1f}, max={images.max():.1f}")
+    # print(f"DEBUG: ===== END PLOTTING DEBUG =====")
+
+
 
     # Build Image
     mosaic = np.full((int(ns * h), int(ns * w), 3), 255, dtype=np.uint8)  # init

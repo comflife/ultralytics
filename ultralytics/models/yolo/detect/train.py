@@ -97,8 +97,33 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (dict): Preprocessed batch with normalized images.
         """
-        # Handle dual stream images: [B, 2, C, H, W] or single stream: [B, C, H, W]
-        batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+        # print(f"DEBUG: ===== DETECTION PREPROCESS_BATCH DEBUG =====")
+        # print(f"DEBUG: Input batch img shape: {batch['img'].shape}")
+        # print(f"DEBUG: Input batch img range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+        
+        # Handle dual stream properly
+        if batch["img"].dim() == 5 and batch["img"].shape[1] == 2:  # Dual stream: [B, 2, C, H, W]
+            # print("DEBUG: ✅ DUAL STREAM detected in DetectionTrainer.preprocess_batch")
+            
+            # Move to device
+            batch["img"] = batch["img"].to(self.device, non_blocking=True).float()
+            
+            # Check if already normalized (0-1 range) or needs normalization (0-255 range)
+            if batch["img"].max() > 1.0:
+                # print("DEBUG: Normalizing dual stream from 0-255 to 0-1")
+                batch["img"] = batch["img"] / 255.0
+            # else:
+                # print("DEBUG: Dual stream already normalized (0-1 range), not dividing by 255")
+            
+            # print(f"DEBUG: After processing dual stream - shape: {batch['img'].shape}")
+            # print(f"DEBUG: After processing dual stream - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+            
+        else:  # Single stream: [B, C, H, W]
+            # print("DEBUG: Regular single stream detected")
+            batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+            
+            # print(f"DEBUG: After processing single stream - shape: {batch['img'].shape}")
+            # print(f"DEBUG: After processing single stream - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
         
         if self.args.multi_scale:
             imgs = batch["img"]
@@ -110,6 +135,7 @@ class DetectionTrainer(BaseTrainer):
             
             # Handle dual stream multi-scale
             if imgs.dim() == 5 and imgs.shape[1] == 2:  # Dual stream: [B, 2, C, H, W]
+                # print("DEBUG: Applying multi-scale to dual stream")
                 sf = sz / max(imgs.shape[3:])  # scale factor based on H, W
                 if sf != 1:
                     ns = [
@@ -121,7 +147,9 @@ class DetectionTrainer(BaseTrainer):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
                     # Reshape back: [B, 2, C, H, W]
                     imgs = imgs.view(b, streams, c, ns[0], ns[1])
+                    # print(f"DEBUG: After multi-scale dual stream - shape: {imgs.shape}")
             else:  # Single stream: [B, C, H, W]
+                # print("DEBUG: Applying multi-scale to single stream")
                 sf = sz / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
                     ns = [
@@ -130,6 +158,11 @@ class DetectionTrainer(BaseTrainer):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
             
             batch["img"] = imgs
+        
+        # print(f"DEBUG: Final batch img shape: {batch['img'].shape}")
+        # print(f"DEBUG: Final batch img range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+        # print(f"DEBUG: ===== END DETECTION PREPROCESS_BATCH DEBUG =====")
+        
         return batch
 
     def set_model_attributes(self):

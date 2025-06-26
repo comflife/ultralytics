@@ -141,49 +141,34 @@ class DetectionValidator(BaseValidator):
         
         # Handle dual stream image dimensions
         img_shape = batch["img"].shape
-        if len(img_shape) == 5:  # Dual stream: [B, 2, C, H, W]
-            h_new, w_new = img_shape[-2], img_shape[-1]
-        else:  # Regular: [B, C, H, W]
-            h_new, w_new = img_shape[-2], img_shape[-1]
         
-        imgsz = (h_new, w_new)
+        # Convert ori_shape to list for compatibility
+        if torch.is_tensor(ori_shape):
+            ori_shape = ori_shape.cpu().numpy().tolist()
         
-        # For dual stream, skip complex scaling and use bbox as-is
-        # since we're doing simple resize without letterboxing
+        imgsz = img_shape[-2:]  # Get H, W regardless of dual stream or not
+        
+        # For dual stream, we don't need complex scaling
         if len(img_shape) == 5:  # Dual stream
-            # Simple scaling for dual stream (no letterbox padding)
-            h_orig, w_orig = ori_shape.cpu().numpy() if torch.is_tensor(ori_shape) else ori_shape
-            scale_x = w_new / w_orig
-            scale_y = h_new / h_orig
-            
-            # Scale bboxes directly
-            if len(bbox) > 0:
-                bbox[:, [0, 2]] *= scale_x  # x coordinates
-                bbox[:, [1, 3]] *= scale_y  # y coordinates
-            
-            ratio_pad = np.array([[1.0, 1.0, 0.0, 0.0]], dtype=np.float32)  # No padding for simple resize
+            ratio_pad = "dual_stream"  # Special marker
         else:
-            # Regular processing with scale_boxes
             ratio_pad = None
-            bbox = ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad)
         
         return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
 
     def _prepare_pred(self, pred, pbatch):
-        """
-        Prepare predictions for evaluation against ground truth.
-
-        Args:
-            pred (torch.Tensor): Model predictions.
-            pbatch (dict): Prepared batch information.
-
-        Returns:
-            (torch.Tensor): Prepared predictions in native space.
-        """
+        """Prepare predictions for evaluation against ground truth."""
         predn = pred.clone()
+        
+        # Skip scaling for dual stream
+        if pbatch["ratio_pad"] == "dual_stream":
+            return predn
+        
+        # Regular scaling for single stream
         ops.scale_boxes(
             pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
-        )  # native-space pred
+        )
+        
         return predn
 
     def update_metrics(self, preds, batch):
