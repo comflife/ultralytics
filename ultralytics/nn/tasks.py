@@ -1,10 +1,11 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 # Add dual stream modules to global namespace for yaml parsing
 try:
-    from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+    from ultralytics.nn.modules.conv import MultiStreamConv, Fusion, SpatialAlignedMultiStreamConv
     from ultralytics.nn.modules.block import MultiStreamC3
     
     # Add to globals so yaml parsing can find them
+    globals()['SpatialAlignedMultiStreamConv'] = SpatialAlignedMultiStreamConv
     globals()['MultiStreamConv'] = MultiStreamConv
     globals()['MultiStreamC3'] = MultiStreamC3
     globals()['Fusion'] = Fusion
@@ -21,11 +22,14 @@ except ImportError as e:
     class Fusion:
         def __init__(self, *args, **kwargs):
             raise NotImplementedError("Fusion not implemented")
+    class SpatialAlignedMultiStreamConv:
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError("SpatialAlignedMultiStreamConv not implemented")
     
     globals()['MultiStreamConv'] = MultiStreamConv
     globals()['MultiStreamC3'] = MultiStreamC3
     globals()['Fusion'] = Fusion
-
+    globals()['SpatialAlignedMultiStreamConv'] = SpatialAlignedMultiStreamConv
     
 import contextlib
 import pickle
@@ -98,7 +102,7 @@ from ultralytics.nn.modules import (
 )
 
 try:
-    from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+    from ultralytics.nn.modules.conv import MultiStreamConv, Fusion, SpatialAlignedMultiStreamConv
     from ultralytics.nn.modules.block import MultiStreamC3
 except ImportError:
     # Define placeholder classes if modules don't exist yet
@@ -1466,9 +1470,9 @@ def parse_model(d, ch, verbose=True, dual_stream=False):  # model_dict, input_ch
 
     # Import dual stream modules from correct locations
     try:
-        from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+        from ultralytics.nn.modules.conv import MultiStreamConv, Fusion, SpatialAlignedMultiStreamConv
         from ultralytics.nn.modules.block import MultiStreamC3
-        dual_stream_modules = {MultiStreamConv, MultiStreamC3, Fusion}
+        dual_stream_modules = {MultiStreamConv, MultiStreamC3, Fusion, SpatialAlignedMultiStreamConv}
     except ImportError:
         LOGGER.warning("Dual stream modules not found.")
         dual_stream_modules = set()
@@ -1562,11 +1566,12 @@ def parse_model(d, ch, verbose=True, dual_stream=False):  # model_dict, input_ch
             # If not found in globals, try importing from correct modules
             if m is None and any(x in str(m) for x in ["MultiStream", "Fusion"]):
                 try:
-                    if m == "MultiStreamConv" or m == "Fusion":
-                        from ultralytics.nn.modules.conv import MultiStreamConv, Fusion
+                    if m == "MultiStreamConv" or m == "Fusion" or m == "SpatialAlignedMultiStreamConv":
+                        from ultralytics.nn.modules.conv import MultiStreamConv, Fusion, SpatialAlignedMultiStreamConv
                         module_map = {
                             "MultiStreamConv": MultiStreamConv,
                             "Fusion": Fusion,
+                            "SpatialAlignedMultiStreamConv": SpatialAlignedMultiStreamConv,
                         }
                     elif m == "MultiStreamC3":
                         from ultralytics.nn.modules.block import MultiStreamC3

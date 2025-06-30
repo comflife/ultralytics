@@ -73,8 +73,33 @@ class DetectionValidator(BaseValidator):
         Returns:
             (dict): Preprocessed batch.
         """
+        # print(f"DEBUG: ===== VALIDATION PREPROCESS DEBUG =====")
+        # print(f"DEBUG: Validation batch img shape: {batch['img'].shape}")
+        # print(f"DEBUG: BEFORE processing - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+        
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
+        
+        # print(f"DEBUG: AFTER /255 - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+        
+        # 비정상적으로 낮은 값인 경우 임시 보정
+        # if batch["img"].max() < 0.1:
+        #     print("DEBUG: ⚠️ Abnormally low pixel values detected! Applying correction...")
+        #     batch["img"] = batch["img"] * 255  # /255를 취소
+        #     print(f"DEBUG: AFTER correction - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+        
+        # Dual stream validation 처리 확인
+        # if batch["img"].dim() == 5 and batch["img"].shape[1] == 2:
+        #     print("DEBUG: ✅ DUAL STREAM detected in validation")
+        #     print(f"DEBUG: Wide stream range: {batch['img'][:, 0].min():.4f}-{batch['img'][:, 0].max():.4f}")
+        #     print(f"DEBUG: Narrow stream range: {batch['img'][:, 1].min():.4f}-{batch['img'][:, 1].max():.4f}")
+        # else:
+        #     print("DEBUG: ❌ SINGLE STREAM in validation - this might be the problem!")
+        #     print(f"DEBUG: Batch img dimensions: {batch['img'].dim()}")
+        
+        # print(f"DEBUG: Final validation img range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+        # print(f"DEBUG: ===== END VALIDATION PREPROCESS DEBUG =====")
+        
         for k in ["batch_idx", "cls", "bboxes"]:
             batch[k] = batch[k].to(self.device)
 
@@ -120,7 +145,21 @@ class DetectionValidator(BaseValidator):
         Returns:
             (List[torch.Tensor]): Processed predictions after NMS.
         """
-        return ops.non_max_suppression(
+        print(f"DEBUG: ===== VAL POSTPROCESS DEBUG =====")
+        print(f"DEBUG: Postprocess preds type: {type(preds)}")
+        if isinstance(preds, (list, tuple)):
+            print(f"DEBUG: Postprocess preds length: {len(preds)}")
+            if len(preds) > 0:
+                print(f"DEBUG: First pred shape: {preds[0].shape}")
+                print(f"DEBUG: First pred sample values: {preds[0][0, :10] if len(preds[0]) > 0 else 'Empty'}")
+        else:
+            print(f"DEBUG: Postprocess preds shape: {preds.shape}")
+            print(f"DEBUG: Preds sample values: {preds[0, 0, :10] if preds.numel() > 0 else 'Empty'}")
+        
+        print(f"DEBUG: Conf threshold: {self.args.conf}")
+        print(f"DEBUG: IoU threshold: {self.args.iou}")
+        
+        processed = ops.non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
@@ -131,6 +170,17 @@ class DetectionValidator(BaseValidator):
             end2end=self.end2end,
             rotated=self.args.task == "obb",
         )
+        
+        print(f"DEBUG: NMS output type: {type(processed)}")
+        print(f"DEBUG: NMS output length: {len(processed) if isinstance(processed, (list, tuple)) else 'N/A'}")
+        if isinstance(processed, (list, tuple)) and len(processed) > 0:
+            print(f"DEBUG: First NMS result shape: {processed[0].shape if hasattr(processed[0], 'shape') else len(processed[0])}")
+            print(f"DEBUG: First NMS result detections: {len(processed[0]) if hasattr(processed[0], '__len__') else 'N/A'}")
+            if len(processed[0]) > 0:
+                print(f"DEBUG: First detection: {processed[0][0] if len(processed[0]) > 0 else 'Empty'}")
+        print(f"DEBUG: ===== END VAL POSTPROCESS DEBUG =====")
+        
+        return processed
 
     def _prepare_batch(self, si, batch):
         """Prepare a batch for training or inference."""
@@ -179,9 +229,21 @@ class DetectionValidator(BaseValidator):
             preds (List[torch.Tensor]): List of predictions from the model.
             batch (dict): Batch data containing ground truth.
         """
+        print(f"DEBUG: ===== UPDATE METRICS DEBUG =====")
+        print(f"DEBUG: Preds length: {len(preds)}")
+        print(f"DEBUG: Batch keys: {list(batch.keys())}")
+        
+        total_detections = sum(len(pred) for pred in preds)
+        print(f"DEBUG: Total detections across all images: {total_detections}")
+        
         for si, pred in enumerate(preds):
             self.seen += 1
             npr = len(pred)
+            print(f"DEBUG: Image {si}: {npr} predictions")
+            
+            if npr > 0:
+                print(f"DEBUG: Image {si} first prediction: {pred[0]}")
+            
             stat = dict(
                 conf=torch.zeros(0, device=self.device),
                 pred_cls=torch.zeros(0, device=self.device),
@@ -190,6 +252,8 @@ class DetectionValidator(BaseValidator):
             pbatch = self._prepare_batch(si, batch)
             cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
             nl = len(cls)
+            print(f"DEBUG: Image {si}: {nl} ground truth objects")
+            
             stat["target_cls"] = cls
             stat["target_img"] = cls.unique()
             if npr == 0:
@@ -225,6 +289,8 @@ class DetectionValidator(BaseValidator):
                     pbatch["ori_shape"],
                     self.save_dir / "labels" / f"{Path(batch['im_file'][si]).stem}.txt",
                 )
+        
+        print(f"DEBUG: ===== END UPDATE METRICS DEBUG =====")
 
     def finalize_metrics(self, *args, **kwargs):
         """
@@ -301,7 +367,38 @@ class DetectionValidator(BaseValidator):
         Returns:
             (Dataset): YOLO dataset.
         """
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride)
+        # print(f"DEBUG: ===== BUILDING VALIDATION DATASET =====")
+        # print(f"DEBUG: img_path: {img_path}")
+        # print(f"DEBUG: mode: {mode}")
+        # print(f"DEBUG: batch: {batch}")
+        # print(f"DEBUG: args.multi_modal: {getattr(self.args, 'multi_modal', 'NOT SET')}")
+        
+        # Validation에서도 multi_modal 강제 활성화
+        original_multi_modal = getattr(self.args, 'multi_modal', False)
+        self.args.multi_modal = True
+        
+        # print(f"DEBUG: Forcing multi_modal=True for validation")
+        
+        dataset = build_yolo_dataset(
+            self.args, 
+            img_path, 
+            batch, 
+            self.data, 
+            mode=mode, 
+            stride=self.stride
+        )
+        
+        # 원래 값 복원 (다른 곳에 영향 주지 않기 위해)
+        self.args.multi_modal = original_multi_modal
+        
+        # print(f"DEBUG: Dataset type: {type(dataset)}")
+        # print(f"DEBUG: Dataset length: {len(dataset)}")
+        # print(f"DEBUG: Dataset has multi_modal: {hasattr(dataset, 'multi_modal')}")
+        if hasattr(dataset, 'multi_modal'):
+            print(f"DEBUG: Dataset.multi_modal: {dataset.multi_modal}")
+        # print(f"DEBUG: ===== END BUILDING VALIDATION DATASET =====")
+        
+        return dataset
 
     def get_dataloader(self, dataset_path, batch_size):
         """
@@ -325,8 +422,21 @@ class DetectionValidator(BaseValidator):
             batch (dict): Batch containing images and annotations.
             ni (int): Batch index.
         """
+        # print(f"DEBUG: ===== PLOT VAL SAMPLES DEBUG =====")
+        # print(f"DEBUG: Plot validation batch img shape: {batch['img'].shape}")
+        
+        # Dual stream에서 wide stream만 시각화
+        img_to_plot = batch["img"]
+        if batch["img"].dim() == 5 and batch["img"].shape[1] == 2:
+            # print("DEBUG: Using wide stream for validation plot")
+            img_to_plot = batch["img"][:, 0]  # Wide stream만 사용
+        
+        # print(f"DEBUG: Image to plot shape: {img_to_plot.shape}")
+        # print(f"DEBUG: Image to plot range: min={img_to_plot.min():.4f}, max={img_to_plot.max():.4f}")
+        # print(f"DEBUG: ===== END PLOT VAL SAMPLES DEBUG =====")
+        
         plot_images(
-            batch["img"],
+            img_to_plot,  # 수정된 부분
             batch["batch_idx"],
             batch["cls"].squeeze(-1),
             batch["bboxes"],
@@ -345,8 +455,20 @@ class DetectionValidator(BaseValidator):
             preds (List[torch.Tensor]): List of predictions from the model.
             ni (int): Batch index.
         """
+        # print(f"DEBUG: ===== PLOT PREDICTIONS DEBUG =====")
+        # print(f"DEBUG: Plot predictions batch img shape: {batch['img'].shape}")
+        
+        # Dual stream에서 wide stream만 시각화
+        img_to_plot = batch["img"]
+        if batch["img"].dim() == 5 and batch["img"].shape[1] == 2:
+            # print("DEBUG: Using wide stream for prediction plot")
+            img_to_plot = batch["img"][:, 0]  # Wide stream만 사용
+        
+        # print(f"DEBUG: Image to plot shape: {img_to_plot.shape}")
+        # print(f"DEBUG: ===== END PLOT PREDICTIONS DEBUG =====")
+        
         plot_images(
-            batch["img"],
+            img_to_plot,  # 수정된 부분
             *output_to_target(preds, max_det=self.args.max_det),
             paths=batch["im_file"],
             fname=self.save_dir / f"val_batch{ni}_pred.jpg",

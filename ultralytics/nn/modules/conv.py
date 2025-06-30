@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "Conv",
@@ -79,6 +80,105 @@ class MultiStreamConv(nn.Module):
             
         else:
             raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D input with shape {x.shape}")
+
+
+class SpatialAlignedMultiStreamConv(nn.Module):
+    """공간적으로 정렬된 듀얼 스트림 Conv"""
+    
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        super().__init__()
+        self.cv_wide = Conv(c1, c2, k, s, autopad(k, p, d), g=g, d=d, act=act)
+        self.cv_narrow = Conv(c1, c2, k, s, autopad(k, p, d), g=g, d=d, act=act)
+        
+        # Narrow FOV가 wide image에서 보이는 위치 (YOLO format)
+        self.narrow_bbox = {
+            'center_x': 0.499289,
+            'center_y': 0.499912,
+            'width': 0.286041,
+            'height': 0.291975
+        }
+
+    def place_narrow_in_wide_space(self, narrow_tensor, target_size):
+        """Narrow tensor를 wide space의 올바른 위치에 배치"""
+        B, C, H_narrow, W_narrow = narrow_tensor.shape
+        H_wide, W_wide = target_size
+        
+        # print(f"DEBUG: Placing narrow {narrow_tensor.shape} into wide space {target_size}")
+        
+        # 출력 텐서 초기화 (zero padding)
+        aligned_narrow = torch.zeros(B, C, H_wide, W_wide, 
+                                   device=narrow_tensor.device, 
+                                   dtype=narrow_tensor.dtype)
+        
+        # YOLO bbox -> 픽셀 좌표 변환
+        center_x = int(self.narrow_bbox['center_x'] * W_wide)
+        center_y = int(self.narrow_bbox['center_y'] * H_wide)
+        bbox_w = int(self.narrow_bbox['width'] * W_wide)
+        bbox_h = int(self.narrow_bbox['height'] * H_wide)
+        
+        # 배치할 위치 계산
+        x1 = max(0, center_x - bbox_w // 2)
+        y1 = max(0, center_y - bbox_h // 2)
+        x2 = min(W_wide, x1 + bbox_w)
+        y2 = min(H_wide, y1 + bbox_h)
+        
+        # print(f"DEBUG: Narrow bbox in wide space: ({x1}, {y1}) to ({x2}, {y2})")
+        # print(f"DEBUG: Narrow bbox size: {x2-x1}x{y2-y1}")
+        
+        # Narrow tensor를 bbox 크기로 resize
+        target_h = y2 - y1
+        target_w = x2 - x1
+        
+        if target_h > 0 and target_w > 0:
+            # Narrow를 target 크기로 resize
+            narrow_resized = F.interpolate(narrow_tensor, 
+                                         size=(target_h, target_w), 
+                                         mode='bilinear', 
+                                         align_corners=False)
+            
+            # Wide space의 해당 위치에 배치
+            aligned_narrow[:, :, y1:y2, x1:x2] = narrow_resized
+            
+            # print(f"DEBUG: Successfully placed narrow at ({x1}:{x2}, {y1}:{y2})")
+        # else:
+            # print(f"DEBUG: ❌ Invalid target size: {target_w}x{target_h}")
+        
+        return aligned_narrow
+
+    def forward(self, x):
+        # print(f"DEBUG: SpatialAlignedMultiStreamConv input shape: {x.shape}")
+        
+        if x.dim() == 5 and x.shape[1] == 2:  # [B, 2, C, H, W]
+            # print("DEBUG: ✅ Processing dual stream with spatial alignment")
+            
+            wide_stream = x[:, 0]    # [B, C, H, W]
+            narrow_stream = x[:, 1]  # [B, C, H, W]
+            
+            # print(f"DEBUG: Wide stream shape: {wide_stream.shape}")
+            # print(f"DEBUG: Narrow stream shape: {narrow_stream.shape}")
+            
+            # Wide stream 처리 (그대로)
+            wide_out = self.cv_wide(wide_stream)
+            
+            # Narrow stream을 wide space에 올바른 위치에 배치
+            H_wide, W_wide = wide_stream.shape[2], wide_stream.shape[3]
+            narrow_aligned = self.place_narrow_in_wide_space(narrow_stream, (H_wide, W_wide))
+            
+            # 정렬된 narrow stream 처리
+            narrow_out = self.cv_narrow(narrow_aligned)
+            
+            # print(f"DEBUG: Wide output shape: {wide_out.shape}")
+            # print(f"DEBUG: Narrow aligned output shape: {narrow_out.shape}")
+            
+            # Dual stream 형태로 재결합
+            output = torch.stack([wide_out, narrow_out], dim=1)  # [B, 2, C_out, H_out, W_out]
+            
+            # print(f"DEBUG: SpatialAligned output shape: {output.shape}")
+            return output
+        else:
+            # Single stream 처리
+            return self.cv_wide(x)
+
 
 class MultiStreamMaxPool2d(nn.Module):
     """Multi-stream MaxPool2d module for multi-sensor inputs."""

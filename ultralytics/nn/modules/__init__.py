@@ -188,5 +188,6 @@ __all__ = (
     "MultiStreamConv",
     "MultiStreamC3",
     "MultiStreamMaxPool2d",
+    "SpatialAlignedMultiStreamConv",
     "Fusion",
 )

@@ -498,6 +498,9 @@ class Model(torch.nn.Module):
         **kwargs: Any,
     ) -> List[Results]:
         """Performs predictions on the given image source using the YOLO model."""
+        print(f"DEBUG: ===== MODEL PREDICT DEBUG =====")
+        print(f"DEBUG: Model predict called with source type: {type(source)}")
+        
         if source is None:
             source = "https://ultralytics.com/images/boats.jpg" if self.task == "obb" else ASSETS
             LOGGER.warning(f"'source' is missing. Using 'source={source}'.")
@@ -512,19 +515,36 @@ class Model(torch.nn.Module):
 
         # Check if using dual stream model
         is_dual_model = getattr(self.model, 'dual_stream', False) or args.get('dual_stream', False)
+        print(f"DEBUG: Is dual stream model: {is_dual_model}")
+        print(f"DEBUG: Model has dual_stream attr: {hasattr(self.model, 'dual_stream')}")
+        if hasattr(self.model, 'dual_stream'):
+            print(f"DEBUG: Model.dual_stream value: {self.model.dual_stream}")
         
         # Handle dual stream source (second source for narrow images)
         source2 = kwargs.pop("source2", None)
         if is_dual_model and source2:
             args["source2"] = source2
+            print(f"DEBUG: Dual stream with source2: {source2}")
 
         if not self.predictor:
+            print("DEBUG: Creating new predictor")
             self.predictor = (predictor or self._smart_load("predictor"))(overrides=args, _callbacks=self.callbacks)
             self.predictor.setup_model(model=self.model, verbose=is_cli)
         else:  # only update args if predictor is already setup
+            print("DEBUG: Updating existing predictor args")
             self.predictor.args = get_cfg(self.predictor.args, args)
             if "project" in args or "name" in args:
                 self.predictor.save_dir = get_save_dir(self.predictor.args)
+        
+        # Ensure predictor knows about dual stream
+        if is_dual_model:
+            print("DEBUG: Setting dual_stream on predictor")
+            self.predictor.args.dual_stream = True
+            if hasattr(self.predictor, 'model') and hasattr(self.predictor.model, 'dual_stream'):
+                self.predictor.model.dual_stream = True
+        
+        print(f"DEBUG: Predictor args dual_stream: {getattr(self.predictor.args, 'dual_stream', 'NOT SET')}")
+        print(f"DEBUG: ===== END MODEL PREDICT DEBUG =====")
         
         if prompts and hasattr(self.predictor, "set_prompts"):  # for SAM-type models
             self.predictor.set_prompts(prompts)
