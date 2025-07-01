@@ -506,16 +506,17 @@ class YOLODataset(BaseDataset):
                     # Handle dual stream images
                     first_item = value[0]
                     if isinstance(first_item, tuple) and len(first_item) == 2:
-                        # Dual stream case: separate wide and narrow images
+                        # Dual stream case: keep as tuple but ensure both have same batch size
                         wide_imgs = [item[0] for item in value]
                         narrow_imgs = [item[1] for item in value]
                         
-                        # Stack wide and narrow separately, then combine
-                        wide_tensor = torch.stack(wide_imgs, 0)    # [B, C, H, W]
-                        narrow_tensor = torch.stack(narrow_imgs, 0)  # [B, C, H, W]
+                        # Stack each stream separately, then combine as tuple
+                        wide_batch = torch.stack(wide_imgs, 0)    # [B, C, H, W]
+                        narrow_batch = torch.stack(narrow_imgs, 0)  # [B, C, H, W]
                         
-                        # Combine into [B, 2, C, H, W] format
-                        value = torch.stack([wide_tensor, narrow_tensor], dim=1)
+                        # Keep as tuple in img key
+                        # value = (wide_batch, narrow_batch)
+                        value = torch.stack((wide_batch, narrow_batch), dim=1)  # [2, B, C, H, W]
                     else:
                         # Single stream case
                         value = torch.stack(value, 0)
