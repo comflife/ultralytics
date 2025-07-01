@@ -73,32 +73,12 @@ class DetectionValidator(BaseValidator):
         Returns:
             (dict): Preprocessed batch.
         """
-        # print(f"DEBUG: ===== VALIDATION PREPROCESS DEBUG =====")
-        # print(f"DEBUG: Validation batch img shape: {batch['img'].shape}")
-        # print(f"DEBUG: BEFORE processing - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
+
         
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
         
-        # print(f"DEBUG: AFTER /255 - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
-        
-        # 비정상적으로 낮은 값인 경우 임시 보정
-        # if batch["img"].max() < 0.1:
-        #     print("DEBUG: ⚠️ Abnormally low pixel values detected! Applying correction...")
-        #     batch["img"] = batch["img"] * 255  # /255를 취소
-        #     print(f"DEBUG: AFTER correction - range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
-        
-        # Dual stream validation 처리 확인
-        # if batch["img"].dim() == 5 and batch["img"].shape[1] == 2:
-        #     print("DEBUG: ✅ DUAL STREAM detected in validation")
-        #     print(f"DEBUG: Wide stream range: {batch['img'][:, 0].min():.4f}-{batch['img'][:, 0].max():.4f}")
-        #     print(f"DEBUG: Narrow stream range: {batch['img'][:, 1].min():.4f}-{batch['img'][:, 1].max():.4f}")
-        # else:
-        #     print("DEBUG: ❌ SINGLE STREAM in validation - this might be the problem!")
-        #     print(f"DEBUG: Batch img dimensions: {batch['img'].dim()}")
-        
-        # print(f"DEBUG: Final validation img range: min={batch['img'].min():.4f}, max={batch['img'].max():.4f}")
-        # print(f"DEBUG: ===== END VALIDATION PREPROCESS DEBUG =====")
+
         
         for k in ["batch_idx", "cls", "bboxes"]:
             batch[k] = batch[k].to(self.device)
@@ -206,19 +186,20 @@ class DetectionValidator(BaseValidator):
         
         return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
 
+    # detect/val.py
     def _prepare_pred(self, pred, pbatch):
         """Prepare predictions for evaluation against ground truth."""
         predn = pred.clone()
-        
-        # Skip scaling for dual stream
-        if pbatch["ratio_pad"] == "dual_stream":
-            return predn
-        
-        # Regular scaling for single stream
+
+        # ratio_pad 인자에 pbatch 값을 직접 넣는 대신, 항상 None을 전달하여
+        # scale_boxes 함수가 패딩을 직접 계산하도록 합니다.
         ops.scale_boxes(
-            pbatch["imgsz"], predn[:, :4], pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"]
+            pbatch["imgsz"],
+            predn[:, :4],
+            pbatch["ori_shape"],
+            ratio_pad=None  # ✅ 이렇게 수정
         )
-        
+
         return predn
 
     def update_metrics(self, preds, batch):
@@ -229,20 +210,20 @@ class DetectionValidator(BaseValidator):
             preds (List[torch.Tensor]): List of predictions from the model.
             batch (dict): Batch data containing ground truth.
         """
-        print(f"DEBUG: ===== UPDATE METRICS DEBUG =====")
-        print(f"DEBUG: Preds length: {len(preds)}")
-        print(f"DEBUG: Batch keys: {list(batch.keys())}")
+        # print(f"DEBUG: ===== UPDATE METRICS DEBUG =====")
+        # print(f"DEBUG: Preds length: {len(preds)}")
+        # print(f"DEBUG: Batch keys: {list(batch.keys())}")
         
         total_detections = sum(len(pred) for pred in preds)
-        print(f"DEBUG: Total detections across all images: {total_detections}")
+        # print(f"DEBUG: Total detections across all images: {total_detections}")
         
         for si, pred in enumerate(preds):
             self.seen += 1
             npr = len(pred)
-            print(f"DEBUG: Image {si}: {npr} predictions")
+            # print(f"DEBUG: Image {si}: {npr} predictions")
             
-            if npr > 0:
-                print(f"DEBUG: Image {si} first prediction: {pred[0]}")
+            # if npr > 0:
+                # print(f"DEBUG: Image {si} first prediction: {pred[0]}")
             
             stat = dict(
                 conf=torch.zeros(0, device=self.device),
@@ -252,7 +233,7 @@ class DetectionValidator(BaseValidator):
             pbatch = self._prepare_batch(si, batch)
             cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
             nl = len(cls)
-            print(f"DEBUG: Image {si}: {nl} ground truth objects")
+            # print(f"DEBUG: Image {si}: {nl} ground truth objects")
             
             stat["target_cls"] = cls
             stat["target_img"] = cls.unique()
@@ -290,7 +271,7 @@ class DetectionValidator(BaseValidator):
                     self.save_dir / "labels" / f"{Path(batch['im_file'][si]).stem}.txt",
                 )
         
-        print(f"DEBUG: ===== END UPDATE METRICS DEBUG =====")
+        # print(f"DEBUG: ===== END UPDATE METRICS DEBUG =====")
 
     def finalize_metrics(self, *args, **kwargs):
         """

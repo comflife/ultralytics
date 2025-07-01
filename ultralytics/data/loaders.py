@@ -861,8 +861,45 @@ class LoadDualImagesAndVideos:
             
             # If both images loaded successfully
             if im01 is not None and im02 is not None:
-                # Stack images as [2, H, W, C] - dual stream format
-                dual_img = np.stack([im01, im02], axis=0)
+                print(f"DEBUG: LOADER - Raw image shapes: im01={im01.shape}, im02={im02.shape}")
+                
+                # 🔧 Ensure both images have same shape
+                h1, w1 = im01.shape[:2]
+                h2, w2 = im02.shape[:2]
+                
+                if (h1, w1) != (h2, w2):
+                    print(f"DEBUG: LOADER - Resizing im02 from {im02.shape} to match im01 {im01.shape}")
+                    im02 = cv2.resize(im02, (w1, h1))
+                
+                # 🔧 Convert BGR to RGB for both images (OpenCV loads as BGR)
+                if len(im01.shape) == 3 and im01.shape[2] == 3:
+                    im01 = cv2.cvtColor(im01, cv2.COLOR_BGR2RGB)
+                    im02 = cv2.cvtColor(im02, cv2.COLOR_BGR2RGB)
+                    print(f"DEBUG: LOADER - Converted BGR to RGB")
+                
+                # 🔧 Create proper dual stream format: [2, C, H, W]
+                if len(im01.shape) == 3:  # Color image [H, W, C]
+                    # Transpose to [C, H, W] for each image
+                    im01_chw = np.transpose(im01, (2, 0, 1))  # [C, H, W]
+                    im02_chw = np.transpose(im02, (2, 0, 1))  # [C, H, W]
+                    
+                    # Stack to create dual stream [2, C, H, W]
+                    dual_img = np.stack([im01_chw, im02_chw], axis=0)
+                    print(f"DEBUG: LOADER - Color dual_img shape: {dual_img.shape}")
+                    
+                else:  # Grayscale image [H, W]
+                    # Add channel dimension [1, H, W] for each image
+                    im01_chw = np.expand_dims(im01, axis=0)  # [1, H, W]
+                    im02_chw = np.expand_dims(im02, axis=0)  # [1, H, W]
+                    
+                    # Stack to create dual stream [2, 1, H, W]
+                    dual_img = np.stack([im01_chw, im02_chw], axis=0)
+                    print(f"DEBUG: LOADER - Grayscale dual_img shape: {dual_img.shape}")
+                
+                # 🔧 Ensure correct data type
+                dual_img = dual_img.astype(np.uint8)
+                print(f"DEBUG: LOADER - Final dual_img shape: {dual_img.shape}, dtype: {dual_img.dtype}")
+                print(f"DEBUG: LOADER - Value range: {dual_img.min()} ~ {dual_img.max()}")
                 
                 paths.append(f"{path1}|{path2}")  # Combined path for tracking
                 imgs.append(dual_img)

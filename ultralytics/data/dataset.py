@@ -6,6 +6,7 @@ from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from copy import deepcopy
+import traceback
 
 
 import cv2
@@ -18,6 +19,7 @@ from ultralytics.utils import LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, colorstr
 from ultralytics.utils.instance import Instances
 from ultralytics.utils.ops import resample_segments, segments2boxes
 from ultralytics.utils.torch_utils import TORCHVISION_0_18
+
 
 from .augment import (
     Compose,
@@ -44,6 +46,55 @@ from .utils import (
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
 DATASET_CACHE_VERSION = "1.0.3"
 
+# YOLODataset 클래스 위에 있는 DualLetterBox를 아래 코드로 교체하세요.
+
+class DualLetterBox(LetterBox):
+    """
+    Applies LetterBox to 'img' and 'img2' keys in-place.
+    """
+    def __call__(self, labels=None, image=None):
+        # 1. 첫 번째 이미지(wide)와 라벨을 함께 변환
+        labels = super().__call__(labels)
+
+        # 2. 두 번째 이미지(narrow)가 있으면 변환
+        if 'img2' in labels:
+            # 임시 딕셔너리를 만들어 두 번째 이미지에 LetterBox 적용
+            temp_labels_for_narrow = labels.copy()
+            temp_labels_for_narrow['img'] = labels['img2']
+            transformed_narrow_dict = super().__call__(temp_labels_for_narrow)
+            
+            # ✅ 수정된 부분: 튜플로 묶지 않고, 'img2' 키에 그대로 저장
+            labels['img2'] = transformed_narrow_dict['img']
+
+        return labels
+    
+# DualLetterBox 클래스 아래에 이 코드를 추가하세요.
+
+class DualFormat(Format):
+    """
+    Formats labels for dual-stream datasets.
+    Converts both 'img' and 'img2' to tensors and combines them into a single 'img' key as a tuple.
+    """
+    def __call__(self, labels):
+        # 1. 첫 번째 이미지(wide)와 라벨들을 표준 Format으로 변환
+        labels = super().__call__(labels)
+        
+        # 2. 두 번째 이미지(narrow)가 있는지 확인하고 변환
+        if 'img2' in labels:
+            img2 = labels.pop('img2') # 'img2'를 가져오고 딕셔너리에서 제거
+            
+            # np.array를 텐서로 변환 (부모 Format 클래스의 로직 일부)
+            if self.bgr > 0 and np.random.rand() < self.bgr:
+                img2 = img2[..., ::-1]  # BGR to RGB
+            img2 = np.ascontiguousarray(img2.transpose(2, 0, 1))
+            img2 = torch.from_numpy(img2)
+            
+            # 변환된 두 이미지를 튜플로 묶어서 'img' 키에 저장
+            wide_tensor = labels['img']
+            narrow_tensor = img2.float() / 255.0 if self.normalize else img2.float()
+            labels['img'] = (wide_tensor, narrow_tensor)
+            
+        return labels
 
 class YOLODataset(BaseDataset):
     """
@@ -145,203 +196,97 @@ class YOLODataset(BaseDataset):
 
 
     def __getitem__(self, index):
-        """Returns transformed label information for given index."""
-        if hasattr(self, 'narrow_files'):
-            result = self._get_dual_item(index)
-            # print(f"DEBUG: __getitem__ returning dual tensor with shape: {result['img'].shape}")
-            return result
-        else:
-            return self._get_item(index)
+        """Returns a single item from the dataset."""
+        if self.is_dual_stream:
+            # 듀얼 스트림일 경우 _get_dual_item 호출
+            return self._get_dual_item(index)
+        
+        # 싱글 스트림일 경우, BaseDataset의 __getitem__ 로직을 따름
+        # (get_image_and_label 호출 후 self.transforms(label) 적용)
+        label = self.get_image_and_label(index)
+        return self.transforms(label)
     
     def _get_dual_item(self, index):
-        """Get dual stream item (wide + narrow images)."""
+        """
+        Loads raw data for a single dual-stream item and passes it to the transform pipeline.
+        """
         try:
-            # Load wide image and labels
-            wide_label = deepcopy(self.labels[index])
+            # BaseDataset의 get_image_and_label을 직접 사용하되, 
+            # dual stream 이미지 로딩을 위해 수정된 버전 사용
+            label = deepcopy(self.labels[index])
+            label.pop("shape", None)  # shape is for rect, remove it
             
-            # Load images
-            img_result = self.load_image(index)
+            # Load dual stream images
+            imgs, ori_shape, resized_shape = self.load_image(index)
             
-            if isinstance(img_result, tuple) and len(img_result) == 3:
-                imgs, ori_shape, resized_shape = img_result
-                
-                if isinstance(imgs, list) and len(imgs) == 2:
-                    wide_img, narrow_img = imgs
-                else:
-                    wide_img = imgs
-                    narrow_img = imgs.copy()
-            else:
-                raise ValueError(f"Unexpected return format from load_image: {type(img_result)}")
+            # 두 이미지를 별도로 설정
+            label["img"] = imgs[0]   # wide image (numpy array)
+            label["img2"] = imgs[1]  # narrow image (numpy array)
             
-            # Debug original image values
-            # print(f"DEBUG: Original wide_img - shape: {wide_img.shape}, range: min={wide_img.min()}, max={wide_img.max()}, dtype={wide_img.dtype}")
-            # print(f"DEBUG: Original narrow_img - shape: {narrow_img.shape}, range: min={narrow_img.min()}, max={narrow_img.max()}, dtype={narrow_img.dtype}")
+            label["ori_shape"] = ori_shape
+            label["resized_shape"] = resized_shape
+            label["ratio_pad"] = (
+                resized_shape[0] / ori_shape[0],
+                resized_shape[1] / ori_shape[1],
+            )  # for evaluation
             
-            # Process images
-            target_size = (640, 640)
-            wide_resized = cv2.resize(wide_img, target_size)
-            narrow_resized = cv2.resize(narrow_img, target_size)
+            if self.rect:
+                label["rect_shape"] = self.batch_shapes[self.batch[index]]
             
-            # print(f"DEBUG: After resize - wide: min={wide_resized.min()}, max={wide_resized.max()}")
-            # print(f"DEBUG: After resize - narrow: min={narrow_resized.min()}, max={narrow_resized.max()}")
-            
-            # Check if images are already normalized or need normalization
-            if wide_resized.max() <= 1.0:
-                # print("DEBUG: Images already normalized (0-1), using as-is")
-                wide_tensor = torch.from_numpy(wide_resized).permute(2, 0, 1).float()
-                narrow_tensor = torch.from_numpy(narrow_resized).permute(2, 0, 1).float()
-            else:
-                # print("DEBUG: Images in 0-255 range, normalizing")
-                wide_tensor = torch.from_numpy(wide_resized).permute(2, 0, 1).float() / 255.0
-                narrow_tensor = torch.from_numpy(narrow_resized).permute(2, 0, 1).float() / 255.0
-            
-            # print(f"DEBUG: Final tensors - wide: min={wide_tensor.min():.4f}, max={wide_tensor.max():.4f}")
-            # print(f"DEBUG: Final tensors - narrow: min={narrow_tensor.min():.4f}, max={narrow_tensor.max():.4f}")
-            
-            dual_tensor = torch.stack([wide_tensor, narrow_tensor], dim=0)
-            
-            
-            # Process labels
-            cls = wide_label.get('cls', np.array([]))
-            bboxes = wide_label.get('bboxes', np.array([]).reshape(0, 4))
-            segments = wide_label.get('segments', [])
-            keypoints = wide_label.get('keypoints')
-            
-            # Convert to tensors
-            if cls is None:
-                cls_tensor = torch.tensor([], dtype=torch.float32)
-            elif isinstance(cls, np.ndarray):
-                cls_tensor = torch.from_numpy(cls.astype(np.float32))
-            elif isinstance(cls, (list, tuple)):
-                cls_tensor = torch.tensor(cls, dtype=torch.float32)
-            else:
-                cls_tensor = torch.tensor([], dtype=torch.float32)
-            
-            if bboxes is None:
-                bboxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
-            elif isinstance(bboxes, np.ndarray):
-                bboxes_tensor = torch.from_numpy(bboxes.astype(np.float32))
-            elif isinstance(bboxes, (list, tuple)):
-                bboxes_tensor = torch.tensor(bboxes, dtype=torch.float32).reshape(-1, 4)
-            else:
-                bboxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
-            
-            if segments is None:
-                segments = []
-            elif not isinstance(segments, list):
-                segments = []
-            
-            # Calculate ratio_pad for validation
-            # ratio_pad is needed for proper coordinate conversion during validation
-            h_orig, w_orig = ori_shape
-            h_new, w_new = target_size
-            
-            # Calculate scale and padding (like LetterBox does)
-            scale = min(h_new / h_orig, w_new / w_orig)
-            pad_w = (w_new - w_orig * scale) / 2
-            pad_h = (h_new - h_orig * scale) / 2
-            
-            ratio_pad = torch.tensor([scale, scale, pad_w, pad_h], dtype=torch.float32)
-            
-            # Create result with all required keys
-            result = {
-                'img': dual_tensor,
-                'im_file': f"{self.im_files[index]}|{self.narrow_files[index]}",
-                'ori_shape': torch.tensor(ori_shape, dtype=torch.int64),
-                'resized_shape': torch.tensor(target_size, dtype=torch.int64),
-                # 'ratio_pad': ratio_pad,  # Add this for validation
-                'cls': cls_tensor,
-                'bboxes': bboxes_tensor,
-                'segments': segments,
-                'keypoints': keypoints,
-                'bbox_format': wide_label.get('bbox_format', 'xywh'),
-                'normalized': wide_label.get('normalized', True),
-                'batch_idx': torch.tensor([], dtype=torch.long),
-            }
-            
-            return result
-            
+            # update_labels_info 적용
+            label = self.update_labels_info(label)
+
+            # 4. 준비된 딕셔너리를 전체 변환 파이프라인(self.transforms)에 전달합니다.
+            return self.transforms(label)
+
         except Exception as e:
-            LOGGER.error(f"ERROR in _get_dual_item for index {index}: {e}")
-            raise e
+            LOGGER.error(f"DETAILED ERROR in _get_dual_item for index {index}:")
+            traceback.print_exc()
+            return None
+            
+
+
+    # YOLODataset 클래스 내부의 build_transforms 함수를 아래 코드로 교체하세요.
 
     def build_transforms(self, hyp=None):
-        """
-        Builds and appends transforms to the list.
-        
-        Args:
-            hyp (dict, optional): Hyperparameters for transforms.
-            
-        Returns:
-            (Compose): Composed transforms.
-        """
-        # For dual stream, use minimal transforms to avoid issues
         if self.is_dual_stream:
-            # Only basic transforms - no augmentation
-            transforms = Compose([
-                LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False),
-                Format(
-                    bbox_format="xywh",
-                    normalize=True,
-                    return_mask=self.use_segments,
-                    return_keypoint=self.use_keypoints,
-                    return_obb=self.use_obb,
-                    batch_idx=True,
-                    mask_ratio=4,
-                    mask_overlap=True,
-                    bgr=0.0,  # No BGR augmentation
-                )
-            ])
+            # 듀얼 스트림용 변환 파이프라인
+            if self.augment:
+                # TODO: 여기에 학습용 증강(v8_transforms)을 추가할 수 있습니다.
+                # 우선은 검증과 동일하게 구성합니다.
+                transforms = Compose([
+                    DualLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=True),
+                    DualFormat(
+                        bbox_format="xywh",
+                        normalize=True,
+                        return_mask=self.use_segments,
+                        return_keypoint=self.use_keypoints,
+                        return_obb=self.use_obb,
+                        batch_idx=True,
+                        mask_ratio=getattr(hyp, 'mask_ratio', 4) if hyp else 4,
+                        mask_overlap=getattr(hyp, 'overlap_mask', True) if hyp else True,
+                        bgr=getattr(hyp, 'bgr', 0.0) if hyp else 0.0
+                    )
+                ])
+            else:
+                # 검증(Validation) 시의 변환
+                transforms = Compose([
+                    DualLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False),
+                    DualFormat(
+                        bbox_format="xywh",
+                        normalize=True,
+                        return_mask=self.use_segments,
+                        return_keypoint=self.use_keypoints,
+                        return_obb=self.use_obb,
+                        batch_idx=True
+                    )
+                ])
             return transforms
-        
-        # Original transforms for single stream
-        if self.augment:
-            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
-            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
-            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
-            transforms = v8_transforms(self, self.imgsz, hyp)
         else:
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
-        transforms.append(
-            Format(
-                bbox_format="xywh",
-                normalize=True,
-                return_mask=self.use_segments,
-                return_keypoint=self.use_keypoints,
-                return_obb=self.use_obb,
-                batch_idx=True,
-                mask_ratio=hyp.mask_ratio,
-                mask_overlap=hyp.overlap_mask,
-                bgr=hyp.bgr if self.augment else 0.0,
-            )
-        )
-        return transforms
-
-    def _apply_basic_transforms_to_narrow(self, narrow_data, wide_result):
-        """Apply basic transforms to narrow image to match wide image format."""
-        from ultralytics.data.augment import LetterBox, Format
+            # 싱글 스트림은 기존 로직을 그대로 사용합니다.
+            return super().build_transforms(hyp)
         
-        # Get target size from wide result
-        target_size = wide_result['img'].shape[-2:]  # (H, W)
-        
-        # Create basic transform pipeline (no augmentation)
-        basic_transforms = Compose([
-            LetterBox(new_shape=target_size, scaleup=False),
-            Format(
-                bbox_format="xywh",
-                normalize=True,
-                return_mask=self.use_segments,
-                return_keypoint=self.use_keypoints,
-                return_obb=self.use_obb,
-                batch_idx=True,
-                mask_ratio=4,
-                mask_overlap=True,
-                bgr=0.0,  # No BGR augmentation
-            )
-        ])
-        
-        # Apply transforms
-        return basic_transforms(narrow_data)
+  
 
 
     def cache_labels(self, path=Path("./labels.cache")):
@@ -543,6 +488,11 @@ class YOLODataset(BaseDataset):
     @staticmethod
     def collate_fn(batch):
         """Collates data samples into batches."""
+        # ✅ 추가된 부분: None인 아이템은 배치에서 제외합니다.
+        batch = [b for b in batch if b is not None]
+        if not batch:
+            return None  # 배치가 비어있으면 None 반환
+        
         try:
             new_batch = {}
             batch = [dict(sorted(b.items())) for b in batch]
@@ -554,10 +504,21 @@ class YOLODataset(BaseDataset):
                 
                 if k == "img":
                     # Handle dual stream images
-                    if len(value[0].shape) == 4 and value[0].shape[0] == 2:
-                        value = torch.stack(value, 0)  # [B, 2, C, H, W]
+                    first_item = value[0]
+                    if isinstance(first_item, tuple) and len(first_item) == 2:
+                        # Dual stream case: separate wide and narrow images
+                        wide_imgs = [item[0] for item in value]
+                        narrow_imgs = [item[1] for item in value]
+                        
+                        # Stack wide and narrow separately, then combine
+                        wide_tensor = torch.stack(wide_imgs, 0)    # [B, C, H, W]
+                        narrow_tensor = torch.stack(narrow_imgs, 0)  # [B, C, H, W]
+                        
+                        # Combine into [B, 2, C, H, W] format
+                        value = torch.stack([wide_tensor, narrow_tensor], dim=1)
                     else:
-                        value = torch.stack(value, 0)  # [B, C, H, W]
+                        # Single stream case
+                        value = torch.stack(value, 0)
                 elif k in {"cls", "bboxes"}:
                     # Only process non-empty tensors
                     valid_tensors = [v for v in value if len(v) > 0]
@@ -569,9 +530,14 @@ class YOLODataset(BaseDataset):
                             value = torch.tensor([], dtype=torch.float32)
                         else:  # bboxes
                             value = torch.zeros((0, 4), dtype=torch.float32)
-                elif k in {"ori_shape", "resized_shape", "ratio_pad"}:
-                    # Stack tensor values
-                    value = torch.stack(value, 0)
+                elif k in {"ori_shape", "resized_shape", "ratio_pad", "shape"}:
+                    # Handle shape-related keys that should be stacked
+                    if all(isinstance(v, (tuple, list)) for v in value):
+                        # Convert to tensor if they are tuples/lists
+                        value = torch.tensor(value, dtype=torch.float32)
+                    else:
+                        # Stack tensor values
+                        value = torch.stack([torch.tensor(v) if not isinstance(v, torch.Tensor) else v for v in value], 0)
                 elif k == "segments":
                     # Keep as list, flatten nested lists
                     value = [item for sublist in value for item in (sublist if isinstance(sublist, list) else [])]
@@ -587,7 +553,7 @@ class YOLODataset(BaseDataset):
                     # Keep all filenames as list
                     value = list(value)
                 else:
-                    # Keep as-is
+                    # Keep as-is for other keys
                     value = value
                 
                 new_batch[k] = value
@@ -595,8 +561,8 @@ class YOLODataset(BaseDataset):
             # Create batch_idx
             batch_idx_list = []
             for i, item in enumerate(batch):
-                n_objects = len(item['cls'])
-                if n_objects > 0:
+                if 'cls' in item and len(item['cls']) > 0:
+                    n_objects = len(item['cls'])
                     batch_idx_list.append(torch.full((n_objects,), i, dtype=torch.long))
             
             if batch_idx_list:
@@ -608,8 +574,19 @@ class YOLODataset(BaseDataset):
             
         except Exception as e:
             LOGGER.error(f"ERROR in collate_fn: {e}")
+            # Add debug information
+            if batch:
+                first_batch = batch[0]
+                LOGGER.error(f"First batch keys: {first_batch.keys()}")
+                if 'img' in first_batch:
+                    img_info = first_batch['img']
+                    if isinstance(img_info, tuple):
+                        LOGGER.error(f"img is tuple with length: {len(img_info)}")
+                        LOGGER.error(f"img[0] type: {type(img_info[0])}, shape: {getattr(img_info[0], 'shape', 'no shape')}")
+                        LOGGER.error(f"img[1] type: {type(img_info[1])}, shape: {getattr(img_info[1], 'shape', 'no shape')}")
+                    else:
+                        LOGGER.error(f"img type: {type(img_info)}, shape: {getattr(img_info, 'shape', 'no shape')}")
             raise e
-
 class YOLOMultiModalDataset(YOLODataset):
     """
     Dataset class for loading object detection and/or segmentation labels in YOLO format with multi-modal support.

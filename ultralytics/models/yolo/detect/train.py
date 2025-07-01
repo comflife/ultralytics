@@ -6,6 +6,7 @@ from copy import copy
 
 import numpy as np
 import torch.nn as nn
+import torch
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
@@ -85,7 +86,81 @@ class DetectionTrainer(BaseTrainer):
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
         workers = self.args.workers if mode == "train" else self.args.workers * 2
-        return build_dataloader(dataset, batch_size, workers, shuffle, rank)  # return dataloader
+        dataloader = build_dataloader(dataset, batch_size, workers, shuffle, rank)  # return dataloader
+        
+        # 🔧 데이터 로더 검증 및 디버깅
+        # print(f"DEBUG: ===== {mode.upper()} DATALOADER CHECK =====")
+        try:
+            # 첫 번째 배치 확인
+            first_batch = next(iter(dataloader))
+            img = first_batch['img']
+            
+            # print(f"DEBUG: {mode} batch img shape: {img.shape}")
+            # print(f"DEBUG: {mode} batch img range: {img.min():.6f} ~ {img.max():.6f}")
+            # print(f"DEBUG: {mode} batch img dtype: {img.dtype}")
+            # print(f"DEBUG: {mode} batch size: {len(first_batch['img'])}")
+            
+            # Dual stream 확인
+            if img.dim() == 5 and img.shape[1] == 2:
+                # print(f"DEBUG: ✅ {mode} dual stream data detected")
+                # print(f"DEBUG: Wide stream range: {img[:, 0].min():.6f} ~ {img[:, 0].max():.6f}")
+                # print(f"DEBUG: Narrow stream range: {img[:, 1].min():.6f} ~ {img[:, 1].max():.6f}")
+                
+                # 채널별 평균값 확인 (정규화 상태 판단)
+                wide_mean = img[:, 0].mean(dim=(0, 2, 3))
+                narrow_mean = img[:, 1].mean(dim=(0, 2, 3))
+                # print(f"DEBUG: Wide stream RGB means: R={wide_mean[0]:.4f}, G={wide_mean[1]:.4f}, B={wide_mean[2]:.4f}")
+                # print(f"DEBUG: Narrow stream RGB means: R={narrow_mean[0]:.4f}, G={narrow_mean[1]:.4f}, B={narrow_mean[2]:.4f}")
+                
+                # 정규화 상태 판단
+            #     if img.max() <= 1.0 and img.min() >= 0:
+            #         if wide_mean[0] > 0.4 and wide_mean[1] > 0.4 and wide_mean[2] > 0.4:
+            #             print(f"DEBUG: ⚠️ Possible ImageNet normalization issue - means too high")
+            #         else:
+            #             print(f"DEBUG: ✅ Standard 0-1 normalization detected")
+            #     elif img.max() > 1.0:
+            #         print(f"DEBUG: ⚠️ Images not normalized (0-255 range)")
+            #     elif img.min() < 0:
+            #         print(f"DEBUG: ⚠️ ImageNet normalization detected (negative values)")
+                
+            # elif img.dim() == 4:
+            #     print(f"DEBUG: ❌ {mode} single stream data (expected dual stream)")
+            #     print(f"DEBUG: This may cause issues in dual stream model")
+            # else:
+            #     print(f"DEBUG: ❌ Unexpected tensor dimensions: {img.dim()}D")
+            
+            # 라벨 정보 확인
+            # if 'cls' in first_batch:
+            #     print(f"DEBUG: Classes shape: {first_batch['cls'].shape}")
+            #     print(f"DEBUG: Unique classes: {torch.unique(first_batch['cls'])}")
+            
+            # if 'bboxes' in first_batch:
+            #     print(f"DEBUG: Bboxes shape: {first_batch['bboxes'].shape}")
+            #     print(f"DEBUG: Bboxes range: {first_batch['bboxes'].min():.4f} ~ {first_batch['bboxes'].max():.4f}")
+            
+            # 파일 경로 확인
+            # if 'im_file' in first_batch:
+            #     print(f"DEBUG: Sample file paths:")
+            #     for i, path in enumerate(first_batch['im_file'][:3]):  # 첫 3개만
+            #         print(f"DEBUG:   [{i}]: {path}")
+            #         if '|' in path:
+            #             print(f"DEBUG:       ✅ Dual stream path format detected")
+            #         else:
+            #             print(f"DEBUG:       ❌ Single stream path format")
+            
+            # # 데이터셋 정보
+            # print(f"DEBUG: Dataset size: {len(dataset)}")
+            # if hasattr(dataset, 'is_dual_stream'):
+            #     print(f"DEBUG: Dataset dual_stream flag: {dataset.is_dual_stream}")
+            
+        except Exception as e:
+            print(f"DEBUG: ❌ Error checking {mode} dataloader: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # print(f"DEBUG: ===== END {mode.upper()} DATALOADER CHECK =====")
+        
+        return dataloader
 
     def preprocess_batch(self, batch):
         """
@@ -247,23 +322,72 @@ class DetectionTrainer(BaseTrainer):
             "Instances",
             "Size",
         )
+    
+
 
     def plot_training_samples(self, batch, ni):
-        """
-        Plot training samples with their annotations.
-
-        Args:
-            batch (dict): Dictionary containing batch data.
-            ni (int): Number of iterations.
-        """
+        """Plot training samples with their annotations."""
+        print(f"DEBUG: ===== PLOT TRAINING SAMPLES DEBUG =====")
+        
         images = batch["img"]
+        print(f"DEBUG: Input images shape: {images.shape}")
+        print(f"DEBUG: Input images range: {images.min():.6f} ~ {images.max():.6f}")
+        print(f"DEBUG: Input images dtype: {images.dtype}")
+        
+        # 🔧 올바른 정규화 복원 함수
+        def denormalize_for_plot(img_tensor):
+            """이미지를 시각화용으로 올바르게 복원"""
+            print(f"DEBUG: Denormalizing - input range: {img_tensor.min():.6f} ~ {img_tensor.max():.6f}")
+            
+            # 🔧 Case 1: 이미 0-255 범위 (정규화 안됨)
+            if img_tensor.max() > 1.0:
+                print(f"DEBUG: Already in 0-255 range, clamping only")
+                return torch.clamp(img_tensor, 0, 255)
+            
+            # 🔧 Case 2: 0-1 범위이지만 ImageNet 정규화 없음 (일반적인 YOLO)
+            elif img_tensor.min() >= 0 and img_tensor.max() <= 1.0:
+                print(f"DEBUG: 0-1 range detected (standard YOLO normalization)")
+                # 단순히 0-255로 변환
+                result = img_tensor * 255.0
+                result = torch.clamp(result, 0, 255)
+                print(f"DEBUG: After 0-255 conversion: {result.min():.6f} ~ {result.max():.6f}")
+                return result
+            
+            # 🔧 Case 3: ImageNet 정규화 적용됨 (음수 값 포함)
+            elif img_tensor.min() < 0:
+                print(f"DEBUG: ImageNet normalization detected (negative values present)")
+                # ImageNet 역정규화: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(img_tensor.device)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(img_tensor.device)
+                
+                # 역정규화
+                result = img_tensor * std + mean
+                result = torch.clamp(result, 0, 1)
+                print(f"DEBUG: After ImageNet denorm: {result.min():.6f} ~ {result.max():.6f}")
+                
+                # 0-255 변환
+                result = result * 255.0
+                result = torch.clamp(result, 0, 255)
+                print(f"DEBUG: After 0-255 conversion: {result.min():.6f} ~ {result.max():.6f}")
+                return result
+            
+            # 🔧 Case 4: 예상치 못한 범위
+            else:
+                print(f"DEBUG: ⚠️ Unexpected range, using as-is")
+                return torch.clamp(img_tensor * 255.0, 0, 255)
         
         # Handle dual stream visualization
         if images.dim() == 5 and images.shape[1] == 2:  # Dual stream: [B, 2, C, H, W]
+            print(f"DEBUG: ✅ Dual stream detected for visualization")
+            
             # Plot wide images (first stream)
             wide_images = images[:, 0]  # [B, C, H, W]
+            wide_images_plot = denormalize_for_plot(wide_images.clone())
+            
+            print(f"DEBUG: Wide stream final range: {wide_images_plot.min():.1f} ~ {wide_images_plot.max():.1f}")
+            
             plot_images(
-                images=wide_images,
+                images=wide_images_plot,
                 batch_idx=batch["batch_idx"],
                 cls=batch["cls"].squeeze(-1),
                 bboxes=batch["bboxes"],
@@ -274,18 +398,42 @@ class DetectionTrainer(BaseTrainer):
             
             # Plot narrow images (second stream)
             narrow_images = images[:, 1]  # [B, C, H, W]
+            narrow_images_plot = denormalize_for_plot(narrow_images.clone())
+            
+            print(f"DEBUG: Narrow stream final range: {narrow_images_plot.min():.1f} ~ {narrow_images_plot.max():.1f}")
+            
+            # narrow 경로명 수정
+            narrow_paths = []
+            for path in batch["im_file"]:
+                if '|' in path:
+                    narrow_paths.append(path.replace('|', '_narrow|'))
+                else:
+                    from pathlib import Path
+                    p = Path(path)
+                    narrow_path = str(p.parent / f"{p.stem}_narrow{p.suffix}")
+                    narrow_paths.append(narrow_path)
+            
             plot_images(
-                images=narrow_images,
+                images=narrow_images_plot,
                 batch_idx=batch["batch_idx"],
                 cls=batch["cls"].squeeze(-1),
                 bboxes=batch["bboxes"],
-                paths=[path.replace('|', '_narrow|') if '|' in path else f"{path}_narrow" for path in batch["im_file"]],
+                paths=narrow_paths,
                 fname=self.save_dir / f"train_batch{ni}_narrow.jpg",
                 on_plot=self.on_plot,
             )
+            
+            print(f"DEBUG: Wide plot: {self.save_dir / f'train_batch{ni}_wide.jpg'}")
+            print(f"DEBUG: Narrow plot: {self.save_dir / f'train_batch{ni}_narrow.jpg'}")
+            
         else:  # Single stream
+            print(f"DEBUG: Single stream detected for visualization")
+            images_plot = denormalize_for_plot(images.clone())
+            
+            print(f"DEBUG: Single stream final range: {images_plot.min():.1f} ~ {images_plot.max():.1f}")
+            
             plot_images(
-                images=images,
+                images=images_plot,
                 batch_idx=batch["batch_idx"],
                 cls=batch["cls"].squeeze(-1),
                 bboxes=batch["bboxes"],
@@ -293,6 +441,9 @@ class DetectionTrainer(BaseTrainer):
                 fname=self.save_dir / f"train_batch{ni}.jpg",
                 on_plot=self.on_plot,
             )
+            print(f"DEBUG: Single stream plot: {self.save_dir / f'train_batch{ni}.jpg'}")
+        
+        print(f"DEBUG: ===== END PLOT TRAINING SAMPLES DEBUG =====")
 
     def plot_metrics(self):
         """Plot metrics from a CSV file."""

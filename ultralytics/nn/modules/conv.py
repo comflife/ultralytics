@@ -83,34 +83,38 @@ class MultiStreamConv(nn.Module):
 
 
 class SpatialAlignedMultiStreamConv(nn.Module):
-    """공간적으로 정렬된 듀얼 스트림 Conv"""
+    """공간적으로 정렬된 듀얼 스트림 Conv - 개선 버전"""
     
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
         self.cv_wide = Conv(c1, c2, k, s, autopad(k, p, d), g=g, d=d, act=act)
         self.cv_narrow = Conv(c1, c2, k, s, autopad(k, p, d), g=g, d=d, act=act)
         
-        # Narrow FOV가 wide image에서 보이는 위치 (YOLO format)
+        # Narrow FOV 정보
         self.narrow_bbox = {
             'center_x': 0.499289,
             'center_y': 0.499912,
             'width': 0.286041,
             'height': 0.291975
         }
+        
+        # 🔧 Zero padding 문제 완화를 위한 가중치
+        self.narrow_weight = nn.Parameter(torch.tensor(0.5))
 
     def place_narrow_in_wide_space(self, narrow_tensor, target_size):
-        """Narrow tensor를 wide space의 올바른 위치에 배치"""
+        """Narrow tensor를 wide space에 배치하되 정보 손실 최소화"""
         B, C, H_narrow, W_narrow = narrow_tensor.shape
         H_wide, W_wide = target_size
         
-        # print(f"DEBUG: Placing narrow {narrow_tensor.shape} into wide space {target_size}")
+        # print(f"DEBUG: SpatialAlign - Narrow {narrow_tensor.shape} → Wide space {target_size}")
         
-        # 출력 텐서 초기화 (zero padding)
-        aligned_narrow = torch.zeros(B, C, H_wide, W_wide, 
-                                   device=narrow_tensor.device, 
-                                   dtype=narrow_tensor.dtype)
+        # 🔧 개선: 전체를 zero로 초기화하지 않고 작은 값으로 초기화
+        aligned_narrow = torch.full((B, C, H_wide, W_wide), 
+                                  fill_value=0.01,  # 완전한 0 대신 작은 값
+                                  device=narrow_tensor.device, 
+                                  dtype=narrow_tensor.dtype)
         
-        # YOLO bbox -> 픽셀 좌표 변환
+        # YOLO bbox → 픽셀 좌표 변환
         center_x = int(self.narrow_bbox['center_x'] * W_wide)
         center_y = int(self.narrow_bbox['center_y'] * H_wide)
         bbox_w = int(self.narrow_bbox['width'] * W_wide)
@@ -122,27 +126,28 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         x2 = min(W_wide, x1 + bbox_w)
         y2 = min(H_wide, y1 + bbox_h)
         
-        # print(f"DEBUG: Narrow bbox in wide space: ({x1}, {y1}) to ({x2}, {y2})")
-        # print(f"DEBUG: Narrow bbox size: {x2-x1}x{y2-y1}")
-        
-        # Narrow tensor를 bbox 크기로 resize
         target_h = y2 - y1
         target_w = x2 - x1
         
+        # print(f"DEBUG: Narrow region: ({x1}:{x2}, {y1}:{y2}) = {target_w}x{target_h}")
+        # print(f"DEBUG: Original narrow: {W_narrow}x{H_narrow}")
+        # print(f"DEBUG: Size reduction: {target_w/W_wide:.3f}x{target_h/H_wide:.3f}")
+        
         if target_h > 0 and target_w > 0:
-            # Narrow를 target 크기로 resize
+            # 🔧 Narrow를 target 크기로 resize
             narrow_resized = F.interpolate(narrow_tensor, 
                                          size=(target_h, target_w), 
                                          mode='bilinear', 
                                          align_corners=False)
             
-            # Wide space의 해당 위치에 배치
-            aligned_narrow[:, :, y1:y2, x1:x2] = narrow_resized
+            # 🔧 Narrow 영역에 배치 (기존 작은 값과 blend)
+            aligned_narrow[:, :, y1:y2, x1:x2] = narrow_resized * 0.9 + aligned_narrow[:, :, y1:y2, x1:x2] * 0.1
             
-            # print(f"DEBUG: Successfully placed narrow at ({x1}:{x2}, {y1}:{y2})")
+            # print(f"DEBUG: Successfully placed narrow with blending")
         # else:
             # print(f"DEBUG: ❌ Invalid target size: {target_w}x{target_h}")
         
+        # print(f"DEBUG: Aligned narrow range: {aligned_narrow.min():.6f} ~ {aligned_narrow.max():.6f}")
         return aligned_narrow
 
     def forward(self, x):
@@ -154,26 +159,29 @@ class SpatialAlignedMultiStreamConv(nn.Module):
             wide_stream = x[:, 0]    # [B, C, H, W]
             narrow_stream = x[:, 1]  # [B, C, H, W]
             
-            # print(f"DEBUG: Wide stream shape: {wide_stream.shape}")
-            # print(f"DEBUG: Narrow stream shape: {narrow_stream.shape}")
+            # print(f"DEBUG: Wide stream range: {wide_stream.min():.6f} ~ {wide_stream.max():.6f}")
+            # print(f"DEBUG: Narrow stream range: {narrow_stream.min():.6f} ~ {narrow_stream.max():.6f}")
             
-            # Wide stream 처리 (그대로)
+            # Wide stream 처리 (변경 없음)
             wide_out = self.cv_wide(wide_stream)
             
-            # Narrow stream을 wide space에 올바른 위치에 배치
+            # Narrow stream을 wide space에 배치
             H_wide, W_wide = wide_stream.shape[2], wide_stream.shape[3]
             narrow_aligned = self.place_narrow_in_wide_space(narrow_stream, (H_wide, W_wide))
             
-            # 정렬된 narrow stream 처리
-            narrow_out = self.cv_narrow(narrow_aligned)
+            # 🔧 Narrow stream에 학습 가능한 가중치 적용
+            narrow_weighted = narrow_aligned * torch.sigmoid(self.narrow_weight)
             
-            # print(f"DEBUG: Wide output shape: {wide_out.shape}")
-            # print(f"DEBUG: Narrow aligned output shape: {narrow_out.shape}")
+            # 정렬된 narrow stream 처리
+            narrow_out = self.cv_narrow(narrow_weighted)
+            
+            # print(f"DEBUG: Wide output range: {wide_out.min():.6f} ~ {wide_out.max():.6f}")
+            # print(f"DEBUG: Narrow aligned output range: {narrow_out.min():.6f} ~ {narrow_out.max():.6f}")
             
             # Dual stream 형태로 재결합
             output = torch.stack([wide_out, narrow_out], dim=1)  # [B, 2, C_out, H_out, W_out]
             
-            # print(f"DEBUG: SpatialAligned output shape: {output.shape}")
+            # print(f"DEBUG: SpatialAligned final output shape: {output.shape}")
             return output
         else:
             # Single stream 처리
@@ -211,69 +219,61 @@ class MultiStreamMaxPool2d(nn.Module):
 
 
 class Fusion(nn.Module):
-    """
-    Fusion module to combine features from multiple streams.
-    
-    Supports different fusion strategies: 'concat', 'add', 'max', 'weighted_sum'
-    """
-
     def __init__(self, fusion_type='concat', scale_factor=1.0):
-        """
-        Initialize Fusion module.
-        
-        Args:
-            fusion_type (str): Type of fusion - 'concat', 'add', 'max', 'weighted_sum'
-            scale_factor (float): Scale factor for the output (multiplier).
-        """
         super().__init__()
         self.fusion_type = fusion_type
         self.scale_factor = scale_factor
         
         # For weighted sum, create learnable weights
         if fusion_type == 'weighted_sum':
-            self.weights = nn.Parameter(torch.ones(2))  # Initialize with equal weights
+            self.weights = nn.Parameter(torch.ones(2))
             
     def forward(self, x):
-        """
-        Fuse multiple input streams.
+        # print(f"DEBUG: ===== FUSION LAYER DEBUG =====")
+        # print(f"DEBUG: Fusion input type: {type(x)}")
+        # print(f"DEBUG: Fusion input shape: {x.shape if hasattr(x, 'shape') else 'N/A'}")
         
-        Args:
-            x (torch.Tensor or list): Input tensor with dual streams [B, 2, C, H, W] 
-                                     or list of tensors from multiple streams.
-            
-        Returns:
-            (torch.Tensor): Fused output tensor.
-        """
         # Handle tensor input with dual streams: [B, 2, C, H, W]
         if isinstance(x, torch.Tensor) and x.dim() == 5 and x.shape[1] == 2:
+            # print(f"DEBUG: Processing dual stream tensor: {x.shape}")
             # Split dual stream tensor into list
             stream1 = x[:, 0]  # [B, C, H, W]
             stream2 = x[:, 1]  # [B, C, H, W]
             streams = [stream1, stream2]
-        # Handle list input (multiple separate tensors)
+            print(f"DEBUG: Stream1 shape: {stream1.shape}")
+            print(f"DEBUG: Stream2 shape: {stream2.shape}")
         elif isinstance(x, list) and len(x) >= 2:
             streams = x
-        else:
-            # Single stream input - just return as is (no fusion needed)
+            # print(f"DEBUG: Processing list input with {len(streams)} streams")
+        # else:
+            # print(f"DEBUG: Single stream input, returning as-is")
             return x
         
         if self.fusion_type == 'concat':
             # Concatenate along channel dimension
             output = torch.cat(streams, dim=1)
+            # print(f"DEBUG: Concat output shape: {output.shape}")
         elif self.fusion_type == 'add':
             # Element-wise addition
             output = sum(streams)
+            # print(f"DEBUG: Add output shape: {output.shape}")
         elif self.fusion_type == 'max':
             # Element-wise maximum
             output = torch.maximum(streams[0], streams[1])
             for i in range(2, len(streams)):
                 output = torch.maximum(output, streams[i])
+            # print(f"DEBUG: Max output shape: {output.shape}")
         elif self.fusion_type == 'weighted_sum':
             # Weighted sum with learnable weights
             normalized_weights = torch.softmax(self.weights, dim=0)
             output = sum(normalized_weights[i] * tensor for i, tensor in enumerate(streams[:len(normalized_weights)]))
+            # print(f"DEBUG: Weighted sum output shape: {output.shape}")
         else:
             raise ValueError(f"Unsupported fusion type: {self.fusion_type}")
+        
+        # print(f"DEBUG: Final fusion output shape: {output.shape}")
+        # print(f"DEBUG: Final fusion output range: {output.min():.6f} ~ {output.max():.6f}")
+        # print(f"DEBUG: ===== END FUSION LAYER DEBUG =====")
         
         return output
 

@@ -9,5 +9,5 @@ python train_yolov8_dual_v0.py \
   --epochs 250 \
   --batch-size 16 \
   --imgsz 640 \
-  --dual-stream
+  # --dual-stream
 
