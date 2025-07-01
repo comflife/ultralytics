@@ -58,13 +58,42 @@ class DualLetterBox(LetterBox):
 
         # 2. 두 번째 이미지(narrow)가 있으면 변환
         if 'img2' in labels:
-            # 임시 딕셔너리를 만들어 두 번째 이미지에 LetterBox 적용
-            temp_labels_for_narrow = labels.copy()
-            temp_labels_for_narrow['img'] = labels['img2']
-            transformed_narrow_dict = super().__call__(temp_labels_for_narrow)
+            # ✅ 수정: 간단하게 이미지만 변환하고 bbox는 건드리지 않음
+            narrow_img = labels['img2']
             
-            # ✅ 수정된 부분: 튜플로 묶지 않고, 'img2' 키에 그대로 저장
-            labels['img2'] = transformed_narrow_dict['img']
+            # 기본 LetterBox 변환 적용 (이미지만)
+            h, w = narrow_img.shape[:2]
+            
+            # LetterBox의 이미지 변환 로직을 직접 구현
+            r = min(self.new_shape[0] / h, self.new_shape[1] / w)
+            if not self.scaleup:
+                r = min(r, 1.0)
+            
+            # 새로운 크기 계산
+            new_unpad = int(round(w * r)), int(round(h * r))
+            dw, dh = self.new_shape[1] - new_unpad[0], self.new_shape[0] - new_unpad[1]
+            
+            if self.auto:
+                dw, dh = np.mod(dw, self.stride), np.mod(dh, self.stride)
+            elif getattr(self, 'scaleFill', False):  # ✅ 안전한 속성 접근
+                dw, dh = 0.0, 0.0
+                new_unpad = (self.new_shape[1], self.new_shape[0])
+            
+            dw /= 2
+            dh /= 2
+            
+            # 이미지 리사이즈
+            if (w, h) != new_unpad:
+                narrow_img = cv2.resize(narrow_img, new_unpad, interpolation=cv2.INTER_LINEAR)
+            
+            # 패딩 추가
+            top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+            left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+            narrow_img = cv2.copyMakeBorder(
+                narrow_img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)
+            )
+            
+            labels['img2'] = narrow_img
 
         return labels
     
@@ -91,7 +120,7 @@ class DualFormat(Format):
             
             # 변환된 두 이미지를 튜플로 묶어서 'img' 키에 저장
             wide_tensor = labels['img']
-            narrow_tensor = img2.float() / 255.0 if self.normalize else img2.float()
+            narrow_tensor = img2.float() if self.normalize else img2.float()
             labels['img'] = (wide_tensor, narrow_tensor)
             
         return labels

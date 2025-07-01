@@ -127,6 +127,8 @@ def train(cfg, opt, device, callbacks=None):
         'val': not opt.noval,
         'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
+        'conf': 0.25,  # confidence threshold for validation
+        'iou': 0.7,
         'dual_stream': is_dual_model or opt.dual_stream,  # Enable dual-stream mode if detected or explicitly set
         # Note: We handle dual-stream mode internally and don't pass it to the trainer
     }

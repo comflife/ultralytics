@@ -66,19 +66,15 @@ class DetectionValidator(BaseValidator):
     def preprocess(self, batch):
         """
         Preprocess batch of images for YOLO validation.
-
-        Args:
-            batch (dict): Batch containing images and annotations.
-
-        Returns:
-            (dict): Preprocessed batch.
         """
-
+        # ✅ Dual stream 처리 추가
+        if isinstance(batch["img"], tuple):
+            # Dual stream case: convert tuple to [B, 2, C, H, W] tensor
+            wide_batch, narrow_batch = batch["img"]
+            batch["img"] = torch.stack([wide_batch, narrow_batch], dim=1)
         
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
-        
-
         
         for k in ["batch_idx", "cls", "bboxes"]:
             batch[k] = batch[k].to(self.device)
@@ -127,14 +123,43 @@ class DetectionValidator(BaseValidator):
         """
         print(f"DEBUG: ===== VAL POSTPROCESS DEBUG =====")
         print(f"DEBUG: Postprocess preds type: {type(preds)}")
+        
+        # ✅ Dual stream 처리 추가 - 안전한 타입 체크
+        if isinstance(preds, tuple) and len(preds) == 2:
+            print(f"DEBUG: Dual stream detected, using first stream")
+            print(f"DEBUG: Stream 0 type: {type(preds[0])}")
+            print(f"DEBUG: Stream 1 type: {type(preds[1])}")
+            
+
+            # 안전한 shape 출력
+            if hasattr(preds[0], 'shape'):
+                print(f"DEBUG: Stream 0 shape: {preds[0].shape}")
+            else:
+                print(f"DEBUG: Stream 0 has no shape attribute, type: {type(preds[0])}")
+                
+            if hasattr(preds[1], 'shape'):
+                print(f"DEBUG: Stream 1 shape: {preds[1].shape}")
+            else:
+                print(f"DEBUG: Stream 1 has no shape attribute, type: {type(preds[1])}")
+            
+            # 첫 번째 스트림만 사용 (tensor인 경우만)
+            if hasattr(preds[0], 'shape'):
+                preds = preds[0]
+            elif hasattr(preds[1], 'shape'):
+                preds = preds[1]
+            else:
+                print(f"DEBUG: Neither stream has shape attribute, taking first item")
+                preds = preds[0]
+        
         if isinstance(preds, (list, tuple)):
             print(f"DEBUG: Postprocess preds length: {len(preds)}")
-            if len(preds) > 0:
+            if len(preds) > 0 and hasattr(preds[0], 'shape'):
                 print(f"DEBUG: First pred shape: {preds[0].shape}")
                 print(f"DEBUG: First pred sample values: {preds[0][0, :10] if len(preds[0]) > 0 else 'Empty'}")
         else:
-            print(f"DEBUG: Postprocess preds shape: {preds.shape}")
-            print(f"DEBUG: Preds sample values: {preds[0, 0, :10] if preds.numel() > 0 else 'Empty'}")
+            if hasattr(preds, 'shape'):
+                print(f"DEBUG: Postprocess preds shape: {preds.shape}")
+                print(f"DEBUG: Preds sample values: {preds[0, 0, :10] if preds.numel() > 0 else 'Empty'}")
         
         print(f"DEBUG: Conf threshold: {self.args.conf}")
         print(f"DEBUG: IoU threshold: {self.args.iou}")
@@ -176,54 +201,54 @@ class DetectionValidator(BaseValidator):
         if torch.is_tensor(ori_shape):
             ori_shape = ori_shape.cpu().numpy().tolist()
         
-        imgsz = img_shape[-2:]  # Get H, W regardless of dual stream or not
+        # ✅ dual stream 처리
+        if len(img_shape) == 5:  # [B, 2, C, H, W] - dual stream
+            imgsz = img_shape[-2:]  # Get H, W
+        else:  # [B, C, H, W] - single stream
+            imgsz = img_shape[-2:]
         
-        # For dual stream, we don't need complex scaling
-        if len(img_shape) == 5:  # Dual stream
-            ratio_pad = "dual_stream"  # Special marker
-        else:
-            ratio_pad = None
+        # ✅ GT bbox를 pixel 좌표로 변환
+        if bbox.numel() > 0:  # bbox가 있는 경우에만
+            img_h, img_w = imgsz
+            bbox[:, [0, 2]] *= img_w  # x coordinates to pixel
+            bbox[:, [1, 3]] *= img_h  # y coordinates to pixel
         
-        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": ratio_pad}
+        return {"cls": cls, "bbox": bbox, "ori_shape": ori_shape, "imgsz": imgsz, "ratio_pad": None}
 
     # detect/val.py
     def _prepare_pred(self, pred, pbatch):
         """Prepare predictions for evaluation against ground truth."""
         predn = pred.clone()
+        
+        # ✅ 좌표 변환 수정
+        # ops.scale_boxes(
+        #     pbatch["imgsz"],      # 현재 이미지 크기 (예: [640, 640])
+        #     predn[:, :4],         # 예측된 bbox 좌표
+        #     pbatch["ori_shape"],  # 원본 이미지 크기
+        #     ratio_pad=None        # 패딩 정보는 자동 계산
+        # )
 
-        # ratio_pad 인자에 pbatch 값을 직접 넣는 대신, 항상 None을 전달하여
-        # scale_boxes 함수가 패딩을 직접 계산하도록 합니다.
-        ops.scale_boxes(
-            pbatch["imgsz"],
-            predn[:, :4],
-            pbatch["ori_shape"],
-            ratio_pad=None  # ✅ 이렇게 수정
-        )
-
+        
         return predn
 
     def update_metrics(self, preds, batch):
-        """
-        Update metrics with new predictions and ground truth.
-
-        Args:
-            preds (List[torch.Tensor]): List of predictions from the model.
-            batch (dict): Batch data containing ground truth.
-        """
-        # print(f"DEBUG: ===== UPDATE METRICS DEBUG =====")
-        # print(f"DEBUG: Preds length: {len(preds)}")
-        # print(f"DEBUG: Batch keys: {list(batch.keys())}")
+        """Update metrics with new predictions and ground truth."""
+        print(f"DEBUG: ===== UPDATE METRICS DEBUG =====")
+        print(f"DEBUG: Preds length: {len(preds)}")
+        print(f"DEBUG: Batch keys: {list(batch.keys())}")
         
         total_detections = sum(len(pred) for pred in preds)
-        # print(f"DEBUG: Total detections across all images: {total_detections}")
+        print(f"DEBUG: Total detections across all images: {total_detections}")
         
         for si, pred in enumerate(preds):
             self.seen += 1
             npr = len(pred)
-            # print(f"DEBUG: Image {si}: {npr} predictions")
+            print(f"DEBUG: Image {si}: {npr} predictions")
             
-            # if npr > 0:
-                # print(f"DEBUG: Image {si} first prediction: {pred[0]}")
+            if npr > 0:
+                print(f"DEBUG: Image {si} first prediction: {pred[0]}")
+                print(f"DEBUG: Image {si} confidence range: {pred[:, 4].min():.4f} - {pred[:, 4].max():.4f}")
+                print(f"DEBUG: Image {si} classes: {pred[:, 5].unique()}")
             
             stat = dict(
                 conf=torch.zeros(0, device=self.device),
@@ -233,7 +258,12 @@ class DetectionValidator(BaseValidator):
             pbatch = self._prepare_batch(si, batch)
             cls, bbox = pbatch.pop("cls"), pbatch.pop("bbox")
             nl = len(cls)
-            # print(f"DEBUG: Image {si}: {nl} ground truth objects")
+            print(f"DEBUG: Image {si}: {nl} ground truth objects")
+            
+            if nl > 0:
+                print(f"DEBUG: Image {si} GT classes: {cls}")
+                print(f"DEBUG: Image {si} GT bbox shape: {bbox.shape}")
+                print(f"DEBUG: Image {si} GT bbox range: x={bbox[:, [0,2]].min():.1f}-{bbox[:, [0,2]].max():.1f}, y={bbox[:, [1,3]].min():.1f}-{bbox[:, [1,3]].max():.1f}")
             
             stat["target_cls"] = cls
             stat["target_img"] = cls.unique()
@@ -249,12 +279,18 @@ class DetectionValidator(BaseValidator):
             if self.args.single_cls:
                 pred[:, 5] = 0
             predn = self._prepare_pred(pred, pbatch)
+            
+            print(f"DEBUG: Image {si} predn shape: {predn.shape}")
+            if len(predn) > 0:
+                print(f"DEBUG: Image {si} predn bbox range: x={predn[:, [0,2]].min():.1f}-{predn[:, [0,2]].max():.1f}, y={predn[:, [1,3]].min():.1f}-{predn[:, [1,3]].max():.1f}")
+            
             stat["conf"] = predn[:, 4]
             stat["pred_cls"] = predn[:, 5]
 
             # Evaluate
             if nl:
                 stat["tp"] = self._process_batch(predn, bbox, cls)
+                print(f"DEBUG: Image {si} TP shape: {stat['tp'].shape}, TP sum: {stat['tp'].sum()}")
             if self.args.plots:
                 self.confusion_matrix.process_batch(predn, bbox, cls)
             for k in self.stats.keys():
@@ -271,7 +307,7 @@ class DetectionValidator(BaseValidator):
                     self.save_dir / "labels" / f"{Path(batch['im_file'][si]).stem}.txt",
                 )
         
-        # print(f"DEBUG: ===== END UPDATE METRICS DEBUG =====")
+        print(f"DEBUG: ===== END UPDATE METRICS DEBUG =====")
 
     def finalize_metrics(self, *args, **kwargs):
         """
