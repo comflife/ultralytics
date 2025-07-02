@@ -34,6 +34,6 @@ train: /home/byounggun/ultralytics/swm/images  # Ultralytics requires these keys
 val: /home/byounggun/ultralytics/swm/images    # Ultralytics requires these keys
 # Dual stream custom keys
 train_wide: /home/byounggun/ultralytics/swm/images
-train_narrow: /home/byounggun/ultralytics/swm/images
+train_narrow: /home/byounggun/ultralytics/swm/narrow_images
 val_wide: /home/byounggun/ultralytics/swm/images
-val_narrow: /home/byounggun/ultralytics/swm/images
+val_narrow: /home/byounggun/ultralytics/swm/narrow_images

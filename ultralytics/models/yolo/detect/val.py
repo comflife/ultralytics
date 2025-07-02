@@ -220,13 +220,12 @@ class DetectionValidator(BaseValidator):
         """Prepare predictions for evaluation against ground truth."""
         predn = pred.clone()
         
-        # ✅ 좌표 변환 수정
-        # ops.scale_boxes(
-        #     pbatch["imgsz"],      # 현재 이미지 크기 (예: [640, 640])
-        #     predn[:, :4],         # 예측된 bbox 좌표
-        #     pbatch["ori_shape"],  # 원본 이미지 크기
-        #     ratio_pad=None        # 패딩 정보는 자동 계산
-        # )
+        ops.scale_boxes(
+            pbatch["imgsz"],      # 현재 이미지 크기 (예: [640, 640])
+            predn[:, :4],         # 예측된 bbox 좌표
+            pbatch["ori_shape"],  # 원본 이미지 크기
+            ratio_pad=None        # 패딩 정보는 자동 계산
+        )
 
         
         return predn

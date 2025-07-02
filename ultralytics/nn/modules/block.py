@@ -355,25 +355,35 @@ class MultiStreamC3(nn.Module):  # C3 상속하지 않음!
         self.fusion_conv = Conv(2 * c1, c2, 1, 1)
         
     def forward(self, x):
-        """
-        Forward pass through MultiStreamC3.
-        Args:
-            x (torch.Tensor): Input [B, 2, C, H, W] or [B, C, H, W]
-        Returns:
-            torch.Tensor: Single stream output [B, C_out, H, W]
-        """
+        print(f"DEBUG: ===== MultiStreamC3 DEBUG =====")
+        print(f"DEBUG: Input shape: {x.shape}")
+        print(f"DEBUG: Input type: {type(x)}")
+        
         if x.dim() == 5 and x.shape[1] == 2:
             # Dual stream: [B, 2, C, H, W]
             stream1 = x[:, 0]  # [B, C, H, W]
             stream2 = x[:, 1]  # [B, C, H, W]
             
-            # 각 stream 독립 처리
-            out1 = self.stream1_c3(stream1)  # [B, C, H, W]
-            out2 = self.stream2_c3(stream2)  # [B, C, H, W]
+            print(f"DEBUG: Stream1 shape: {stream1.shape}")
+            print(f"DEBUG: Stream2 shape: {stream2.shape}")
             
-            # Concatenate and fuse: [B, 2*C, H, W] → [B, C_out, H, W]
-            fused = torch.cat([out1, out2], dim=1)  # [B, 2*C, H, W]
-            return self.fusion_conv(fused)  # [B, C_out, H, W]
+            # 각 stream 독립 처리
+            out1 = self.stream1_c3(stream1)
+            out2 = self.stream2_c3(stream2)
+            
+            print(f"DEBUG: Stream1 after C3: {out1.shape}")
+            print(f"DEBUG: Stream2 after C3: {out2.shape}")
+            
+            # Concatenate and fuse
+            fused = torch.cat([out1, out2], dim=1)
+            print(f"DEBUG: After concat: {fused.shape}")
+            
+            result = self.fusion_conv(fused)
+            print(f"DEBUG: ✅ FINAL OUTPUT (SINGLE STREAM): {result.shape}")
+            print(f"DEBUG: Output range: {result.min():.4f} ~ {result.max():.4f}")
+            print(f"DEBUG: ===== END MultiStreamC3 =====")
+            
+            return result
             
         elif x.dim() == 4:
             # Single stream: [B, C, H, W]
