@@ -113,14 +113,37 @@ class Detect(nn.Module):
 
     def forward(self, x: List[torch.Tensor]) -> Union[List[torch.Tensor], Tuple]:
         """Concatenate and return predicted bounding boxes and class probabilities."""
+        # print(f"DEBUG: ===== DETECT LAYER DEBUG =====")
+        # print(f"DEBUG: Detect input list length: {len(x)}")
+        # for i, tensor in enumerate(x):
+        #     print(f"DEBUG: Detect input[{i}] shape: {tensor.shape}")
+        #     print(f"DEBUG: Detect input[{i}] range: {tensor.min():.4f} ~ {tensor.max():.4f}")
+        
         if self.end2end:
             return self.forward_end2end(x)
 
         for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            # print(f"DEBUG: Processing detection layer {i}")
+            cv2_out = self.cv2[i](x[i])  # box regression
+            cv3_out = self.cv3[i](x[i])  # classification
+            # print(f"DEBUG: Layer {i} - cv2 output shape: {cv2_out.shape}")
+            # print(f"DEBUG: Layer {i} - cv3 output shape: {cv3_out.shape}")
+            # print(f"DEBUG: Layer {i} - cv2 range: {cv2_out.min():.4f} ~ {cv2_out.max():.4f}")
+            # print(f"DEBUG: Layer {i} - cv3 range: {cv3_out.min():.4f} ~ {cv3_out.max():.4f}")
+            
+            x[i] = torch.cat((cv2_out, cv3_out), 1)
+            # print(f"DEBUG: Layer {i} - final output shape: {x[i].shape}")
+        
         if self.training:  # Training path
+            # print(f"DEBUG: ✅ TRAINING MODE - returning raw predictions")
             return x
+        
+        # print(f"DEBUG: 🔍 INFERENCE MODE - processing for validation")
         y = self._inference(x)
+        # print(f"DEBUG: After _inference: {y.shape}")
+        # print(f"DEBUG: Inference output range: {y.min():.4f} ~ {y.max():.4f}")
+        # print(f"DEBUG: ===== END DETECT LAYER =====")
+        
         return y if self.export else (y, x)
 
     def forward_end2end(self, x: List[torch.Tensor]) -> Union[dict, Tuple]:

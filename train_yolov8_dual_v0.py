@@ -97,7 +97,7 @@ def train(cfg, opt, device, callbacks=None):
         model.overrides = getattr(model, 'overrides', {})
         model.overrides['dual_stream'] = True
     
-    # Configure training settings
+    # ✅ Configure training settings with stability improvements
     model_training_args = {
         'data': opt.data,
         'epochs': opt.epochs,
@@ -127,14 +127,54 @@ def train(cfg, opt, device, callbacks=None):
         'val': not opt.noval,
         'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
-        'conf': 0.25,  # confidence threshold for validation
-        'iou': 0.7,
-        'dual_stream': is_dual_model or opt.dual_stream,  # Enable dual-stream mode if detected or explicitly set
-        # Note: We handle dual-stream mode internally and don't pass it to the trainer
+        'conf': 0.1,   # confidence threshold
+        'iou': 0.3,    # ✅ IoU threshold 낮추기 (기본값 0.7 → 0.3)
+        'dual_stream': is_dual_model or opt.dual_stream,
+        
+        # 🔧 Gradient exploding 해결을 위한 설정들
+        'lr0': 0.001,           # ✅ Learning rate 감소 (기본값 0.01 → 0.001)
+        'lrf': 0.01,            # ✅ Final learning rate (lr0 * lrf)
+        'momentum': 0.937,      # ✅ SGD momentum/Adam beta1
+        'weight_decay': 0.0005, # ✅ Weight decay
+        'warmup_epochs': 3.0,   # ✅ Warmup epochs (fractions ok)
+        'warmup_momentum': 0.8, # ✅ Warmup initial momentum
+        'warmup_bias_lr': 0.1,  # ✅ Warmup initial bias lr
+        'box': 7.5,             # ✅ Box loss gain
+        'cls': 0.5,             # ✅ Classification loss gain (감소)
+        'dfl': 1.5,             # ✅ DFL loss gain
+        'pose': 12.0,           # ✅ Pose loss gain (only for pose models)
+        'kobj': 2.0,            # ✅ Keypoint obj loss gain (only for pose models)
+        'hsv_h': 0.015,         # ✅ Image HSV-Hue augmentation (fraction)
+        'hsv_s': 0.7,           # ✅ Image HSV-Saturation augmentation (fraction)
+        'hsv_v': 0.4,           # ✅ Image HSV-Value augmentation (fraction)
+        'degrees': 0.0,         # ✅ Image rotation (+/- deg)
+        'translate': 0.1,       # ✅ Image translation (+/- fraction)
+        'scale': 0.5,           # ✅ Image scale (+/- gain)
+        'shear': 0.0,           # ✅ Image shear (+/- deg)
+        'perspective': 0.0,     # ✅ Image perspective (+/- fraction), range 0-0.001
+        'flipud': 0.0,          # ✅ Image flip up-down (probability)
+        'fliplr': 0.5,          # ✅ Image flip left-right (probability)
+        'mosaic': 1.0,          # ✅ Image mosaic (probability)
+        'mixup': 0.0,           # ✅ Image mixup (probability)
+        'copy_paste': 0.0,      # ✅ Image copy-paste (probability)
+        'auto_augment': None,   # ✅ Auto augmentation policy for classification (randaugment, autoaugment, augmix)
+        'erasing': 0.4,         # ✅ Random erasing probability during classification training (0-0.9), 0 to disable
+        'crop_fraction': 1.0,   # ✅ Image crop fraction for classification (0.1-1.0)
     }
+    
+    # 🔧 특별히 dual stream 모델의 경우 더욱 안정적인 설정
+    if is_dual_model or opt.dual_stream:
+        LOGGER.info("🔧 Applying dual-stream specific training stabilization...")
+        model_training_args.update({
+            'lr0': 0.0005,      # ✅ dual stream의 경우 더욱 낮은 learning rate
+            'cls': 0.25,        # ✅ Classification loss 더욱 감소
+            'warmup_epochs': 5.0, # ✅ 더 긴 warmup
+            'patience': 50,     # ✅ 더 긴 patience
+        })
     
     # Start training
     LOGGER.info(f"Starting training for {opt.epochs} epochs...")
+    LOGGER.info(f"🔧 Stability settings: lr0={model_training_args['lr0']}, cls_loss={model_training_args['cls']}")
     t0 = time.time()
     
     # Set up dual-stream handling if needed
@@ -159,6 +199,42 @@ def train(cfg, opt, device, callbacks=None):
             if is_dual_model or opt.dual_stream:
                 val_args['dual_stream'] = True
             results = model.val(**val_args)
+        
+        if is_dual_model or opt.dual_stream:
+            LOGGER.info("🔍 Checking model training state...")
+            
+            total_params = 0
+            trainable_params = 0
+            frozen_layers = []
+            
+            for name, param in model.model.named_parameters():
+                total_params += param.numel()
+                if param.requires_grad:
+                    trainable_params += param.numel()
+                else:
+                    frozen_layers.append(name)
+            
+            LOGGER.info(f"📊 Model Parameter Summary:")
+            LOGGER.info(f"  Total parameters: {total_params:,}")
+            LOGGER.info(f"  Trainable parameters: {trainable_params:,}")
+            LOGGER.info(f"  Frozen parameters: {total_params - trainable_params:,}")
+            LOGGER.info(f"  Trainable ratio: {trainable_params/total_params:.2%}")
+            
+            if frozen_layers:
+                LOGGER.warning(f"🧊 Found {len(frozen_layers)} frozen layers:")
+                for layer in frozen_layers[:10]:  # 처음 10개만 표시
+                    LOGGER.warning(f"  - {layer}")
+                if len(frozen_layers) > 10:
+                    LOGGER.warning(f"  ... and {len(frozen_layers)-10} more")
+            
+            # 🔧 모든 레이어를 강제로 trainable로 설정
+            LOGGER.info("🔓 Ensuring all parameters are trainable...")
+            for param in model.model.parameters():
+                param.requires_grad = True
+            
+            # 재확인
+            trainable_after = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+            LOGGER.info(f"✅ After unfreezing: {trainable_after:,} trainable parameters")
         
         return results
     except Exception as e:
@@ -196,6 +272,10 @@ def parse_opt(known=False):
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--dual-stream", action="store_true", help="Enable dual-stream training mode")
+    
+    # ✅ Stability 관련 옵션 추가
+    parser.add_argument("--lr0", type=float, default=0.001, help="Initial learning rate")
+    parser.add_argument("--stable-training", action="store_true", help="Use extra stable training settings for dual-stream")
     
     # Distributed training arguments
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument")
