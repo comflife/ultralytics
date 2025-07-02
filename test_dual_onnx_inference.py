@@ -2,6 +2,15 @@
 """
 Dual Stream ONNX Model Test Script
 Tests the exported dual-stream YOLO model with real images
+
+중앙 크롭으로 narrow fov 시뮬레이션 후 추론 테스트
+python test_dual_onnx_inference.py
+
+2. 같은 이미지 두 번 사용
+python test_dual_onnx_inference.py --method duplicate
+
+다른이미지
+python test_dual_onnx_inference.py --image /path/to/other/image.jpg
 """
 
 import numpy as np
