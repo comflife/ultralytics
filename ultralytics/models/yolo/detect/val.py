@@ -172,14 +172,14 @@ class DetectionValidator(BaseValidator):
 
     def _prepare_batch(self, si, batch):
         """Prepare a batch for training or inference."""
-        print(f"DEBUG: ===== _prepare_batch DEBUG =====")
+        # print(f"DEBUG: ===== _prepare_batch DEBUG =====")
         
         idx = batch["batch_idx"] == si
         cls = batch["cls"][idx].squeeze(-1)
         bbox = batch["bboxes"][idx]
         ori_shape = batch["ori_shape"][si]
         
-        print(f"DEBUG: Raw bbox format: {bbox[0] if len(bbox) > 0 else 'No boxes'}")
+        # print(f"DEBUG: Raw bbox format: {bbox[0] if len(bbox) > 0 else 'No boxes'}")
         
         # Handle dual stream image dimensions
         if batch['img'].dim() == 5:  # [B, 2, C, H, W]
@@ -193,7 +193,7 @@ class DetectionValidator(BaseValidator):
         
         # Convert normalized bbox to pixel coordinates (original image scale)
         if len(bbox) > 0:
-            print(f"DEBUG: Before conversion (normalized): {bbox[0]}")
+            # print(f"DEBUG: Before conversion (normalized): {bbox[0]}")
             
             # ✅ YOLO format: [center_x, center_y, w, h] normalized → pixel
             bbox[:, 0] *= ori_shape[1]  # center_x * width
@@ -201,7 +201,7 @@ class DetectionValidator(BaseValidator):
             bbox[:, 2] *= ori_shape[1]  # w * width
             bbox[:, 3] *= ori_shape[0]  # h * height
             
-            print(f"DEBUG: After pixel conversion: {bbox[0]}")
+            # print(f"DEBUG: After pixel conversion: {bbox[0]}")
             
             # ✅ 핵심: [center_x, center_y, w, h] → [x1, y1, x2, y2] 변환
             center_x, center_y, w, h = bbox[:, 0], bbox[:, 1], bbox[:, 2], bbox[:, 3]
@@ -212,7 +212,7 @@ class DetectionValidator(BaseValidator):
             
             bbox = torch.stack([x1, y1, x2, y2], dim=1)
             
-            print(f"DEBUG: Final bbox format [x1,y1,x2,y2]: {bbox[0]}")
+            # print(f"DEBUG: Final bbox format [x1,y1,x2,y2]: {bbox[0]}")
         
         return {
             "cls": cls,
@@ -310,7 +310,7 @@ class DetectionValidator(BaseValidator):
             # Evaluate
             if nl:
                 stat["tp"] = self._process_batch(predn, bbox, cls)
-                print(f"DEBUG: Image {si} TP shape: {stat['tp'].shape}, TP sum: {stat['tp'].sum()}")
+                # print(f"DEBUG: Image {si} TP shape: {stat['tp'].shape}, TP sum: {stat['tp'].sum()}")
             if self.args.plots:
                 self.confusion_matrix.process_batch(predn, bbox, cls)
             for k in self.stats.keys():
@@ -377,38 +377,38 @@ class DetectionValidator(BaseValidator):
 
     def _process_batch(self, detections, gt_bboxes, gt_cls):
         """Return correct prediction matrix."""
-        print(f"DEBUG: ===== _process_batch IoU DEBUG =====")
-        print(f"DEBUG: detections shape: {detections.shape}")
-        print(f"DEBUG: gt_bboxes shape: {gt_bboxes.shape}")
+        # print(f"DEBUG: ===== _process_batch IoU DEBUG =====")
+        # print(f"DEBUG: detections shape: {detections.shape}")
+        # print(f"DEBUG: gt_bboxes shape: {gt_bboxes.shape}")
         
         if len(detections) > 0 and len(gt_bboxes) > 0:
-            print(f"DEBUG: First detection: {detections[0]}")
-            print(f"DEBUG: First GT bbox: {gt_bboxes[0]}")
-            print(f"DEBUG: Detection classes: {detections[:, 5]}")
-            print(f"DEBUG: GT classes: {gt_cls}")
+            # print(f"DEBUG: First detection: {detections[0]}")
+            # print(f"DEBUG: First GT bbox: {gt_bboxes[0]}")
+            # print(f"DEBUG: Detection classes: {detections[:, 5]}")
+            # print(f"DEBUG: GT classes: {gt_cls}")
             
             iou = box_iou(gt_bboxes, detections[:, :4])
-            print(f"DEBUG: IoU matrix shape: {iou.shape}")
-            print(f"DEBUG: IoU matrix:\n{iou}")
-            print(f"DEBUG: Max IoU: {iou.max():.4f}")
+            # print(f"DEBUG: IoU matrix shape: {iou.shape}")
+            # print(f"DEBUG: IoU matrix:\n{iou}")
+            # print(f"DEBUG: Max IoU: {iou.max():.4f}")
             
             # ✅ 클래스 매칭 여부 확인 (에러 수정)
             for i, det_cls in enumerate(detections[:, 5]):
                 matching_gts = (gt_cls == det_cls).nonzero().squeeze(-1)  # ✅ -1 추가
-                print(f"DEBUG: Detection {i} (class {det_cls}): matching GT indices {matching_gts}")
+                # print(f"DEBUG: Detection {i} (class {det_cls}): matching GT indices {matching_gts}")
                 
                 # ✅ 0-d tensor 문제 해결
                 if matching_gts.numel() > 0:  # ✅ len() 대신 numel() 사용
                     if matching_gts.dim() == 0:  # 스칼라인 경우
                         matching_gts = matching_gts.unsqueeze(0)  # 1D로 변환
                     best_iou = iou[matching_gts, i].max() if iou.dim() > 1 else iou[matching_gts]
-                    print(f"DEBUG: Best IoU for det {i}: {best_iou:.4f}")
+                    # print(f"DEBUG: Best IoU for det {i}: {best_iou:.4f}")
         
         iou = box_iou(gt_bboxes, detections[:, :4])
         result = self.match_predictions(detections[:, 5], gt_cls, iou)
-        print(f"DEBUG: match_predictions result shape: {result.shape}")
-        print(f"DEBUG: match_predictions TP count: {result.sum()}")
-        print(f"DEBUG: ===== END _process_batch IoU DEBUG =====")
+        # print(f"DEBUG: match_predictions result shape: {result.shape}")
+        # print(f"DEBUG: match_predictions TP count: {result.sum()}")
+        # print(f"DEBUG: ===== END _process_batch IoU DEBUG =====")
         
         return result
 
