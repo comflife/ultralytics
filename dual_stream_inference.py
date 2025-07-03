@@ -27,19 +27,20 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 # ============================================================
 
 # 모델 파일 경로
-MODEL_PATH = "runs/train/exp225/weights/best.pt"
+# MODEL_PATH = "runs/train/exp225/weights/best.pt"
+MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp258/weights/best.pt"
 
 # 입력 이미지 경로
-WIDE_IMAGE_PATH = "swm/images/scene0002_20250422_07540461.jpg"    # Wide stream 이미지
-NARROW_IMAGE_PATH = "swm/images/scene0002_20250422_07540461.jpg"  # Narrow stream 이미지
+WIDE_IMAGE_PATH = "/home/byounggun/ultralytics/swm_total/images/20250423_02114106.jpg"    # Wide stream 이미지
+NARROW_IMAGE_PATH = "/home/byounggun/ultralytics/swm_total/narrow_images/20250423_02114106.jpg"  # Narrow stream 이미지
 
 # 출력 설정
 OUTPUT_DIR = "inference_results"
 OUTPUT_IMAGE_NAME = "dual_stream_result.jpg"
 
 # 추론 설정
-CONFIDENCE_THRESHOLD = 0.25
-IOU_THRESHOLD = 0.45
+CONFIDENCE_THRESHOLD = 0.15
+IOU_THRESHOLD = 0.35
 IMAGE_SIZE = 640
 
 # ============================================================
@@ -119,27 +120,26 @@ def create_dual_stream_input(wide_tensor, narrow_tensor):
     print(f"🔗 Created dual stream input: {dual_stream.shape}")
     return dual_stream
 
-def postprocess_results(results, original_size, target_size=640):
+def postprocess_results_raw(predictions, original_size, target_size=640):
     """
-    모델 결과를 후처리하여 원본 이미지 좌표로 변환
+    Raw NMS 결과를 후처리하여 원본 이미지 좌표로 변환
     
     Args:
-        results: YOLO 모델 출력
+        predictions: NMS 후처리된 결과 (리스트)
         original_size (tuple): 원본 이미지 크기 (height, width)
         target_size (int): 모델 입력 크기
     
     Returns:
         list: 검출된 객체 리스트 [x1, y1, x2, y2, confidence, class_id]
     """
-    if not results or len(results) == 0:
+    if not predictions or len(predictions) == 0:
         return []
     
-    result = results[0]  # 첫 번째 결과
+    # 첫 번째 배치 결과 사용
+    pred = predictions[0]
     
-    if not hasattr(result, 'boxes') or result.boxes is None:
+    if pred is None or len(pred) == 0:
         return []
-    
-    boxes = result.boxes
     
     # 원본 이미지 크기로 스케일링
     original_height, original_width = original_size
@@ -155,11 +155,9 @@ def postprocess_results(results, original_size, target_size=640):
     
     detections = []
     
-    for box in boxes:
-        # 좌표 추출
-        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-        confidence = box.conf[0].cpu().numpy()
-        class_id = int(box.cls[0].cpu().numpy())
+    for detection in pred:
+        # detection: [x1, y1, x2, y2, confidence, class_id]
+        x1, y1, x2, y2, confidence, class_id = detection.cpu().numpy()
         
         # 패딩 제거
         x1 = max(0, x1 - left)
@@ -179,7 +177,7 @@ def postprocess_results(results, original_size, target_size=640):
         x2 = max(0, min(x2, original_width))
         y2 = max(0, min(y2, original_height))
         
-        detections.append([x1, y1, x2, y2, confidence, class_id])
+        detections.append([x1, y1, x2, y2, float(confidence), int(class_id)])
     
     return detections
 
@@ -261,17 +259,39 @@ def main():
     start_time = time.time()
     
     try:
-        # 직접 model.model로 접근하여 듀얼 스트림 입력 사용
+        # 듀얼 스트림 모델의 경우 직접 forward pass 사용
+        # YOLO 모델의 실제 PyTorch 모델에 접근
+        pytorch_model = model.model if hasattr(model, 'model') else model.predictor.model
+        pytorch_model.eval()  # evaluation 모드로 설정
+        
         with torch.no_grad():
-            results = model.predict(
-                source=dual_input,
-                conf=CONFIDENCE_THRESHOLD,
-                iou=IOU_THRESHOLD,
-                verbose=False,
-                save=False
+            # 직접 모델 forward pass 수행
+            predictions = pytorch_model(dual_input)
+            
+            # NMS 후처리 적용
+            from ultralytics.utils.ops import non_max_suppression
+            
+            # 모델의 클래스 수 가져오기
+            nc = getattr(pytorch_model, 'nc', 80)  # 기본값 80 (COCO)
+            
+            # NMS 적용
+            predictions = non_max_suppression(
+                predictions,
+                conf_thres=CONFIDENCE_THRESHOLD,
+                iou_thres=IOU_THRESHOLD,
+                classes=None,
+                agnostic=False,
+                max_det=300,
+                nc=nc
             )
+            
+            # 결과를 리스트로 저장 (배치의 첫 번째 결과만 사용)
+            results = predictions
+            
     except Exception as e:
         print(f"❌ Inference failed: {e}")
+        import traceback
+        traceback.print_exc()
         return
     
     inference_time = time.time() - start_time
@@ -279,7 +299,7 @@ def main():
     
     # 5. 결과 후처리 (wide 이미지 기준)
     print("📊 Processing results...")
-    detections = postprocess_results(results, wide_original_size, IMAGE_SIZE)
+    detections = postprocess_results_raw(results, wide_original_size, IMAGE_SIZE)
     
     print(f"🎯 Found {len(detections)} detections")
     for i, detection in enumerate(detections):
