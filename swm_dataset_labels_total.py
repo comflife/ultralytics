@@ -1,8 +1,7 @@
 """
-Script to copy images with corresponding labels into a YOLOv8 dataset structure.
-This script collects images that have corresponding labels from camera_100_labels directory
-and organizes them into a proper YOLOv8 dataset structure with 'images' and 'labels' folders.
-It also creates a YAML file for the dataset with class names.
+Script to copy all images and corresponding labels from a source directory to an output directory.
+This script recursively finds all images and their corresponding label files and copies them
+to the output directory in a flat structure.
 """
 
 import os
@@ -11,91 +10,77 @@ import glob
 from tqdm import tqdm
 from pathlib import Path
 
-def create_yolov8_dataset(source_images_dir, source_labels_dir, output_dir, allowed_extensions=('.jpg', '.jpeg', '.png')):
+def copy_all_files(source_dir, output_dir, allowed_extensions=('.jpg', '.jpeg', '.png')):
     """
-    Create a YOLOv8 dataset by copying images and labels to the appropriate directories.
+    Copy all images and their corresponding labels from source directory to output directory.
     
     Args:
-        source_images_dir (str): Directory containing all source images
-        source_labels_dir (str): Directory containing all label files
-        output_dir (str): Base output directory where images/ and labels/ folders will be created
+        source_dir (str): Source directory containing images and labels
+        output_dir (str): Output directory where all files will be copied
         allowed_extensions (tuple): Allowed image file extensions
     """
-    # Create output directories
-    output_images_dir = os.path.join(output_dir, 'total_images')
-    output_labels_dir = os.path.join(output_dir, 'total_labels')
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
     
-    os.makedirs(output_images_dir, exist_ok=True)
-    os.makedirs(output_labels_dir, exist_ok=True)
-    
-    print(f"Created output directories:\n- {output_images_dir}\n- {output_labels_dir}")
-    
-    # Get all scene folders in the labels directory
-    scene_folders = [folder for folder in os.listdir(source_labels_dir) 
-                     if os.path.isdir(os.path.join(source_labels_dir, folder))]
+    print(f"Copying files from {source_dir} to {output_dir}")
     
     total_copied = 0
-    skipped_count = 0
     
-    print(f"Found {len(scene_folders)} scene folders in the labels directory")
-    
-    # Process each scene folder
-    for scene_folder in tqdm(scene_folders, desc="Processing scene folders"):
-        # Get full path to scene folder in both source directories
-        scene_labels_path = os.path.join(source_labels_dir, scene_folder)
-        scene_images_path = os.path.join(source_images_dir, scene_folder)
-        
-        # Skip if the scene doesn't exist in the images directory
-        if not os.path.exists(scene_images_path):
-            print(f"Warning: Scene {scene_folder} exists in labels but not in images directory. Skipping.")
-            continue
+    # Walk through all subdirectories in source
+    for root, dirs, files in os.walk(source_dir):
+        for file in tqdm(files, desc=f"Processing {os.path.basename(root)}"):
+            file_path = os.path.join(root, file)
             
-        # Get all label files in the scene folder
-        label_files = glob.glob(os.path.join(scene_labels_path, "*.txt"))
-        
-        for label_file in label_files:
-            label_filename = os.path.basename(label_file)
-            image_basename = os.path.splitext(label_filename)[0]
-            
-            # Check for matching image files with allowed extensions
-            found_image = False
-            for ext in allowed_extensions:
-                image_filename = f"{image_basename}{ext}"
-                image_path = os.path.join(scene_images_path, image_filename)
+            # Check if it's an image file
+            if any(file.lower().endswith(ext) for ext in allowed_extensions):
+                # Copy image file
+                dest_image = os.path.join(output_dir, file)
                 
-                if os.path.exists(image_path):
-                    # Copy image and label to the output directories
-                    dest_image = os.path.join(output_images_dir, f"{scene_folder}_{image_filename}")
-                    dest_label = os.path.join(output_labels_dir, f"{scene_folder}_{label_filename}")
-                    
-                    shutil.copy2(image_path, dest_image)
+                # Handle duplicate filenames by adding directory prefix
+                if os.path.exists(dest_image):
+                    relative_path = os.path.relpath(root, source_dir)
+                    prefix = relative_path.replace(os.sep, '_')
+                    dest_image = os.path.join(output_dir, f"{prefix}_{file}")
+                
+                shutil.copy2(file_path, dest_image)
+                total_copied += 1
+                
+                # Look for corresponding label file
+                image_basename = os.path.splitext(file)[0]
+                label_file = os.path.join(root, f"{image_basename}.txt")
+                
+                if os.path.exists(label_file):
+                    dest_label = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(dest_image))[0]}.txt")
                     shutil.copy2(label_file, dest_label)
-                    total_copied += 1
-                    found_image = True
-                    break
+            
+            # Also copy standalone .txt files (labels without images)
+            elif file.lower().endswith('.txt'):
+                dest_label = os.path.join(output_dir, file)
                 
-            if not found_image:
-                skipped_count += 1
+                # Handle duplicate filenames by adding directory prefix
+                if os.path.exists(dest_label):
+                    relative_path = os.path.relpath(root, source_dir)
+                    prefix = relative_path.replace(os.sep, '_')
+                    dest_label = os.path.join(output_dir, f"{prefix}_{file}")
+                
+                shutil.copy2(file_path, dest_label)
     
-    print(f"\nDone! Copied {total_copied} image-label pairs to YOLOv8 dataset format")
-    print(f"Skipped {skipped_count} labels without matching images")
-    
+    print(f"\nDone! Copied {total_copied} files to {output_dir}")
     return total_copied
 
 def main():
-    # Set paths
-    source_images_dir = "/home/byounggun/swm_dataset/swm_dataset/final_folder/final_data/camera_100"
-    source_labels_dir = "/home/byounggun/swm_dataset/swm_dataset/final_folder/final_data/camera_100_labels"
-    output_dir = "swm_total"
+    # Set paths directly in code
+    source_dir = "/home/byounggun/swm_dataset/swm_dataset/final_folder/final_data/camera_30"
+    output_dir = "swm_total/narrow_images"
     
-    # Create the output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+    if not os.path.exists(source_dir):
+        print(f"Error: Source directory {source_dir} does not exist!")
+        return
     
-    # Create the YOLOv8 dataset
-    create_yolov8_dataset(source_images_dir, source_labels_dir, output_dir)
+    # Copy all files
+    copy_all_files(source_dir, output_dir)
     
-    print(f"\nYOLOv8 dataset created at: {output_dir}")
-    print("You can now use this dataset for training with YOLOv8.")
+    print(f"\nAll files copied from {source_dir} to {output_dir}")
 
 if __name__ == "__main__":
     main()

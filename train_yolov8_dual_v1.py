@@ -1,11 +1,4 @@
 # YOLOv8 🚀 by Ultralytics, AGPL-3.0 license
-"""
-Train a YOLOv8 model on a custom dataset.
-
-Usage - Single-GPU training:
-    $ python train_yolov8.py --data swm.yaml --weights yolov8n.pt --cfg yolov8n.yaml --img 640 --epochs 20
-
-"""
 
 import argparse
 import os
@@ -162,6 +155,7 @@ def train(cfg, opt, device, callbacks=None):
         'fraction': 1.0,  # dataset fraction to train on
         'profile': False,  # profile ONNX and TensorRT speeds
         'val': not opt.noval,
+        # 'val_period': 10,  # ✅ Validation every 10 epochs
         'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
         'conf': 0.1,   # confidence threshold

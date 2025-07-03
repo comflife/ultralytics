@@ -13,7 +13,8 @@ echo "Starting dual-stream YOLO training..."
 
 python train_yolov8_dual_v1.py \
   --cfg models/yolov8-dual.yaml \
-  --data ultralytics/cfg/datasets/for_swm.yaml \
+  --data ultralytics/cfg/datasets/for_swm2.yaml \
   --epochs 100 \
   --batch-size 32 \
-  --imgsz 640
+  --imgsz 640 \
+  --device 1
