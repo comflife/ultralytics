@@ -50,9 +50,9 @@ def train(cfg, opt, device, callbacks=None):
         yaml.dump(vars(opt), f)
     
     # Loggers
-    LOGGER.info(f"Starting YOLOv8 training in {save_dir}")
+    # LOGGER.info(f"Starting YOLOv8 training in {save_dir}")
     
-   # Load model
+    # Load model
     if opt.resume:
         LOGGER.info(f"Resuming training from {opt.weights}")
         model = YOLO(opt.weights)
@@ -66,7 +66,44 @@ def train(cfg, opt, device, callbacks=None):
         else:
             LOGGER.info(f"Loading pretrained model {opt.weights}")
             model = YOLO(opt.weights)
+
+    # ✅ 모델 로딩 직후에 freeze 상태 체크 및 해제
+    # LOGGER.info("🔍 Checking model parameters after loading...")
     
+    # 모델을 training mode로 설정
+    model.model.train()
+    
+    # Freeze 상태 체크
+    total_params = 0
+    trainable_params = 0
+    frozen_layers = []
+    
+    for name, param in model.model.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+        else:
+            frozen_layers.append(name)
+    
+    # LOGGER.info(f"📊 Initial Model Parameter Summary:")
+    # LOGGER.info(f"  Total parameters: {total_params:,}")
+    # LOGGER.info(f"  Trainable parameters: {trainable_params:,}")
+    # LOGGER.info(f"  Frozen parameters: {total_params - trainable_params:,}")
+    # LOGGER.info(f"  Trainable ratio: {trainable_params/total_params:.2%}")
+    
+    # ✅ 모든 파라미터를 trainable로 강제 설정 (학습 전에!)
+    if trainable_params == 0 or len(frozen_layers) > 0:
+        # LOGGER.warning(f"🧊 Found {len(frozen_layers)} frozen layers. Unfreezing all parameters...")
+        
+        for param in model.model.parameters():
+            param.requires_grad = True
+        
+        # 재확인
+        trainable_after = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+    #     LOGGER.info(f"✅ After unfreezing: {trainable_after:,} trainable parameters ({trainable_after/total_params:.2%})")
+    # else:
+    #     LOGGER.info("✅ All parameters are already trainable")
+
     # Check if using a dual-stream model
     is_dual_model = False
     if opt.cfg:
@@ -200,41 +237,12 @@ def train(cfg, opt, device, callbacks=None):
                 val_args['dual_stream'] = True
             results = model.val(**val_args)
         
+        # ✅ 학습 후 상태 체크 (inference mode 해제 없이)
         if is_dual_model or opt.dual_stream:
-            LOGGER.info("🔍 Checking model training state...")
+            LOGGER.info("🔍 Final model training state check...")
             
-            total_params = 0
-            trainable_params = 0
-            frozen_layers = []
-            
-            for name, param in model.model.named_parameters():
-                total_params += param.numel()
-                if param.requires_grad:
-                    trainable_params += param.numel()
-                else:
-                    frozen_layers.append(name)
-            
-            LOGGER.info(f"📊 Model Parameter Summary:")
-            LOGGER.info(f"  Total parameters: {total_params:,}")
-            LOGGER.info(f"  Trainable parameters: {trainable_params:,}")
-            LOGGER.info(f"  Frozen parameters: {total_params - trainable_params:,}")
-            LOGGER.info(f"  Trainable ratio: {trainable_params/total_params:.2%}")
-            
-            if frozen_layers:
-                LOGGER.warning(f"🧊 Found {len(frozen_layers)} frozen layers:")
-                for layer in frozen_layers[:10]:  # 처음 10개만 표시
-                    LOGGER.warning(f"  - {layer}")
-                if len(frozen_layers) > 10:
-                    LOGGER.warning(f"  ... and {len(frozen_layers)-10} more")
-            
-            # 🔧 모든 레이어를 강제로 trainable로 설정
-            LOGGER.info("🔓 Ensuring all parameters are trainable...")
-            for param in model.model.parameters():
-                param.requires_grad = True
-            
-            # 재확인
-            trainable_after = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
-            LOGGER.info(f"✅ After unfreezing: {trainable_after:,} trainable parameters")
+            final_trainable = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+            LOGGER.info(f"📊 Final trainable parameters: {final_trainable:,} ({final_trainable/total_params:.2%})")
         
         return results
     except Exception as e:

@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import ConcatDataset
+import torch.nn.functional as F
 
 from ultralytics.utils import LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, colorstr
 from ultralytics.utils.instance import Instances
@@ -514,6 +515,9 @@ class YOLODataset(BaseDataset):
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
         return label
 
+
+    
+
     @staticmethod
     def collate_fn(batch):
         """Collates data samples into batches."""
@@ -543,8 +547,9 @@ class YOLODataset(BaseDataset):
                         wide_batch = torch.stack(wide_imgs, 0)    # [B, C, H, W]
                         narrow_batch = torch.stack(narrow_imgs, 0)  # [B, C, H, W]
                         
-                        # Keep as tuple in img key
-                        # value = (wide_batch, narrow_batch)
+                        # ✅ 크기 맞춤
+                        wide_batch, narrow_batch = resize_to_match(wide_batch, narrow_batch)
+                        
                         value = torch.stack((wide_batch, narrow_batch), dim=1)  # [2, B, C, H, W]
                     else:
                         # Single stream case
@@ -617,6 +622,21 @@ class YOLODataset(BaseDataset):
                     else:
                         LOGGER.error(f"img type: {type(img_info)}, shape: {getattr(img_info, 'shape', 'no shape')}")
             raise e
+
+def resize_to_match(tensor1, tensor2):
+    """두 텐서를 같은 크기로 맞춤"""
+    # 더 큰 크기를 기준으로 맞춤
+    h1, w1 = tensor1.shape[-2:]
+    h2, w2 = tensor2.shape[-2:]
+    target_h, target_w = max(h1, h2), max(w1, w2)
+    
+    if (h1, w1) != (target_h, target_w):
+        tensor1 = F.interpolate(tensor1, size=(target_h, target_w), mode='bilinear', align_corners=False)
+    if (h2, w2) != (target_h, target_w):
+        tensor2 = F.interpolate(tensor2, size=(target_h, target_w), mode='bilinear', align_corners=False)
+    
+    return tensor1, tensor2
+
 class YOLOMultiModalDataset(YOLODataset):
     """
     Dataset class for loading object detection and/or segmentation labels in YOLO format with multi-modal support.
