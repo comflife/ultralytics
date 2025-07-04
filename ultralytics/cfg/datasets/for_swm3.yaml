@@ -39,7 +39,7 @@ val: /home/byounggun/ultralytics/swm_total/images    # Ultralytics requires thes
 # val_wide: /home/byounggun/ultralytics/swm/images
 # val_narrow: /home/byounggun/ultralytics/swm/images
 
-train_wide: /home/byounggun/ultralytics/swm_total/images
-train_narrow: /home/byounggun/ultralytics/swm_total/narrow_images
-val_wide: /home/byounggun/ultralytics/swm_total/images
-val_narrow: /home/byounggun/ultralytics/swm_total/narrow_images
+# train_wide: /home/byounggun/ultralytics/swm_total/images
+# train_narrow: /home/byounggun/ultralytics/swm_total/narrow_images
+# val_wide: /home/byounggun/ultralytics/swm_total/images
+# val_narrow: /home/byounggun/ultralytics/swm_total/narrow_images
