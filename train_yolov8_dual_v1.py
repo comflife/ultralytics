@@ -185,7 +185,7 @@ def train(cfg, opt, device, callbacks=None):
         'perspective': 0.0,     # ✅ Image perspective (+/- fraction), range 0-0.001
         'flipud': 0.0,          # ✅ Image flip up-down (probability)
         'fliplr': 0.5,          # ✅ Image flip left-right (probability)
-        'mosaic': 1.0,          # ✅ Image mosaic (probability)
+        'mosaic': 0.3,          # ✅ Image mosaic (probability)
         'mixup': 0.0,           # ✅ Image mixup (probability)
         'copy_paste': 0.0,      # ✅ Image copy-paste (probability)
         'auto_augment': None,   # ✅ Auto augmentation policy for classification (randaugment, autoaugment, augmix)
@@ -227,9 +227,8 @@ def train(cfg, opt, device, callbacks=None):
             val_args = {
                 'data': opt.data,
                 'batch': opt.batch_size * 2,
+                'dual_stream': is_dual_model or opt.dual_stream,  # 추가
             }
-            if is_dual_model or opt.dual_stream:
-                val_args['dual_stream'] = True
             results = model.val(**val_args)
         
         # ✅ 학습 후 상태 체크 (inference mode 해제 없이)

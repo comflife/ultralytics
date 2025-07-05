@@ -17,4 +17,4 @@ python train_yolov8_dual_v1.py \
   --epochs 100 \
   --batch-size 32 \
   --imgsz 640 \
-  --device 1
+  # --device 1

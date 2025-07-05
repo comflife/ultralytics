@@ -53,6 +53,13 @@ class DetectionValidator(BaseValidator):
             _callbacks (list, optional): List of callback functions.
         """
         super().__init__(dataloader, save_dir, pbar, args, _callbacks)
+        
+        # 🔧 dual_stream 설정 확인
+        # if hasattr(self.args, 'dual_stream') and self.args.dual_stream:
+        #     print(f"🔍 VAL: DetectionValidator initialized with dual_stream=True")
+        # else:
+        #     print(f"🔍 VAL: DetectionValidator initialized with dual_stream=False")
+        
         self.nt_per_class = None
         self.nt_per_image = None
         self.is_coco = False
@@ -67,11 +74,26 @@ class DetectionValidator(BaseValidator):
         """
         Preprocess batch of images for YOLO validation.
         """
-        # ✅ Dual stream 처리 추가
+        # print(f"🔍 VAL: Batch img type: {type(batch['img'])}")
+        # print(f"🔍 VAL: Batch img shape: {batch['img'].shape}")
+        
+        # ✅ Dual stream 처리 개선
         if isinstance(batch["img"], tuple):
-            # Dual stream case: convert tuple to [B, 2, C, H, W] tensor
+            # print("✅ VAL: Dual stream tuple detected!")
             wide_batch, narrow_batch = batch["img"]
             batch["img"] = torch.stack([wide_batch, narrow_batch], dim=1)
+        elif isinstance(batch["img"], list) and len(batch["img"]) == 2:
+            # print("✅ VAL: Dual stream list detected!")
+            wide_batch, narrow_batch = batch["img"]
+            batch["img"] = torch.stack([wide_batch, narrow_batch], dim=1)
+        elif batch["img"].dim() == 5 and batch["img"].shape[1] == 2:
+            # print("✅ VAL: Dual stream tensor already formatted!")
+            pass
+        else:
+            # print("❌ VAL: Single stream detected - this may cause issues!")
+            pass
+        
+        # print(f"🔍 VAL: Final batch img shape: {batch['img'].shape}")
         
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
@@ -413,28 +435,23 @@ class DetectionValidator(BaseValidator):
         return result
 
     def build_dataset(self, img_path, mode="val", batch=None):
-        """
-        Build YOLO Dataset.
-
-        Args:
-            img_path (str): Path to the folder containing images.
-            mode (str): `train` mode or `val` mode, users are able to customize different augmentations for each mode.
-            batch (int, optional): Size of batches, this is for `rect`.
-
-        Returns:
-            (Dataset): YOLO dataset.
-        """
-        # print(f"DEBUG: ===== BUILDING VALIDATION DATASET =====")
-        # print(f"DEBUG: img_path: {img_path}")
-        # print(f"DEBUG: mode: {mode}")
-        # print(f"DEBUG: batch: {batch}")
-        # print(f"DEBUG: args.multi_modal: {getattr(self.args, 'multi_modal', 'NOT SET')}")
+        """Build YOLO Dataset with proper dual_stream handling."""
         
-        # Validation에서도 multi_modal 강제 활성화
+        # 🔧 dual_stream 설정 확인 및 전달
+        has_dual_stream = getattr(self.args, 'dual_stream', False)
+        
+        # args에서 dual_stream 플래그 확인
+        if has_dual_stream:
+            self.args.dual_stream = True
+        # 데이터셋 YAML에서 dual stream 확인
+        elif self.data and any(k.endswith(('_wide', '_narrow')) for k in self.data.keys()):
+            self.args.dual_stream = True
+            has_dual_stream = True
+        
+        # multi_modal도 dual_stream일 때 활성화
         original_multi_modal = getattr(self.args, 'multi_modal', False)
-        self.args.multi_modal = True
-        
-        # print(f"DEBUG: Forcing multi_modal=True for validation")
+        if has_dual_stream:
+            self.args.multi_modal = True
         
         dataset = build_yolo_dataset(
             self.args, 
@@ -445,15 +462,8 @@ class DetectionValidator(BaseValidator):
             stride=self.stride
         )
         
-        # 원래 값 복원 (다른 곳에 영향 주지 않기 위해)
+        # 원래 값 복원
         self.args.multi_modal = original_multi_modal
-        
-        # print(f"DEBUG: Dataset type: {type(dataset)}")
-        # print(f"DEBUG: Dataset length: {len(dataset)}")
-        # print(f"DEBUG: Dataset has multi_modal: {hasattr(dataset, 'multi_modal')}")
-        if hasattr(dataset, 'multi_modal'):
-            print(f"DEBUG: Dataset.multi_modal: {dataset.multi_modal}")
-        # print(f"DEBUG: ===== END BUILDING VALIDATION DATASET =====")
         
         return dataset
 
