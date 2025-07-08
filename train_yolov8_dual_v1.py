@@ -197,10 +197,33 @@ def train(cfg, opt, device, callbacks=None):
     if is_dual_model or opt.dual_stream:
         # LOGGER.info("🔧 Applying dual-stream specific training stabilization...")
         model_training_args.update({
-            'lr0': 0.0005,      # ✅ dual stream의 경우 더욱 낮은 learning rate
-            'cls': 0.25,        # ✅ Classification loss 더욱 감소
-            'warmup_epochs': 5.0, # ✅ 더 긴 warmup
-            'patience': 50,     # ✅ 더 긴 patience
+            # 🔥 핵심 Learning Rate 개선
+            'lr0': 0.0002,          # ✅ 더욱 낮은 learning rate (0.0005 → 0.0002)
+            'lrf': 0.0001,          # ✅ 매우 낮은 final learning rate 추가
+            'momentum': 0.9,        # ✅ 높은 momentum으로 안정성 확보
+            'weight_decay': 0.001,  # ✅ 더 강한 regularization (0.0005 → 0.001)
+            
+            # 🔥 Warmup & Patience 강화
+            'warmup_epochs': 15.0,  # ✅ 더욱 긴 warmup (5.0 → 15.0)
+            'warmup_momentum': 0.5, # ✅ 낮은 초기 momentum 추가
+            'patience': 100,        # ✅ 더 긴 patience (50 → 100)
+            
+            # 🔥 Loss 조정 - Dual Stream에 최적화
+            'cls': 0.1,             # ✅ Classification loss 대폭 감소 (0.25 → 0.1)
+            'box': 5.0,             # ✅ Box loss 감소 (7.5 → 5.0)
+            'dfl': 1.0,             # ✅ DFL loss 감소 (1.5 → 1.0)
+            
+            # 🔥 Augmentation 약화 - Overfitting 방지
+            'mosaic': 1.0,          # ✅ Mosaic 완전 비활성화 (0.3 → 0.0)
+            'mixup': 0.0,           # ✅ Mixup 유지 (이미 0.0)
+            'copy_paste': 0.0,      # ✅ Copy-paste 유지 (이미 0.0)
+            'degrees': 0.0,         # ✅ Rotation 유지 (이미 0.0)
+            'translate': 0.0,      # ✅ Translation 감소 (0.1 → 0.05)
+            'scale': 0.2,           # ✅ Scale 감소 (0.5 → 0.2)
+            'perspective': 0.0,     # ✅ Perspective 유지 (이미 0.0)
+            
+            # 🔥 추가 안정화 설정
+            'save_period': 5,       # ✅ 더 자주 저장 (조기 중단 대비)
         })
     
     # Start training
