@@ -198,20 +198,20 @@ def train(cfg, opt, device, callbacks=None):
         # LOGGER.info("🔧 Applying dual-stream specific training stabilization...")
         model_training_args.update({
             # 🔥 핵심 Learning Rate 개선
-            'lr0': 0.0002,          # ✅ 더욱 낮은 learning rate (0.0005 → 0.0002)
-            'lrf': 0.0001,          # ✅ 매우 낮은 final learning rate 추가
+            'lr0': 0.001,          # ✅ 더욱 낮은 learning rate (0.0005 → 0.0002)
+            'lrf': 0.01,          # ✅ 매우 낮은 final learning rate 추가
             'momentum': 0.9,        # ✅ 높은 momentum으로 안정성 확보
             'weight_decay': 0.001,  # ✅ 더 강한 regularization (0.0005 → 0.001)
             
             # 🔥 Warmup & Patience 강화
-            'warmup_epochs': 15.0,  # ✅ 더욱 긴 warmup (5.0 → 15.0)
+            'warmup_epochs': 10.0,  # ✅ 더욱 긴 warmup (5.0 → 15.0)
             'warmup_momentum': 0.5, # ✅ 낮은 초기 momentum 추가
             'patience': 100,        # ✅ 더 긴 patience (50 → 100)
             
             # 🔥 Loss 조정 - Dual Stream에 최적화
-            'cls': 0.1,             # ✅ Classification loss 대폭 감소 (0.25 → 0.1)
-            'box': 5.0,             # ✅ Box loss 감소 (7.5 → 5.0)
-            'dfl': 1.0,             # ✅ DFL loss 감소 (1.5 → 1.0)
+            'cls': 0.25,             # ✅ Classification loss 대폭 감소 (0.25 → 0.1)
+            'box': 7.5,             # ✅ Box loss 감소 (7.5 → 5.0)
+            'dfl': 1.5,             # ✅ DFL loss 감소 (1.5 → 1.0)
             
             # 🔥 Augmentation 약화 - Overfitting 방지
             'mosaic': 1.0,          # ✅ Mosaic 완전 비활성화 (0.3 → 0.0)

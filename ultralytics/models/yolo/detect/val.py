@@ -194,54 +194,41 @@ class DetectionValidator(BaseValidator):
 
     def _prepare_batch(self, si, batch):
         """Prepare a batch for training or inference."""
-        # print(f"DEBUG: ===== _prepare_batch DEBUG =====")
-        
         idx = batch["batch_idx"] == si
         cls = batch["cls"][idx].squeeze(-1)
         bbox = batch["bboxes"][idx]
         ori_shape = batch["ori_shape"][si]
         
-        # print(f"DEBUG: Raw bbox format: {bbox[0] if len(bbox) > 0 else 'No boxes'}")
-        
         # Handle dual stream image dimensions
         if batch['img'].dim() == 5:  # [B, 2, C, H, W]
-            imgsz = batch['img'].shape[-2:]  # Use last 2 dimensions
+            imgsz = batch['img'].shape[-2:]
         else:  # [B, C, H, W]  
             imgsz = batch['img'].shape[-2:]
+        
+        # ✅ 핵심 수정: ratio_pad 정보 사용
+        ratio_pad = batch.get("ratio_pad", [None])[si] if "ratio_pad" in batch else None
         
         # Convert ori_shape to list for compatibility
         if isinstance(ori_shape, torch.Tensor):
             ori_shape = ori_shape.tolist()
         
-        # Convert normalized bbox to pixel coordinates (original image scale)
+        # ✅ 표준 방식: ground truth 좌표 처리  
         if len(bbox) > 0:
-            # print(f"DEBUG: Before conversion (normalized): {bbox[0]}")
+            # 1단계: 정규화된 xywh를 모델 입력 크기의 pixel 좌표로 변환
+            bbox = bbox.clone()
+            bbox[:, [0, 2]] *= imgsz[1]  # x coordinates
+            bbox[:, [1, 3]] *= imgsz[0]  # y coordinates
             
-            # ✅ YOLO format: [center_x, center_y, w, h] normalized → pixel
-            bbox[:, 0] *= ori_shape[1]  # center_x * width
-            bbox[:, 1] *= ori_shape[0]  # center_y * height  
-            bbox[:, 2] *= ori_shape[1]  # w * width
-            bbox[:, 3] *= ori_shape[0]  # h * height
-            
-            # print(f"DEBUG: After pixel conversion: {bbox[0]}")
-            
-            # ✅ 핵심: [center_x, center_y, w, h] → [x1, y1, x2, y2] 변환
-            center_x, center_y, w, h = bbox[:, 0], bbox[:, 1], bbox[:, 2], bbox[:, 3]
-            x1 = center_x - w / 2
-            y1 = center_y - h / 2  
-            x2 = center_x + w / 2
-            y2 = center_y + h / 2
-            
-            bbox = torch.stack([x1, y1, x2, y2], dim=1)
-            
-            # print(f"DEBUG: Final bbox format [x1,y1,x2,y2]: {bbox[0]}")
+            # 2단계: ✅ 표준 scale_boxes로 원본 이미지 크기로 변환 (패딩 고려)
+            bbox = ops.xywh2xyxy(bbox)  # xywh → xyxy 
+            ops.scale_boxes(imgsz, bbox, ori_shape, ratio_pad=ratio_pad, xywh=False)
         
         return {
             "cls": cls,
             "bbox": bbox,
             "ori_shape": ori_shape,
             "imgsz": imgsz,
-            "ratio_pad": None
+            "ratio_pad": ratio_pad
         }
 
     # detect/val.py

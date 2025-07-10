@@ -28,7 +28,9 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 
 # 모델 파일 경로
 # MODEL_PATH = "runs/train/exp225/weights/best.pt"
-MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp260/weights/best.pt" #278
+# MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp260/weights/best.pt" #278
+# MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp4/weights/best.pt" #good
+MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp13/weights/best.pt"
 
 # 입력 이미지 경로
 WIDE_IMAGE_PATH = "/home/byounggun/ultralytics/swm_total/images/20250520_01471514.jpg"    # Wide stream 이미지
