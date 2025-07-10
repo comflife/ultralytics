@@ -155,75 +155,80 @@ def train(cfg, opt, device, callbacks=None):
         'fraction': 1.0,  # dataset fraction to train on
         'profile': False,  # profile ONNX and TensorRT speeds
         'val': not opt.noval,
-        # 'val_period': 10,  # ✅ Validation every 10 epochs
         'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
-        'conf': 0.1,   # confidence threshold
-        'iou': 0.3,    # ✅ IoU threshold 낮추기 (기본값 0.7 → 0.3)
         'dual_stream': is_dual_model or opt.dual_stream,
         
-        # 🔧 Gradient exploding 해결을 위한 설정들
-        'lr0': 0.001,           # ✅ Learning rate 감소 (기본값 0.01 → 0.001)
+        # 🔧 기본 Ultralytics YOLO CLI와 동일한 설정들
+        'lr0': 0.01,            # ✅ 기본값 복원 (0.001 → 0.01)
         'lrf': 0.01,            # ✅ Final learning rate (lr0 * lrf)
-        'momentum': 0.937,      # ✅ SGD momentum/Adam beta1
-        'weight_decay': 0.0005, # ✅ Weight decay
-        'warmup_epochs': 3.0,   # ✅ Warmup epochs (fractions ok)
-        'warmup_momentum': 0.8, # ✅ Warmup initial momentum
-        'warmup_bias_lr': 0.1,  # ✅ Warmup initial bias lr
-        'box': 7.5,             # ✅ Box loss gain
-        'cls': 0.5,             # ✅ Classification loss gain (감소)
-        'dfl': 1.5,             # ✅ DFL loss gain
-        'pose': 12.0,           # ✅ Pose loss gain (only for pose models)
-        'kobj': 2.0,            # ✅ Keypoint obj loss gain (only for pose models)
-        'hsv_h': 0.015,         # ✅ Image HSV-Hue augmentation (fraction)
-        'hsv_s': 0.7,           # ✅ Image HSV-Saturation augmentation (fraction)
-        'hsv_v': 0.4,           # ✅ Image HSV-Value augmentation (fraction)
-        'degrees': 0.0,         # ✅ Image rotation (+/- deg)
-        'translate': 0.1,       # ✅ Image translation (+/- fraction)
-        'scale': 0.5,           # ✅ Image scale (+/- gain)
-        'shear': 0.0,           # ✅ Image shear (+/- deg)
-        'perspective': 0.0,     # ✅ Image perspective (+/- fraction), range 0-0.001
-        'flipud': 0.0,          # ✅ Image flip up-down (probability)
-        'fliplr': 0.5,          # ✅ Image flip left-right (probability)
-        'mosaic': 0.3,          # ✅ Image mosaic (probability)
-        'mixup': 0.0,           # ✅ Image mixup (probability)
-        'copy_paste': 0.0,      # ✅ Image copy-paste (probability)
-        'auto_augment': None,   # ✅ Auto augmentation policy for classification (randaugment, autoaugment, augmix)
-        'erasing': 0.4,         # ✅ Random erasing probability during classification training (0-0.9), 0 to disable
-        'crop_fraction': 1.0,   # ✅ Image crop fraction for classification (0.1-1.0)
+        'momentum': 0.937,      # ✅ SGD momentum/Adam beta1 (기본값)
+        'weight_decay': 0.0005, # ✅ Weight decay (기본값)
+        'warmup_epochs': 3.0,   # ✅ Warmup epochs (기본값)
+        'warmup_momentum': 0.8, # ✅ Warmup initial momentum (기본값)
+        'warmup_bias_lr': 0.1,  # ✅ Warmup initial bias lr (기본값)
+        'box': 7.5,             # ✅ Box loss gain (기본값)
+        'cls': 0.5,             # ✅ Classification loss gain (기본값)
+        'dfl': 1.5,             # ✅ DFL loss gain (기본값)
+        'pose': 12.0,           # ✅ Pose loss gain (기본값)
+        'kobj': 1.0,            # ✅ Keypoint obj loss gain (기본값으로 수정)
+        'hsv_h': 0.015,         # ✅ Image HSV-Hue augmentation (기본값)
+        'hsv_s': 0.7,           # ✅ Image HSV-Saturation augmentation (기본값)
+        'hsv_v': 0.4,           # ✅ Image HSV-Value augmentation (기본값)
+        'degrees': 0.0,         # ✅ Image rotation (기본값)
+        'translate': 0.1,       # ✅ Image translation (기본값)
+        'scale': 0.5,           # ✅ Image scale (기본값)
+        'shear': 0.0,           # ✅ Image shear (기본값)
+        'perspective': 0.0,     # ✅ Image perspective (기본값)
+        'flipud': 0.0,          # ✅ Image flip up-down (기본값)
+        'fliplr': 0.5,          # ✅ Image flip left-right (기본값)
+        'mosaic': 1.0,          # ✅ Image mosaic (기본값)
+        'mixup': 0.0,           # ✅ Image mixup (기본값)
+        'copy_paste': 0.0,      # ✅ Image copy-paste (기본값)
+        # 기본 CLI에서 지원하지 않는 파라미터들 제거
+        # 'auto_augment': 'randaugment',  # ✅ 기본값 (하지만 detection에서는 None)
+        # 'erasing': 0.4,         # ✅ Classification 전용이므로 제거
+        # 'crop_fraction': 1.0,   # ✅ Classification 전용이므로 제거
+        # 'conf': 0.25,          # ✅ validation 기본값이지만 train에서는 설정 안함
+        # 'iou': 0.7,            # ✅ validation 기본값이지만 train에서는 설정 안함
     }
     
     # 🔧 특별히 dual stream 모델의 경우 더욱 안정적인 설정
     if is_dual_model or opt.dual_stream:
         # LOGGER.info("🔧 Applying dual-stream specific training stabilization...")
         model_training_args.update({
-            # 🔥 핵심 Learning Rate 개선
-            'lr0': 0.001,          # ✅ 더욱 낮은 learning rate (0.0005 → 0.0002)
-            'lrf': 0.01,          # ✅ 매우 낮은 final learning rate 추가
-            'momentum': 0.9,        # ✅ 높은 momentum으로 안정성 확보
-            'weight_decay': 0.001,  # ✅ 더 강한 regularization (0.0005 → 0.001)
-            
-            # 🔥 Warmup & Patience 강화
-            'warmup_epochs': 10.0,  # ✅ 더욱 긴 warmup (5.0 → 15.0)
-            'warmup_momentum': 0.5, # ✅ 낮은 초기 momentum 추가
-            'patience': 100,        # ✅ 더 긴 patience (50 → 100)
-            
-            # 🔥 Loss 조정 - Dual Stream에 최적화
-            'cls': 0.25,             # ✅ Classification loss 대폭 감소 (0.25 → 0.1)
-            'box': 7.5,             # ✅ Box loss 감소 (7.5 → 5.0)
-            'dfl': 1.5,             # ✅ DFL loss 감소 (1.5 → 1.0)
-            
-            # 🔥 Augmentation 약화 - Overfitting 방지
-            'mosaic': 1.0,          # ✅ Mosaic 완전 비활성화 (0.3 → 0.0)
-            'mixup': 0.0,           # ✅ Mixup 유지 (이미 0.0)
-            'copy_paste': 0.0,      # ✅ Copy-paste 유지 (이미 0.0)
-            'degrees': 0.0,         # ✅ Rotation 유지 (이미 0.0)
-            'translate': 0.0,      # ✅ Translation 감소 (0.1 → 0.05)
-            'scale': 0.2,           # ✅ Scale 감소 (0.5 → 0.2)
-            'perspective': 0.0,     # ✅ Perspective 유지 (이미 0.0)
+            # 🔥 핵심 Learning Rate 개선 - NaN 방지를 위한 보수적 설정
+            'lr0': 0.01,            # ✅ 기본값 복원 (0.001 → 0.01)
+            'lrf': 0.01,            # ✅ Final learning rate (lr0 * lrf)
+            'momentum': 0.937,      # ✅ SGD momentum/Adam beta1 (기본값)
+            'weight_decay': 0.0005, # ✅ Weight decay (기본값)
+            'warmup_epochs': 3.0,   # ✅ Warmup epochs (기본값)
+            'warmup_momentum': 0.8, # ✅ Warmup initial momentum (기본값)
+            'warmup_bias_lr': 0.1,  # ✅ Warmup initial bias lr (기본값)
+            'box': 7.5,             # ✅ Box loss gain (기본값)
+            'cls': 0.5,             # ✅ Classification loss gain (기본값)
+            'dfl': 1.5,             # ✅ DFL loss gain (기본값)
+            'pose': 12.0,           # ✅ Pose loss gain (기본값)
+            'kobj': 1.0,            # ✅ Keypoint obj loss gain (기본값으로 수정)
+            'hsv_h': 0.015,         # ✅ Image HSV-Hue augmentation (기본값)
+            'hsv_s': 0.7,           # ✅ Image HSV-Saturation augmentation (기본값)
+            'hsv_v': 0.4,           # ✅ Image HSV-Value augmentation (기본값)
+            'degrees': 0.0,         # ✅ Image rotation (기본값)
+            'translate': 0.1,       # ✅ Image translation (기본값)
+            'scale': 0.5,           # ✅ Image scale (기본값)
+            'shear': 0.0,           # ✅ Image shear (기본값)
+            'perspective': 0.0,     # ✅ Image perspective (기본값)
+            'flipud': 0.0,          # ✅ Image flip up-down (기본값)
+            'fliplr': 0.5,          # ✅ Image flip left-right (기본값)
+            'mosaic': 1.0,          # ✅ Image mosaic (기본값)
+            'mixup': 0.0,           # ✅ Image mixup (기본값)
+            'copy_paste': 0.0,      # ✅ Image copy-paste (기본값)
             
             # 🔥 추가 안정화 설정
             'save_period': 5,       # ✅ 더 자주 저장 (조기 중단 대비)
+            
+            # 🔥 Validation 관련 - dual-stream에 맞는 임계값
+            # 참고: 이 값들은 validation 시에만 적용됨
         })
     
     # Start training
@@ -250,8 +255,16 @@ def train(cfg, opt, device, callbacks=None):
             val_args = {
                 'data': opt.data,
                 'batch': opt.batch_size * 2,
-                'dual_stream': is_dual_model or opt.dual_stream,  # 추가
+                'dual_stream': is_dual_model or opt.dual_stream,
             }
+            
+            # 🔥 Dual-stream 모델의 경우 더 관대한 validation 설정
+            if is_dual_model or opt.dual_stream:
+                val_args.update({
+                    'conf': 0.1,   # ✅ 낮은 confidence threshold (0.25 → 0.1)
+                    'iou': 0.3,    # ✅ 낮은 IoU threshold (0.7 → 0.3)
+                })
+            
             results = model.val(**val_args)
         
         # ✅ 학습 후 상태 체크 (inference mode 해제 없이)
