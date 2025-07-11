@@ -196,40 +196,62 @@ def train(cfg, opt, device, callbacks=None):
     # 🔧 특별히 dual stream 모델의 경우 더욱 안정적인 설정
     if is_dual_model or opt.dual_stream:
         # LOGGER.info("🔧 Applying dual-stream specific training stabilization...")
+        
+        # 🚀 Batch Size에 따른 Learning Rate Scaling
+        base_lr = 0.002
+        batch_scale_factor = opt.batch_size / 16  # 기준 batch_size=16
+        scaled_lr = base_lr * batch_scale_factor
+        
         model_training_args.update({
-            # 🔥 핵심 Learning Rate 개선 - NaN 방지를 위한 보수적 설정
-            'lr0': 0.01,            # ✅ 기본값 복원 (0.001 → 0.01)
-            'lrf': 0.01,            # ✅ Final learning rate (lr0 * lrf)
-            'momentum': 0.937,      # ✅ SGD momentum/Adam beta1 (기본값)
-            'weight_decay': 0.0005, # ✅ Weight decay (기본값)
-            'warmup_epochs': 3.0,   # ✅ Warmup epochs (기본값)
-            'warmup_momentum': 0.8, # ✅ Warmup initial momentum (기본값)
-            'warmup_bias_lr': 0.1,  # ✅ Warmup initial bias lr (기본값)
-            'box': 7.5,             # ✅ Box loss gain (기본값)
-            'cls': 0.5,             # ✅ Classification loss gain (기본값)
-            'dfl': 1.5,             # ✅ DFL loss gain (기본값)
-            'pose': 12.0,           # ✅ Pose loss gain (기본값)
-            'kobj': 1.0,            # ✅ Keypoint obj loss gain (기본값으로 수정)
-            'hsv_h': 0.015,         # ✅ Image HSV-Hue augmentation (기본값)
-            'hsv_s': 0.7,           # ✅ Image HSV-Saturation augmentation (기본값)
-            'hsv_v': 0.4,           # ✅ Image HSV-Value augmentation (기본값)
-            'degrees': 0.0,         # ✅ Image rotation (기본값)
-            'translate': 0.1,       # ✅ Image translation (기본값)
-            'scale': 0.5,           # ✅ Image scale (기본값)
-            'shear': 0.0,           # ✅ Image shear (기본값)
-            'perspective': 0.0,     # ✅ Image perspective (기본값)
-            'flipud': 0.0,          # ✅ Image flip up-down (기본값)
-            'fliplr': 0.5,          # ✅ Image flip left-right (기본값)
-            'mosaic': 1.0,          # ✅ Image mosaic (기본값)
-            'mixup': 0.0,           # ✅ Image mixup (기본값)
-            'copy_paste': 0.0,      # ✅ Image copy-paste (기본값)
+            # 🚀 Advanced Optimizer & Learning Rate Optimization
+            'optimizer': 'AdamW',                    # ✅ AdamW가 dual-stream에 더 효과적
+            'lr0': scaled_lr,                        # ✅ Batch size에 따른 scaled learning rate
+            'lrf': 0.01,                            # ✅ Final learning rate factor
+            'cos_lr': True,                         # ✅ Cosine learning rate scheduler 활성화
+            'momentum': 0.9,                        # ✅ AdamW beta1 (momentum 역할)
+            'weight_decay': 0.0001,                 # ✅ AdamW에 적합한 weight decay
             
-            # 🔥 추가 안정화 설정
-            'save_period': 5,       # ✅ 더 자주 저장 (조기 중단 대비)
+            # 🚀 Advanced Warmup Strategy - Dual-stream 안정성
+            'warmup_epochs': 5.0,                   # ✅ 긴 warmup (dual-stream feature alignment)
+            'warmup_momentum': 0.5,                 # ✅ 낮은 초기 momentum
+            'warmup_bias_lr': 0.05,                 # ✅ 낮은 bias learning rate
             
-            # 🔥 Validation 관련 - dual-stream에 맞는 임계값
+            # 🚀 Dual-Stream Loss Optimization
+            'cls': 0.3,                             # ✅ Classification loss 미세 조정
+            'box': 8.0,                             # ✅ Box loss 약간 증가 (정확도 향상)
+            'dfl': 1.8,                             # ✅ DFL loss 약간 증가
+            
+            # 🚀 Advanced Training Techniques
+            'label_smoothing': 0.05,                # ✅ Label smoothing으로 일반화 성능 향상
+            'close_mosaic': 15,                     # ✅ 마지막 15 epochs는 mosaic 비활성화
+            
+            # 🚀 Dual-Stream Specific Augmentation
+            'mosaic': 0.8,                          # ✅ Mosaic 약간 감소 (안정성)
+            'mixup': 0.1,                           # ✅ Mixup 약간 활성화 (feature mixing)
+            'copy_paste': 0.1,                      # ✅ Copy-paste 약간 활성화
+            'translate': 0.05,                      # ✅ Translation 감소 (feature alignment)
+            'scale': 0.3,                           # ✅ Scale 감소 (안정성)
+            'hsv_h': 0.01,                          # ✅ HSV augmentation 감소 (dual-stream 안정성)
+            'hsv_s': 0.5,                           # ✅ Saturation 감소
+            'hsv_v': 0.2,                           # ✅ Value 감소
+            
+            # 🚀 Training Efficiency & Stability
+            'save_period': 10,                      # ✅ 정기적 저장 (10 epochs마다)
+            'patience': 50,                         # ✅ Early stopping patience
+            'amp': True,                            # ✅ Mixed Precision 유지
+            
+            # 🚀 Advanced Training Features
+            'rect': False,                          # ✅ Rectangular training 비활성화 (dual-stream 안정성)
+            'multi_scale': True,                    # ✅ Multi-scale training 활성화
+            
+            # 🚀 Validation 관련 - dual-stream에 맞는 임계값
             # 참고: 이 값들은 validation 시에만 적용됨
         })
+        
+        # LOGGER.info(f"🚀 Applied dual-stream optimizations:")
+        # LOGGER.info(f"  Optimizer: AdamW with scaled LR: {scaled_lr:.4f} (batch_size={opt.batch_size})")
+        # LOGGER.info(f"  Cosine LR scheduler enabled with 5-epoch warmup")
+        # LOGGER.info(f"  Enhanced augmentation and loss balancing for dual-stream")
     
     # Start training
     # LOGGER.info(f"Starting training for {opt.epochs} epochs...")
