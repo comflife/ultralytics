@@ -101,12 +101,7 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
-from .multistream import (
-    MultiStreamConv,
-    MultiStreamC3,
-    MultiStreamMaxPool2d,
-    Fusion,
-)
+
 
 __all__ = (
     "Conv",

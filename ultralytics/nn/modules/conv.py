@@ -109,20 +109,12 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         
         # print(f"DEBUG: SpatialAlign - Narrow {narrow_tensor.shape} → Wide space {target_size}")
         
-        # 🚀 개선: Gaussian noise로 초기화 (고정값 대신)
-        # 학습 시에는 noise 추가, inference 시에는 작은 고정값 사용
-        if self.training:
-            # Training: Gaussian noise for better gradient flow
-            noise_std = 0.02  # narrow tensor 값 범위에 맞춘 적절한 std
-            aligned_narrow = torch.randn((B, C, H_wide, W_wide), 
-                                       device=narrow_tensor.device, 
-                                       dtype=narrow_tensor.dtype) * noise_std
-        else:
-            # Inference: 작은 고정값으로 안정성 확보
-            aligned_narrow = torch.full((B, C, H_wide, W_wide), 
-                                      fill_value=0.005,  # inference용 작은 고정값
-                                      device=narrow_tensor.device, 
-                                      dtype=narrow_tensor.dtype)
+        # 🚀 개선: 일관된 Gaussian noise 사용 (training/inference 동일)
+        # Training과 inference 모두 같은 distribution으로 일관성 확보
+        noise_std = 0.02  # narrow tensor 값 범위에 맞춘 적절한 std
+        aligned_narrow = torch.randn((B, C, H_wide, W_wide), 
+                                   device=narrow_tensor.device, 
+                                   dtype=narrow_tensor.dtype) * noise_std
         
         # YOLO bbox → 픽셀 좌표 변환
         center_x = int(self.narrow_bbox['center_x'] * W_wide)
@@ -150,20 +142,16 @@ class SpatialAlignedMultiStreamConv(nn.Module):
                                          mode='bilinear', 
                                          align_corners=False)
             
-            # 🚀 개선된 블렌딩 전략
-            if self.training:
-                # Training: narrow와 noise를 adaptive하게 블렌딩
-                narrow_strength = 0.95  # narrow 정보 강도
-                noise_strength = 0.05   # noise 유지 비율
-                aligned_narrow[:, :, y1:y2, x1:x2] = (
-                    narrow_resized * narrow_strength + 
-                    aligned_narrow[:, :, y1:y2, x1:x2] * noise_strength
-                )
-            else:
-                # Inference: 안정적인 배치
-                aligned_narrow[:, :, y1:y2, x1:x2] = narrow_resized * 0.98 + aligned_narrow[:, :, y1:y2, x1:x2] * 0.02
+            # 🚀 일관된 블렌딩 전략 (training/inference 동일)
+            # 95% narrow 정보 + 5% Gaussian noise로 일관성 확보
+            narrow_strength = 0.95  # narrow 정보 강도
+            noise_strength = 0.05   # noise 유지 비율
+            aligned_narrow[:, :, y1:y2, x1:x2] = (
+                narrow_resized * narrow_strength + 
+                aligned_narrow[:, :, y1:y2, x1:x2] * noise_strength
+            )
             
-            # print(f"DEBUG: Successfully placed narrow with {'noise blending' if self.training else 'stable blending'}")
+            # print(f"DEBUG: Successfully placed narrow with consistent noise blending")
         # else:
             # print(f"DEBUG: ❌ Invalid target size: {target_w}x{target_h}")
         
