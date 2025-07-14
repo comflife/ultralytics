@@ -30,7 +30,7 @@ import torch
 import argparse
 
 def verify_custom_modules():
-    """커스텀 모듈들이 제대로 로드되는지 확인"""
+    """커스텀 모듈들이 제대로 로드되는지 확인 - SpatialAlignedMultiStreamConv 포함"""
     print("🔍 Verifying custom modules...")
     
     try:
@@ -50,20 +50,36 @@ def verify_custom_modules():
     # 테스트 인스턴스 생성 - DUAL STREAM 입력으로 테스트
     try:
         conv_test = MultiStreamConv(3, 64)
+        spatial_conv_test = SpatialAlignedMultiStreamConv(3, 64)
         c3_test = MultiStreamC3(64, 64)
         
         # 듀얼 스트림 입력 테스트
         test_input = torch.randn(1, 2, 3, 32, 32)  # [B, 2, C, H, W]
+        
+        # MultiStreamConv 테스트
         conv_output = conv_test(test_input)
         print(f"✅ MultiStreamConv test: {test_input.shape} -> {conv_output.shape}")
         
+        # 🚀 SpatialAlignedMultiStreamConv 테스트 (ONNX export를 위해 eval 모드로)
+        spatial_conv_test.eval()  # inference 모드로 설정
+        spatial_output = spatial_conv_test(test_input)
+        print(f"✅ SpatialAlignedMultiStreamConv test: {test_input.shape} -> {spatial_output.shape}")
+        
+        # C3 블록 테스트
         c3_input = torch.randn(1, 2, 64, 16, 16)
         c3_output = c3_test(c3_input)
         print(f"✅ MultiStreamC3 test: {c3_input.shape} -> {c3_output.shape}")
         
+        # 🔧 ONNX 호환성 확인: SpatialAlignedMultiStreamConv의 torch.randn 사용 체크
+        print("🔍 Checking ONNX compatibility for SpatialAlignedMultiStreamConv...")
+        print("⚠️  Note: SpatialAlignedMultiStreamConv uses torch.randn() which may need attention in ONNX")
+        print("   -> Ensuring model is in eval() mode for consistent behavior")
+        
         return True
     except Exception as e:
         print(f"❌ Failed to test custom modules: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def format_output_info(output):
