@@ -243,30 +243,30 @@ def scale_boxes_numpy(img1_shape, boxes, img0_shape, ratio_pad=None):
 def postprocess_detections(outputs, conf_threshold=0.5, iou_threshold=0.45):
     """
     YOLO 출력을 후처리하여 detection 결과 추출
-    
-    Args:
-        outputs (list): ONNX 모델 출력
-        conf_threshold (float): 신뢰도 임계값
-        iou_threshold (float): NMS IoU 임계값
-    
-    Returns:
-        list: Detection 결과 [(x1, y1, x2, y2, conf, class_id), ...]
     """
-    detections = outputs[0]  # [1, 32, 8400]
-    detections = detections[0]  # [32, 8400]
+    detections = outputs[0][0].T  # [8400, 32]
     
-    # 형태 변환: [32, 8400] -> [8400, 32]
-    detections = detections.T
+    # ===================== 💡 수정된 부분 시작 =====================
     
-    # 박스 좌표 [cx, cy, w, h] -> [x1, y1, x2, y2]
-    boxes = detections[:, :4]
-    boxes[:, 0] = detections[:, 0] - detections[:, 2] / 2  # x1 = cx - w/2
-    boxes[:, 1] = detections[:, 1] - detections[:, 3] / 2  # y1 = cy - h/2
-    boxes[:, 2] = detections[:, 0] + detections[:, 2] / 2  # x2 = cx + w/2
-    boxes[:, 3] = detections[:, 1] + detections[:, 3] / 2  # y2 = cy + h/2
+    # 원본 cx, cy, w, h 값을 별도 변수에 저장하여 원본 데이터가 바뀌는 것을 방지합니다.
+    cx = detections[:, 0]
+    cy = detections[:, 1]
+    w = detections[:, 2]
+    h = detections[:, 3]
     
+    # 저장된 원본 값을 사용하여 x1, y1, x2, y2를 정확하게 계산합니다.
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
+    
+    # 계산된 좌표들로 새로운 boxes 배열을 생성합니다.
+    boxes = np.stack((x1, y1, x2, y2), axis=1)
+
+    # ===================== 💡 수정된 부분 끝 =====================
+
     # 신뢰도 및 클래스
-    confidences = detections[:, 4:]  # [8400, 28] (28 classes)
+    confidences = detections[:, 4:]  # [8400, 28]
     class_ids = np.argmax(confidences, axis=1)
     max_confidences = np.max(confidences, axis=1)
     
@@ -333,9 +333,9 @@ def visualize_dual_results(wide_image_path, narrow_image_path, detections, wide_
     ax2.imshow(narrow_image)
     ax2.set_title(f'Narrow FOV - {Path(narrow_image_path).name}', fontsize=14)
     
-    # 🔧 두 가지 방식으로 동시에 시각화해서 비교
+    # 🔧 Detection 시각화
     if detections:
-        print(f"🔍 Comparing TWO visualization methods:")
+        print(f"🔍 Visualizing detection results:")
         
         # Detection 좌표를 numpy 배열로 변환
         detection_boxes = np.array([[x1, y1, x2, y2] for x1, y1, x2, y2, _, _ in detections])
@@ -345,34 +345,7 @@ def visualize_dual_results(wide_image_path, narrow_image_path, detections, wide_
             w, h = box[2] - box[0], box[3] - box[1]
             print(f"  Box {i+1}: x1={box[0]:.1f}, y1={box[1]:.1f}, x2={box[2]:.1f}, y2={box[3]:.1f} (w={w:.1f}, h={h:.1f})")
         
-        # Method 1: 640x640 좌표 그대로 (빨간색) - 주석처리
-        # for i, detection in enumerate(detections[:5]):  # 처음 5개만
-        #     x1, y1, x2, y2, conf, class_id = detection
-        #     
-        #     # 640x640 좌표를 원본 이미지 비율로 단순 변환
-        #     scale_w = wide_original_shape[1] / 640  # width scale
-        #     scale_h = wide_original_shape[0] / 640  # height scale
-        #     
-        #     x1_simple = x1 * scale_w
-        #     y1_simple = y1 * scale_h
-        #     x2_simple = x2 * scale_w
-        #     y2_simple = y2 * scale_h
-        #     
-        #     # 빨간색 박스 그리기 (단순 스케일링)
-        #     rect_simple = patches.Rectangle(
-        #         (x1_simple, y1_simple), 
-        #         x2_simple - x1_simple, 
-        #         y2_simple - y1_simple,
-        #         linewidth=2, edgecolor='red', facecolor='none'
-        #     )
-        #     ax1.add_patch(rect_simple)
-        #     
-        #     # 라벨 추가
-        #     ax1.text(x1_simple, y1_simple - 10, f'SIMPLE {class_id}: {conf:.3f}',
-        #             bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7),
-        #             fontsize=8, color='white')
-        
-        # Method 2: scale_boxes_numpy 사용 (파란색) - val.py 스타일
+        # scale_boxes_numpy 사용 (파란색) - val.py 스타일
         scaled_boxes = scale_boxes_numpy(
             img1_shape=(640, 640),           # 모델 입력 크기
             boxes=detection_boxes,           # Detection 박스들
