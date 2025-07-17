@@ -12,9 +12,13 @@ echo "Starting dual-stream YOLO training..."
 
 
 python train_yolov8_dual_v1.py \
-  --cfg /home/byounggun/ultralytics/ultralytics/cfg/models/v8/yolov8.yaml \
+  --cfg models/yolov8-dual.yaml \
   --data ultralytics/cfg/datasets/for_swm3.yaml \
-  --epochs 100 \
-  --batch-size 32 \
+  --epochs 250 \
+  --batch-size 64 \
+  # --monitor-gradients \
+  # --gradient-log-interval 10 \
+  # --gradient-check-interval 50 \
+  # --detect-anomaly \
   --imgsz 640 \
   --device 3

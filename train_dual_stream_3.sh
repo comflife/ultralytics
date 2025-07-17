@@ -15,6 +15,6 @@ python train_yolov8_dual_v1.py \
   --cfg models/yolov8-dual.yaml \
   --data ultralytics/cfg/datasets/for_swm3.yaml \
   --epochs 100 \
-  --batch-size 32 \
+  --batch-size 48 \
   --imgsz 640 \
   --device 0

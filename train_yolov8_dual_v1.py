@@ -182,7 +182,7 @@ def train(cfg, opt, device, callbacks=None):
         'perspective': 0.0,     # ✅ Image perspective (기본값)
         'flipud': 0.0,          # ✅ Image flip up-down (기본값)
         'fliplr': 0.5,          # ✅ Image flip left-right (기본값)
-        'mosaic': 1.0,          # ✅ Image mosaic (기본값)
+        'mosaic': 0.3,          # ✅ Image mosaic (기본값)
         'mixup': 0.0,           # ✅ Image mixup (기본값)
         'copy_paste': 0.0,      # ✅ Image copy-paste (기본값)
         # 기본 CLI에서 지원하지 않는 파라미터들 제거
@@ -208,8 +208,8 @@ def train(cfg, opt, device, callbacks=None):
             'lr0': scaled_lr,                        # ✅ Batch size에 따른 scaled learning rate
             'lrf': 0.01,                            # ✅ Final learning rate factor
             'cos_lr': True,                         # ✅ Cosine learning rate scheduler 활성화
-            'momentum': 0.9,                        # ✅ AdamW beta1 (momentum 역할)
-            'weight_decay': 0.0001,                 # ✅ AdamW에 적합한 weight decay
+            'momentum': 0.937,                        # ✅ AdamW beta1 (momentum 역할)
+            'weight_decay': 0.0005,                 # ✅ AdamW에 적합한 weight decay
             
             # 🚀 Advanced Warmup Strategy - Dual-stream 안정성
             'warmup_epochs': 5.0,                   # ✅ 긴 warmup (dual-stream feature alignment)
@@ -218,19 +218,19 @@ def train(cfg, opt, device, callbacks=None):
             
             # 🚀 Dual-Stream Loss Optimization
             'cls': 0.3,                             # ✅ Classification loss 미세 조정
-            'box': 8.0,                             # ✅ Box loss 약간 증가 (정확도 향상)
-            'dfl': 1.8,                             # ✅ DFL loss 약간 증가
+            'box': 5.0,                             # ✅ Box loss 약간 증가 (정확도 향상)
+            'dfl': 2.0,                             # ✅ DFL loss 약간 증가
             
             # 🚀 Advanced Training Techniques
             'label_smoothing': 0.05,                # ✅ Label smoothing으로 일반화 성능 향상
-            'close_mosaic': 15,                     # ✅ 마지막 15 epochs는 mosaic 비활성화
+            'close_mosaic': 1,                     # ✅ 마지막 15 epochs는 mosaic 비활성화
             
             # 🚀 Dual-Stream Specific Augmentation
-            'mosaic': 0.8,                          # ✅ Mosaic 약간 감소 (안정성)
-            'mixup': 0.1,                           # ✅ Mixup 약간 활성화 (feature mixing)
-            'copy_paste': 0.1,                      # ✅ Copy-paste 약간 활성화
-            'translate': 0.05,                      # ✅ Translation 감소 (feature alignment)
-            'scale': 0.3,                           # ✅ Scale 감소 (안정성)
+            'mosaic': 0.5,                          # ✅ Mosaic 약간 감소 (안정성)
+            'mixup': 0.0,                           # ✅ Mixup 약간 활성화 (feature mixing) 0.3
+            'copy_paste': 0.0,                      # ✅ Copy-paste 약간 활성화 0.1
+            'translate': 0.0,                      # ✅ Translation 감소 (feature alignment) 0.05
+            'scale': 0.5,                           # ✅ Scale 감소 (안정성) 0.3
             'hsv_h': 0.01,                          # ✅ HSV augmentation 감소 (dual-stream 안정성)
             'hsv_s': 0.5,                           # ✅ Saturation 감소
             'hsv_v': 0.2,                           # ✅ Value 감소
