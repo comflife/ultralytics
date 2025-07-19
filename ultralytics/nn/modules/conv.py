@@ -144,8 +144,8 @@ class SpatialAlignedMultiStreamConv(nn.Module):
             
             # 🚀 일관된 블렌딩 전략 (training/inference 동일)
             # 95% narrow 정보 + 5% Gaussian noise로 일관성 확보
-            narrow_strength = 0.95  # narrow 정보 강도
-            noise_strength = 0.05   # noise 유지 비율
+            narrow_strength = 0.6  # narrow 정보 강도
+            noise_strength = 0.4   # noise 유지 비율
             aligned_narrow[:, :, y1:y2, x1:x2] = (
                 narrow_resized * narrow_strength + 
                 aligned_narrow[:, :, y1:y2, x1:x2] * noise_strength

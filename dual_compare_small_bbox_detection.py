@@ -11,12 +11,12 @@ import matplotlib.pyplot as plt
 # =====================
 # 설정
 # =====================
-MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp33/weights/best.pt"  # dual 모델만 사용
+MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp59/weights/best.pt"  # dual 모델만 사용
 WIDE_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/images"
 NARROW_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/val_narrow_images"
 LABEL_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/labels"
 OUTPUT_DIR = "compare_results"
-SMALL_BBOX_THRESH = 30  # 픽셀 (30으로 변경)
+SMALL_BBOX_THRESH = 20  # 20으로 변경
 IOU_THRESH = 0.4
 CONFIDENCE_THRESHOLD = 0.15
 IMAGE_SIZE = 640
@@ -49,7 +49,7 @@ def is_small_bbox(bbox, img_w, img_h, threshold=SMALL_BBOX_THRESH):
     x1, y1, x2, y2 = yolo_to_xyxy(bbox, img_w, img_h)
     w = x2 - x1
     h = y2 - y1
-    return min(w, h) <= threshold
+    return w <= threshold or h <= threshold  # 가로 또는 세로 중 하나라도 threshold 이하
 
 def compute_iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
@@ -145,7 +145,7 @@ def main():
         img_h, img_w = img.shape[:2]
         gt_bboxes = []
         for bbox in gt_bboxes_raw:
-            if bbox['class'] == 9 and is_small_bbox(bbox, img_w, img_h):
+            if is_small_bbox(bbox, img_w, img_h):  # 클래스 제한 없이 작은 박스만
                 xyxy = yolo_to_xyxy(bbox, img_w, img_h)
                 bbox['xyxy'] = xyxy
                 gt_bboxes.append(bbox)
@@ -171,14 +171,13 @@ def main():
             1 for m in matches
             if m[1] is None and 0 <= m[0] < len(gt_bboxes)
         )
-        # === FP: class 9, 30픽셀 이하 예측만 FP로 집계 ===
+        # === FP: 20픽셀 이하, 클래스 제한 없이 ===
         fp = 0
         for j, pred in enumerate(pred_bboxes):
             if j not in used_pred:
-                # pred가 class 9, 30픽셀 이하인지 확인
                 x1, y1, x2, y2 = pred['xyxy']
                 w, h = x2 - x1, y2 - y1
-                if pred['class'] == 9 and max(w, h) <= SMALL_BBOX_THRESH:
+                if w <= SMALL_BBOX_THRESH or h <= SMALL_BBOX_THRESH:
                     fp += 1
         # =============================================
         # === 디버깅: TP가 1개 이상이면서 조건에 맞는 predict 박스가 1개 이상인 이미지 2개만 wide 이미지에 bbox 시각화해서 저장 ===
