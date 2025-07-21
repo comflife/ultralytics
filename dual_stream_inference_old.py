@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image, ImageDraw, ImageFont
 import time
-import random
 
 # 🔧 로컬 ultralytics 모듈을 우선적으로 사용하도록 설정
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -33,12 +32,13 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 # MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp4/weights/best.pt" #good
 MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp61/weights/best.pt"
 
-# 입력 이미지 디렉토리
-WIDE_DIR = "/home/byounggun/ultralytics/swm_total/images/"
-NARROW_DIR = "/home/byounggun/ultralytics/swm_total/narrow_images/"
+# 입력 이미지 경로
+WIDE_IMAGE_PATH = "/home/byounggun/ultralytics/swm_total/images/20250520_01471514.jpg"    # Wide stream 이미지
+NARROW_IMAGE_PATH = "/home/byounggun/ultralytics/swm_total/narrow_images/20250520_01471514.jpg"  # Narrow stream 이미지
 
 # 출력 설정
 OUTPUT_DIR = "inference_results"
+OUTPUT_IMAGE_NAME = "dual_stream_result.jpg"
 
 # 추론 설정
 CONFIDENCE_THRESHOLD = 0.3
@@ -244,25 +244,6 @@ def main():
         print(f"❌ Failed to load model: {e}")
         return
     
-    # 랜덤 이미지 세트 선택
-    wide_files = [f for f in os.listdir(WIDE_DIR) if f.lower().endswith('.jpg')]
-    if not wide_files:
-        print(f"❌ No JPG files found in {WIDE_DIR}")
-        return
-    
-    filename = random.choice(wide_files)
-    WIDE_IMAGE_PATH = os.path.join(WIDE_DIR, filename)
-    NARROW_IMAGE_PATH = os.path.join(NARROW_DIR, filename)
-    
-    if not os.path.exists(NARROW_IMAGE_PATH):
-        print(f"❌ Matching narrow image not found: {NARROW_IMAGE_PATH}")
-        return
-    
-    print(f"🖼️ Selected random image set: {filename}")
-    
-    # 출력 파일 이름 동적 설정
-    OUTPUT_IMAGE_NAME = f"dual_stream_result_{filename}"
-    
     # 2. 이미지 전처리
     print("🖼️ Preprocessing images...")
     try:
@@ -338,8 +319,7 @@ def main():
     cv2.imwrite(str(output_path), result_image)
     
     # 요약 정보도 함께 저장
-    summary_filename = f"inference_summary_{filename.replace('.jpg', '.txt')}"
-    summary_path = output_dir / summary_filename
+    summary_path = output_dir / "inference_summary.txt"
     with open(summary_path, 'w') as f:
         f.write(f"Dual Stream YOLO Inference Results\n")
         f.write(f"=====================================\n")
@@ -362,4 +342,4 @@ def main():
     print("🎉 Inference completed successfully!")
 
 if __name__ == "__main__":
-    main()
+    main() 
