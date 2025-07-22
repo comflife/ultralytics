@@ -1,4 +1,5 @@
 # YOLOv8 🚀 by Ultralytics, AGPL-3.0 license
+# Dual-Stream V3: Aggressive Training Parameters
 
 import argparse
 import os
@@ -193,71 +194,75 @@ def train(cfg, opt, device, callbacks=None):
         # 'iou': 0.7,            # ✅ validation 기본값이지만 train에서는 설정 안함
     }
     
-    # 🔧 특별히 dual stream 모델의 경우 더욱 안정적인 설정
+    # 🔥 V3: AGGRESSIVE dual stream 모델 학습 설정 - 최대 성능 추구
     if is_dual_model or opt.dual_stream:
-        # LOGGER.info("🔧 Applying dual-stream specific training stabilization...")
+        # LOGGER.info("🔥 Applying AGGRESSIVE dual-stream training parameters...")
         
-        # 🚀 Batch Size에 따른 Learning Rate Scaling
-        base_lr = 0.001  # 🔧 더 낮은 base learning rate (0.002 → 0.001)
+        # 🚀 Aggressive Learning Rate Scaling
+        base_lr = 0.005  # 🔥 높은 base learning rate (0.001 → 0.005)
         batch_scale_factor = opt.batch_size / 16  # 기준 batch_size=16
         scaled_lr = base_lr * batch_scale_factor
         
         model_training_args.update({
-            # 🚀 Advanced Optimizer & Learning Rate Optimization
+            # 🚀 AGGRESSIVE Optimizer & Learning Rate Optimization
             'optimizer': 'AdamW',                    # ✅ AdamW가 dual-stream에 더 효과적
-            'lr0': scaled_lr,                        # ✅ Batch size에 따른 scaled learning rate
-            'lrf': 0.001,                           # 🔧 더 낮은 final LR (0.01 → 0.001)
+            'lr0': scaled_lr,                        # 🔥 Aggressive scaled learning rate
+            'lrf': 0.005,                           # 🔥 Higher final LR (0.001 → 0.005)
             'cos_lr': True,                         # ✅ Cosine learning rate scheduler 활성화
-            'momentum': 0.9,                        # 🔧 AdamW beta1 최적화 (0.937 → 0.9)
-            'weight_decay': 0.001,                  # 🔧 더 강한 정규화 (0.0005 → 0.001)
+            'momentum': 0.95,                       # 🔥 Higher momentum (0.9 → 0.95)
+            'weight_decay': 0.0001,                 # 🔥 Lower weight decay for faster learning (0.001 → 0.0001)
             
-            # 🚀 Advanced Warmup Strategy - Dual-stream 안정성
-            'warmup_epochs': 10.0,                  # 🔧 더 긴 warmup (5.0 → 10.0)
-            'warmup_momentum': 0.1,                 # 🔧 더 낮은 초기 momentum (0.5 → 0.1)
-            'warmup_bias_lr': 0.01,                 # 🔧 더 낮은 bias learning rate (0.05 → 0.01)
+            # 🚀 AGGRESSIVE Warmup Strategy - Fast convergence
+            'warmup_epochs': 3.0,                   # 🔥 Shorter warmup (10.0 → 3.0) - 빠른 학습
+            'warmup_momentum': 0.3,                 # 🔥 Higher initial momentum (0.1 → 0.3)
+            'warmup_bias_lr': 0.05,                 # 🔥 Higher bias learning rate (0.01 → 0.05)
             
-            # 🚀 Dual-Stream Loss Optimization
-            'cls': 0.5,                             # 🔧 Classification loss 증가 (0.3 → 0.5)
-            'box': 7.5,                             # 🔧 Box loss 기본값 복원 (5.0 → 7.5)
-            'dfl': 1.5,                             # 🔧 DFL loss 기본값 복원 (2.0 → 1.5)
+            # 🚀 AGGRESSIVE Loss Optimization
+            'cls': 0.8,                             # 🔥 강한 Classification loss (0.5 → 0.8)
+            'box': 10.0,                            # 🔥 강한 Box loss (7.5 → 10.0)
+            'dfl': 2.5,                             # 🔥 강한 DFL loss (1.5 → 2.5)
             
-            # 🚀 Advanced Training Techniques
-            'label_smoothing': 0.1,                 # 🔧 더 강한 label smoothing (0.05 → 0.1)
-            'close_mosaic': 20,                     # 🔧 더 일찍 mosaic 비활성화 (1 → 20)
+            # 🚀 AGGRESSIVE Training Techniques
+            'label_smoothing': 0.2,                 # 🔥 Strong label smoothing (0.1 → 0.2)
+            'close_mosaic': 30,                     # 🔥 Later mosaic disable (20 → 30)
             
-            # 🚀 Dual-Stream Specific Augmentation
-            'mosaic': 0.8,                          # 🔧 Mosaic 증가 (0.5 → 0.8)
-            'mixup': 0.1,                           # 🔧 Mixup 활성화 (0.0 → 0.1)
-            'copy_paste': 0.05,                     # 🔧 Copy-paste 활성화 (0.0 → 0.05)
-            'translate': 0.05,                      # 🔧 Translation 활성화 (0.0 → 0.05)
-            'scale': 0.3,                           # 🔧 Scale 감소 (0.5 → 0.3) - 더 안정적
-            'shear': 0.02,                          # 🔧 Shear 약간 추가 (0.0 → 0.02)
-            'degrees': 5.0,                         # 🔧 Rotation 약간 추가 (0.0 → 5.0)
-            'hsv_h': 0.015,                         # 🔧 HSV-H 기본값으로 복원 (0.01 → 0.015)
-            'hsv_s': 0.7,                           # 🔧 HSV-S 기본값으로 복원 (0.5 → 0.7)
-            'hsv_v': 0.4,                           # 🔧 HSV-V 기본값으로 복원 (0.2 → 0.4)
+            # 🚀 AGGRESSIVE Augmentation - Maximum diversity
+            'mosaic': 1.0,                          # 🔥 Maximum Mosaic (0.8 → 1.0)
+            'mixup': 0.3,                           # 🔥 Strong Mixup (0.1 → 0.3)
+            'copy_paste': 0.2,                      # 🔥 Strong Copy-paste (0.05 → 0.2)
+            'translate': 0.2,                       # 🔥 Strong Translation (0.05 → 0.2)
+            'scale': 0.8,                           # 🔥 Strong Scale (0.3 → 0.8)
+            'shear': 0.1,                           # 🔥 Strong Shear (0.02 → 0.1)
+            'degrees': 15.0,                        # 🔥 Strong Rotation (5.0 → 15.0)
+            'perspective': 0.0002,                  # 🔥 Add perspective transform
+            'hsv_h': 0.03,                          # 🔥 Strong HSV-H (0.015 → 0.03)
+            'hsv_s': 0.9,                           # 🔥 Strong HSV-S (0.7 → 0.9)
+            'hsv_v': 0.6,                           # 🔥 Strong HSV-V (0.4 → 0.6)
+            'flipud': 0.1,                          # 🔥 Add vertical flip (0.0 → 0.1)
+            'fliplr': 0.7,                          # 🔥 Strong horizontal flip (0.5 → 0.7)
             
-            # 🚀 Training Efficiency & Stability
-            'save_period': 5,                       # 🔧 더 자주 저장 (10 → 5)
-            'patience': 30,                         # 🔧 Patience 감소 (50 → 30)
+            # 🚀 AGGRESSIVE Training Efficiency
+            'save_period': 3,                       # 🔥 Very frequent saves (5 → 3)
+            'patience': 15,                         # 🔥 Short patience for fast iteration (30 → 15)
             'amp': True,                            # ✅ Mixed Precision 유지
             
-            # 🚀 Advanced Training Features
-            'rect': False,                          # ✅ Rectangular training 비활성화 (dual-stream 안정성)
+            # 🚀 AGGRESSIVE Training Features
+            'rect': False,                          # ✅ Rectangular training 비활성화
             'multi_scale': True,                    # ✅ Multi-scale training 활성화
+            'dropout': 0.1,                         # 🔥 Add dropout for regularization
             
-            # 🚀 Validation 관련 - dual-stream에 맞는 임계값
+            # 🚀 AGGRESSIVE Validation - Lower thresholds for detection
             # 참고: 이 값들은 validation 시에만 적용됨
         })
         
-        # LOGGER.info(f"🚀 Applied dual-stream optimizations:")
-        # LOGGER.info(f"  Optimizer: AdamW with scaled LR: {scaled_lr:.4f} (batch_size={opt.batch_size})")
-        # LOGGER.info(f"  Cosine LR scheduler enabled with 5-epoch warmup")
-        # LOGGER.info(f"  Enhanced augmentation and loss balancing for dual-stream")
+        # LOGGER.info(f"🔥 Applied AGGRESSIVE dual-stream optimizations:")
+        # LOGGER.info(f"  Optimizer: AdamW with aggressive LR: {scaled_lr:.4f} (batch_size={opt.batch_size})")
+        # LOGGER.info(f"  Strong augmentation: mosaic=1.0, mixup=0.3, rotation=15°")
+        # LOGGER.info(f"  Aggressive loss weighting: cls=0.8, box=10.0, dfl=2.5")
     
     # Start training
-    # LOGGER.info(f"Starting training for {opt.epochs} epochs...")
-    # LOGGER.info(f"🔧 Stability settings: lr0={model_training_args['lr0']}, cls_loss={model_training_args['cls']}")
+    # LOGGER.info(f"Starting AGGRESSIVE training for {opt.epochs} epochs...")
+    # LOGGER.info(f"🔥 Aggressive settings: lr0={model_training_args['lr0']:.4f}, cls_loss={model_training_args['cls']}")
     t0 = time.time()
     
     # Set up dual-stream handling if needed
@@ -282,11 +287,11 @@ def train(cfg, opt, device, callbacks=None):
                 'dual_stream': is_dual_model or opt.dual_stream,
             }
             
-            # 🔥 Dual-stream 모델의 경우 더 관대한 validation 설정
+            # 🔥 Dual-stream 모델의 경우 더 낮은 validation 임계값 (aggressive detection)
             if is_dual_model or opt.dual_stream:
                 val_args.update({
-                    'conf': 0.1,   # ✅ 낮은 confidence threshold (0.25 → 0.1)
-                    'iou': 0.3,    # ✅ 낮은 IoU threshold (0.7 → 0.3)
+                    'conf': 0.05,   # 🔥 Very low confidence threshold (0.1 → 0.05)
+                    'iou': 0.2,     # 🔥 Very low IoU threshold (0.3 → 0.2)
                 })
             
             results = model.val(**val_args)
@@ -335,9 +340,9 @@ def parse_opt(known=False):
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--dual-stream", action="store_true", help="Enable dual-stream training mode")
     
-    # ✅ Stability 관련 옵션 추가
-    parser.add_argument("--lr0", type=float, default=0.001, help="Initial learning rate")
-    parser.add_argument("--stable-training", action="store_true", help="Use extra stable training settings for dual-stream")
+    # ✅ Aggressive training 관련 옵션 추가
+    parser.add_argument("--lr0", type=float, default=0.005, help="Initial learning rate (aggressive default)")
+    parser.add_argument("--aggressive-training", action="store_true", help="Use aggressive training settings for dual-stream")
     
     # Distributed training arguments
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument")
