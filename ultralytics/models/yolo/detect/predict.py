@@ -52,6 +52,12 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "save_feats", False)
+        
+        # 🔴 Depth estimation: preds가 튜플인지 확인 (depth 출력 포함 여부)
+        depth_preds = None
+        if isinstance(preds, tuple) and len(preds) == 2:
+            preds, depth_preds = preds  # detection predictions, depth predictions
+        
         preds = ops.non_max_suppression(
             preds,
             self.args.conf,
@@ -72,7 +78,7 @@ class DetectionPredictor(BasePredictor):
             obj_feats = self.get_obj_feats(self._feats, preds[1])
             preds = preds[0]
 
-        results = self.construct_results(preds, img, orig_imgs, **kwargs)
+        results = self.construct_results(preds, img, orig_imgs, depth_preds=depth_preds, **kwargs)
 
         if save_feats:
             for r, f in zip(results, obj_feats):
@@ -90,7 +96,7 @@ class DetectionPredictor(BasePredictor):
         )  # mean reduce all vectors to same length
         return [feats[idx] if len(idx) else [] for feats, idx in zip(obj_feats, idxs)]  # for each img in batch
 
-    def construct_results(self, preds, img, orig_imgs):
+    def construct_results(self, preds, img, orig_imgs, depth_preds=None):
         """
         Construct a list of Results objects from model predictions.
 
@@ -98,16 +104,22 @@ class DetectionPredictor(BasePredictor):
             preds (List[torch.Tensor]): List of predicted bounding boxes and scores for each image.
             img (torch.Tensor): Batch of preprocessed images used for inference.
             orig_imgs (List[np.ndarray]): List of original images before preprocessing.
+            depth_preds (List[torch.Tensor], optional): List of depth predictions for each image.
 
         Returns:
             (List[Results]): List of Results objects containing detection information for each image.
         """
         return [
-            self.construct_result(pred, img, orig_img, img_path)
-            for pred, orig_img, img_path in zip(preds, orig_imgs, self.batch[0])
+            self.construct_result(pred, img, orig_img, img_path, depth_pred)
+            for pred, orig_img, img_path, depth_pred in zip(
+                preds, 
+                orig_imgs, 
+                self.batch[0], 
+                depth_preds if depth_preds is not None else [None] * len(preds)
+            )
         ]
 
-    def construct_result(self, pred, img, orig_img, img_path):
+    def construct_result(self, pred, img, orig_img, img_path, depth_pred=None):
         """
         Construct a single Results object from one image prediction.
 
@@ -116,9 +128,18 @@ class DetectionPredictor(BasePredictor):
             img (torch.Tensor): Preprocessed image tensor used for inference.
             orig_img (np.ndarray): Original image before preprocessing.
             img_path (str): Path to the original image file.
+            depth_pred (torch.Tensor, optional): Depth prediction tensor for the image.
 
         Returns:
             (Results): Results object containing the original image, image path, class names, and scaled bounding boxes.
         """
         pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
-        return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])
+        
+        # 🔴 Depth estimation: Results 객체에 depth 정보 추가
+        result = Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])
+        
+        # depth_pred가 있으면 Results 객체에 추가
+        if depth_pred is not None:
+            result.depth = depth_pred.cpu().numpy() if hasattr(depth_pred, 'cpu') else depth_pred
+        
+        return result

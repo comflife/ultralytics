@@ -223,9 +223,9 @@ class Instances:
         ... )
     """
 
-    def __init__(self, bboxes, segments=None, keypoints=None, bbox_format="xywh", normalized=True) -> None:
+    def __init__(self, bboxes, segments=None, keypoints=None, bbox_format="xywh", normalized=True, depths=None) -> None:
         """
-        Initialize the object with bounding boxes, segments, and keypoints.
+        Initialize the object with bounding boxes, segments, keypoints, and depths.
 
         Args:
             bboxes (np.ndarray): Bounding boxes, shape (N, 4).
@@ -233,11 +233,13 @@ class Instances:
             keypoints (np.ndarray, optional): Keypoints, shape (N, 17, 3) in format (x, y, visible).
             bbox_format (str, optional): Format of bboxes.
             normalized (bool, optional): Whether the coordinates are normalized.
+            depths (np.ndarray, optional): Depth values, shape (N,).
         """
         self._bboxes = Bboxes(bboxes=bboxes, format=bbox_format)
         self.keypoints = keypoints
         self.normalized = normalized
         self.segments = segments
+        self.depths = depths
 
     def convert_bbox(self, format):
         """
@@ -339,6 +341,7 @@ class Instances:
         """
         segments = self.segments[index] if len(self.segments) else self.segments
         keypoints = self.keypoints[index] if self.keypoints is not None else None
+        depths = self.depths[index] if self.depths is not None else None  # 🔴 Depth 처리 추가
         bboxes = self.bboxes[index]
         bbox_format = self._bboxes.format
         return Instances(
@@ -347,6 +350,7 @@ class Instances:
             keypoints=keypoints,
             bbox_format=bbox_format,
             normalized=self.normalized,
+            depths=depths,  # 🔴 Depth 추가
         )
 
     def flipud(self, h):
@@ -424,6 +428,8 @@ class Instances:
                 self.segments = self.segments[good]
             if self.keypoints is not None:
                 self.keypoints = self.keypoints[good]
+            if self.depths is not None:  # 🔴 Depth 처리 추가
+                self.depths = self.depths[good]
         return good
 
     def update(self, bboxes, segments=None, keypoints=None):
@@ -491,7 +497,10 @@ class Instances:
         else:
             cat_segments = np.concatenate([b.segments for b in instances_list], axis=axis)
         cat_keypoints = np.concatenate([b.keypoints for b in instances_list], axis=axis) if use_keypoint else None
-        return cls(cat_boxes, cat_segments, cat_keypoints, bbox_format, normalized)
+        # 🔴 Depth 정보 연결
+        use_depth = instances_list[0].depths is not None
+        cat_depths = np.concatenate([b.depths for b in instances_list], axis=axis) if use_depth else None
+        return cls(cat_boxes, cat_segments, cat_keypoints, bbox_format, normalized, depths=cat_depths)
 
     @property
     def bboxes(self):

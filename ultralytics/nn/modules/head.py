@@ -75,19 +75,25 @@ class Detect(nn.Module):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, ch: Tuple = ()):
+    def __init__(self, nc: int = 80, ch: Tuple = (), with_depth: bool = False):
         """
         Initialize the YOLO detection layer with specified number of classes and channels.
 
         Args:
             nc (int): Number of classes.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
+            with_depth (bool): Whether to include depth estimation.
         """
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
         self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.with_depth = with_depth  # 🔴 depth estimation 여부
+        
+        if self.with_depth:
+            self.no += 1  # 🔴 depth 채널 추가
+            
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
@@ -105,6 +111,13 @@ class Detect(nn.Module):
                 for x in ch
             )
         )
+        
+        # 🔴 Depth head 추가
+        if self.with_depth:
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, 1, 1)) for x in ch
+            )
+            
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if self.end2end:
@@ -131,7 +144,12 @@ class Detect(nn.Module):
             # print(f"DEBUG: Layer {i} - cv2 range: {cv2_out.min():.4f} ~ {cv2_out.max():.4f}")
             # print(f"DEBUG: Layer {i} - cv3 range: {cv3_out.min():.4f} ~ {cv3_out.max():.4f}")
             
-            x[i] = torch.cat((cv2_out, cv3_out), 1)
+            # 🔴 Depth 출력 추가
+            if self.with_depth:
+                cv4_out = self.cv4[i](x[i])  # depth estimation
+                x[i] = torch.cat((cv2_out, cv3_out, cv4_out), 1)
+            else:
+                x[i] = torch.cat((cv2_out, cv3_out), 1)
             # print(f"DEBUG: Layer {i} - final output shape: {x[i].shape}")
         
         if self.training:  # Training path
@@ -158,11 +176,19 @@ class Detect(nn.Module):
                 Inference mode returns processed detections or tuple with detections and raw outputs.
         """
         x_detach = [xi.detach() for xi in x]
-        one2one = [
-            torch.cat((self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])), 1) for i in range(self.nl)
-        ]
+        if self.with_depth:
+            one2one = [
+                torch.cat((self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i]), self.cv4[i](x_detach[i])), 1) for i in range(self.nl)
+            ]
+        else:
+            one2one = [
+                torch.cat((self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])), 1) for i in range(self.nl)
+            ]
         for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            if self.with_depth:
+                x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), self.cv4[i](x[i])), 1)
+            else:
+                x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
         if self.training:  # Training path
             return {"one2many": x, "one2one": one2one}
 
@@ -189,9 +215,14 @@ class Detect(nn.Module):
 
         if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
             box = x_cat[:, : self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4 :]
+            cls = x_cat[:, self.reg_max * 4 : self.reg_max * 4 + self.nc]
+            if self.with_depth:
+                depth = x_cat[:, self.reg_max * 4 + self.nc :]
         else:
-            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+            if self.with_depth:
+                box, cls, depth = x_cat.split((self.reg_max * 4, self.nc, 1), 1)
+            else:
+                box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
 
         if self.export and self.format in {"tflite", "edgetpu"}:
             # Precompute normalization factor to increase numerical stability
@@ -209,7 +240,10 @@ class Detect(nn.Module):
         else:
             dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
 
-        return torch.cat((dbox, cls.sigmoid()), 1)
+        if self.with_depth:
+            return torch.cat((dbox, cls.sigmoid(), depth.sigmoid()), 1)
+        else:
+            return torch.cat((dbox, cls.sigmoid()), 1)
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
@@ -219,6 +253,12 @@ class Detect(nn.Module):
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+        
+        # 🔴 Depth head bias 초기화
+        if hasattr(self, 'cv4') and self.with_depth:
+            for c in m.cv4:
+                c[-1].bias.data[:] = 0.0  # depth initial bias to 0
+                
         if self.end2end:
             for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
                 a[-1].bias.data[:] = 1.0  # box

@@ -171,6 +171,9 @@ class YOLODataset(BaseDataset):
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         
+        # 🔴 Depth estimation 지원
+        self.with_depth = data.get("with_depth", False) if data else False
+        
         # Dual stream detection
         self.is_dual_stream = False
         self.narrow_path = None
@@ -351,27 +354,31 @@ class YOLODataset(BaseDataset):
                     repeat(nkpt),
                     repeat(ndim),
                     repeat(self.single_cls),
+                    repeat(self.with_depth),  # 🔴 Depth estimation 파라미터 추가
                 ),
             )
             pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+            for im_file, lb, shape, segments, keypoint, depth_values, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
                 nf += nf_f
                 ne += ne_f
                 nc += nc_f
                 if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoint,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
+                    label_dict = {
+                        "im_file": im_file,
+                        "shape": shape,
+                        "cls": lb[:, 0:1],  # n, 1
+                        "bboxes": lb[:, 1:],  # n, 4
+                        "segments": segments,
+                        "keypoints": keypoint,
+                        "normalized": True,
+                        "bbox_format": "xywh",
+                    }
+                    # 🔴 Depth 정보 추가
+                    if self.with_depth and depth_values is not None:
+                        label_dict["depths"] = depth_values  # n, 1
+                    
+                    x["labels"].append(label_dict)
                 if msg:
                     msgs.append(msg)
                 pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
@@ -501,6 +508,7 @@ class YOLODataset(BaseDataset):
         keypoints = label.pop("keypoints", None)
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
+        depths = label.pop("depths", None) 
 
         # NOTE: do NOT resample oriented boxes
         segment_resamples = 100 if self.use_obb else 1000
@@ -512,7 +520,7 @@ class YOLODataset(BaseDataset):
             segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
         else:
             segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
-        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized, depths=depths)  # 🔴 Depth 추가
         return label
 
 
@@ -554,14 +562,22 @@ class YOLODataset(BaseDataset):
                     else:
                         # Single stream case
                         value = torch.stack(value, 0)
-                elif k in {"cls", "bboxes"}:
+                elif k in {"cls", "bboxes", "depths"}:
                     # Only process non-empty tensors
                     valid_tensors = [v for v in value if len(v) > 0]
                     if valid_tensors:
-                        value = torch.cat(valid_tensors, 0)
+                        # Convert to tensors if not already
+                        tensor_list = []
+                        for v in valid_tensors:
+                            if not isinstance(v, torch.Tensor):
+                                v = torch.tensor(v, dtype=torch.float32)
+                            tensor_list.append(v)
+                        value = torch.cat(tensor_list, 0)
                     else:
                         # All tensors are empty
                         if k == "cls":
+                            value = torch.tensor([], dtype=torch.float32)
+                        elif k == "depths":
                             value = torch.tensor([], dtype=torch.float32)
                         else:  # bboxes
                             value = torch.zeros((0, 4), dtype=torch.float32)
@@ -604,6 +620,11 @@ class YOLODataset(BaseDataset):
                 new_batch["batch_idx"] = torch.cat(batch_idx_list, 0)
             else:
                 new_batch["batch_idx"] = torch.tensor([], dtype=torch.long)
+            
+            # 🔴 Depths 정보 확인 및 처리
+            if "depths" not in new_batch:
+                # 빈 텐서로 초기화 (더미 생성하지 않음)
+                new_batch["depths"] = torch.tensor([], dtype=torch.float32)
             
             return new_batch
             

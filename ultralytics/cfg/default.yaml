@@ -43,6 +43,8 @@ mask_ratio: 4 # (int) mask downsample ratio (segment train only)
 # Classification
 dropout: 0.0 # (float) use dropout regularization (classify train only)
 dual_stream: False # (bool) use dual stream training (detect train only)
+with_depth: False # (bool) enable depth estimation (detect train only)
+depth: 1.0 # (float) depth loss gain
 
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) validate/test during training

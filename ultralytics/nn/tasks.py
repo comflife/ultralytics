@@ -120,6 +120,7 @@ from ultralytics.utils.loss import (
     E2EDetectLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
+    v8DetectionLossWithDepth,  # 🔴 Depth estimation loss 추가
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
@@ -546,7 +547,24 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        if getattr(self, "end2end", False):
+            return E2EDetectLoss(self)
+        
+        # 🔴 Depth estimation 지원 확인
+        has_depth = False
+        if hasattr(self.model, '__iter__'):  # Sequential model
+            for module in self.model:
+                if hasattr(module, 'with_depth') and module.with_depth:
+                    has_depth = True
+                    break
+        elif hasattr(self.model, 'with_depth'):  # Single module
+            has_depth = self.model.with_depth
+            
+        # Depth estimation loss 사용
+        if has_depth:
+            return v8DetectionLossWithDepth(self)
+        else:
+            return v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -1462,6 +1480,9 @@ def parse_model(d, ch, verbose=True, dual_stream=False):  # model_dict, input_ch
     max_channels = float("inf")
     nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
+    
+    # 🔴 Depth estimation 설정 추가
+    with_depth = d.get("with_depth", False)
 
     # 여기에 dual_stream 정보 저장 추가
     is_dual_stream_model = dual_stream
@@ -1709,7 +1730,16 @@ def parse_model(d, ch, verbose=True, dual_stream=False):  # model_dict, input_ch
         elif m in frozenset(
             {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
-            args.append([ch[x] for x in f])
+            # 🔴 Detect 모듈에 with_depth 파라미터 처리
+            if m is Detect:
+                # args = [nc, with_depth] → [nc, ch, with_depth]
+                nc_arg = args[0] if args else 80  # nc (number of classes)
+                with_depth_arg = args[1] if len(args) > 1 else False  # with_depth
+                ch_arg = [ch[x] for x in f]  # channels
+                args = [nc_arg, ch_arg, with_depth_arg]
+            else:
+                args.append([ch[x] for x in f])
+                
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:

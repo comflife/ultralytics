@@ -2164,6 +2164,9 @@ class Format:
         labels["img"] = self._format_img(img)
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        # 🔴 Add depth information if available
+        if hasattr(instances, 'depths') and instances.depths is not None:
+            labels["depths"] = torch.from_numpy(instances.depths) if nl else torch.zeros(nl)
         if self.return_keypoint:
             labels["keypoints"] = torch.from_numpy(instances.keypoints)
             if self.normalize:

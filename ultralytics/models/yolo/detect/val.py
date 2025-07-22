@@ -146,15 +146,25 @@ class DetectionValidator(BaseValidator):
         # print(f"DEBUG: ===== VAL POSTPROCESS DEBUG =====")
         # print(f"DEBUG: Postprocess preds type: {type(preds)}")
         
-        # ✅ 표준 YOLO 출력 처리: (inference_output, raw_predictions)
-        if isinstance(preds, tuple) and len(preds) == 2:
-            inference_output, raw_predictions = preds
-            # print(f"DEBUG: Standard YOLO format: (inference_output, raw_predictions)")
-            # print(f"DEBUG: Inference output type: {type(inference_output)}")
-            # print(f"DEBUG: Raw predictions type: {type(raw_predictions)}")
-            
-            # inference output을 NMS에 사용
-            preds = inference_output
+        # ✅ 표준 YOLO 출력 처리: (inference_output, raw_predictions) 또는 depth 포함된 경우
+        if isinstance(preds, tuple):
+            if len(preds) == 2:
+                # Case 1: 표준 YOLO format (inference_output, raw_predictions)
+                # Case 2: Depth estimation format (detection_preds, depth_preds)
+                inference_output, second_output = preds
+                # print(f"DEBUG: Tuple format with length 2")
+                # print(f"DEBUG: Inference output type: {type(inference_output)}")
+                # print(f"DEBUG: Second output type: {type(second_output)}")
+                
+                # inference output을 NMS에 사용 (depth는 mAP 계산에 사용하지 않음)
+                preds = inference_output
+            elif len(preds) == 3:
+                # Case 3: 확장된 경우 (detection_preds, depth_preds, other_output)
+                inference_output = preds[0]
+                preds = inference_output
+            else:
+                # Default: 첫 번째 요소를 사용
+                preds = preds[0]
         
         # if isinstance(preds, (list, tuple)):
         #     print(f"DEBUG: Postprocess preds length: {len(preds)}")

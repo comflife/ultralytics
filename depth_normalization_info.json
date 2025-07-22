@@ -1,0 +1,8 @@
+{
+  "min_depth": -1.0,
+  "max_depth": 419.1,
+  "mean_depth": 42.94297941283277,
+  "std_depth": 30.838286412390765,
+  "total_labels": 178995,
+  "normalization_method": "min_max"
+}

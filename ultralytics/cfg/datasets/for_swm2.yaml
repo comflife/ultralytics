@@ -28,18 +28,15 @@ names:
   26: red_left_on
   27: unknown
 nc: 28
-# path: /home/byounggun/ultralytics/swm
-path: /home/byounggun/ultralytics/swm_total
+with_depth: True  # 🔴 Depth estimation 활성화
+
+path: /home/byounggun/ultralytics/swm_dual_split
 # Standard required keys
 train: /home/byounggun/ultralytics/swm_total/images  # Ultralytics requires these keys
 val: /home/byounggun/ultralytics/swm_total/images    # Ultralytics requires these keys
-# Dual stream custom keys
-# train_wide: /home/byounggun/ultralytics/swm/images
-# train_narrow: /home/byounggun/ultralytics/swm/images
-# val_wide: /home/byounggun/ultralytics/swm/images
-# val_narrow: /home/byounggun/ultralytics/swm/images
 
-train_wide: /home/byounggun/ultralytics/swm_total/images
-train_narrow: /home/byounggun/ultralytics/swm_total/narrow_images
-val_wide: /home/byounggun/ultralytics/swm_total/images
-val_narrow: /home/byounggun/ultralytics/swm_total/narrow_images
+
+train_wide: /home/byounggun/ultralytics/swm_dual_split/train/images
+train_narrow: /home/byounggun/ultralytics/swm_dual_split/train/train_narrow_images
+val_wide: /home/byounggun/ultralytics/swm_dual_split/val/images
+val_narrow: /home/byounggun/ultralytics/swm_dual_split/val/val_narrow_images

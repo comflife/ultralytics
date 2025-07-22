@@ -290,7 +290,20 @@ class DetectionTrainer(BaseTrainer):
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        # 🔴 Depth estimation 지원 확인
+        has_depth = False
+        if hasattr(self.model, 'model') and hasattr(self.model.model, '__iter__'):
+            for module in self.model.model:
+                if hasattr(module, 'with_depth') and module.with_depth:
+                    has_depth = True
+                    break
+        
+        # Loss names 설정 (depth loss 포함)
+        if has_depth:
+            self.loss_names = "box_loss", "cls_loss", "dfl_loss", "depth_loss"
+        else:
+            self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+            
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
