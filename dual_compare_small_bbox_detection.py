@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 # =====================
 # 설정
 # =====================
-MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp59/weights/best.pt"  # dual 모델만 사용
+MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp108/weights/best.pt"  # dual 모델만 사용
 WIDE_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/images"
 NARROW_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/val_narrow_images"
 LABEL_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/labels"
