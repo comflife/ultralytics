@@ -292,7 +292,7 @@ def export_dual_model_to_onnx_custom(
 
 def main():
     parser = argparse.ArgumentParser(description='Export YOLO Dual-Stream model to ONNX with DUAL STREAM INPUT')
-    parser.add_argument('model', type=str, help='Path to trained .pt model file')
+    parser.add_argument('model', type=str, help='Path to trained .pt model file', default='')
     parser.add_argument('--output', type=str, help='Output ONNX file path')
     parser.add_argument('--imgsz', type=int, default=640, help='Input image size')
     parser.add_argument('--half', action='store_true', help='Export in FP16 precision')

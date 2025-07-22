@@ -507,7 +507,7 @@ def main():
     parser.add_argument('--image', type=str, default=None,
                        help='Specific image name to test (optional, random if not specified)')
     parser.add_argument('--model', type=str,
-                       default='/home/byounggun/ultralytics/runs/train/exp33/weights/best_dual_stream.onnx',
+                       default='/home/byounggun/ultralytics/runs/train/exp108/weights/best_dual_stream.onnx',
                        help='Path to ONNX model')
     parser.add_argument('--conf', type=float, default=0.5,
                        help='Confidence threshold')
