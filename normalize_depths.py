@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-라벨 파일의 depth 값을 normalize하는 스크립트
+라벨 파일의 depth 값을 분석하고, 0 또는 음수 값을 0.1로 대체한 후 normalize하는 스크립트
 """
 
 import os
@@ -9,7 +9,7 @@ from pathlib import Path
 import json
 
 def analyze_and_normalize_depths():
-    """라벨 파일들의 depth 값을 분석하고 normalize"""
+    """라벨 파일들의 depth 값을 분석하고, 0 또는 음수를 0.1로 대체한 후 normalize"""
     
     # 타겟 디렉토리들
     label_dirs = [
@@ -19,8 +19,9 @@ def analyze_and_normalize_depths():
     
     all_depths = []
     total_labels = 0
+    replaced_depth_count = 0
     
-    # 1단계: 모든 depth 값 수집
+    # 1단계: depth 값 수집 (0 또는 음수는 0.1로 대체)
     print("🔍 1단계: 모든 라벨 파일에서 depth 값 수집...")
     
     for label_dir in label_dirs:
@@ -41,8 +42,13 @@ def analyze_and_normalize_depths():
                     parts = line.strip().split()
                     if len(parts) >= 6:  # class x y w h depth
                         depth = float(parts[5])
-                        all_depths.append(depth)
                         total_labels += 1
+                        if depth <= 0:  # 0 또는 음수는 0.1로 대체
+                            all_depths.append(0.1)
+                            replaced_depth_count += 1
+                            print(f"⚠️ 무효한 depth 값 (≤0) 대체: {label_file.name}, depth={depth} -> 0.1")
+                        else:
+                            all_depths.append(depth)
                     elif len(parts) == 5:  # depth 값이 없는 경우
                         print(f"⚠️ depth 값이 없는 라벨: {label_file.name}")
                         
@@ -53,7 +59,7 @@ def analyze_and_normalize_depths():
         print("❌ depth 값이 발견되지 않았습니다!")
         return
         
-    # 2단계: 통계 분석
+    # 2단계: depth 값 통계 분석
     all_depths = np.array(all_depths)
     min_depth = np.min(all_depths)
     max_depth = np.max(all_depths)
@@ -62,6 +68,7 @@ def analyze_and_normalize_depths():
     
     print(f"\n📊 Depth 값 통계:")
     print(f"   총 라벨 수: {total_labels}")
+    print(f"   대체된 depth 수 (0 또는 음수 -> 0.1): {replaced_depth_count}")
     print(f"   최소값: {min_depth:.6f}")
     print(f"   최대값: {max_depth:.6f}")
     print(f"   평균값: {mean_depth:.6f}")
@@ -80,6 +87,7 @@ def analyze_and_normalize_depths():
         "mean_depth": float(mean_depth),
         "std_depth": float(std_depth),
         "total_labels": int(total_labels),
+        "replaced_depth_count": int(replaced_depth_count),
         "normalization_method": "min_max"
     }
     
@@ -115,14 +123,12 @@ def analyze_and_normalize_depths():
                     parts = line.strip().split()
                     if len(parts) >= 6:  # class x y w h depth
                         original_depth = float(parts[5])
+                        # 0 또는 음수는 0.1로 대체
+                        depth_to_normalize = 0.1 if original_depth <= 0 else original_depth
                         # Min-Max 정규화
-                        normalized_depth = (original_depth - min_depth) / (max_depth - min_depth)
-                        
-                        # 새로운 라인 생성
+                        normalized_depth = (depth_to_normalize - min_depth) / (max_depth - min_depth)
                         parts[5] = f"{normalized_depth:.6f}"
-                        normalized_line = " ".join(parts) + "\n"
-                        normalized_lines.append(normalized_line)
-                        
+                        normalized_lines.append(" ".join(parts) + "\n")
                         file_changed = True
                         processed_labels += 1
                     else:
