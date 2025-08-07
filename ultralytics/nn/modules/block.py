@@ -335,6 +335,60 @@ class C3(nn.Module):
         """Forward pass through the CSP bottleneck with 3 convolutions."""
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
+# class MultiStreamC3(nn.Module):  # C3 상속하지 않음!
+#     """Multi-stream CSP Bottleneck that outputs fused single stream."""
+
+#     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+#         """
+#         Initialize multi-stream C3 module.
+#         Args:
+#             c1 (int): Input channels per stream.
+#             c2 (int): Output channels (fused).
+#         """
+#         super().__init__()
+        
+#         # 각 stream을 독립적으로 처리할 C3 생성
+#         self.stream1_c3 = C3(c1, c1, n, shortcut, g, e)  # stream1용
+#         self.stream2_c3 = C3(c1, c1, n, shortcut, g, e)  # stream2용
+        
+#         # Fusion layer: 2*c1 → c2
+#         self.fusion_conv = Conv(2 * c1, c2, 1, 1)
+        
+#     def forward(self, x):
+
+        
+#         if x.dim() == 5 and x.shape[1] == 2:
+#             # Dual stream: [B, 2, C, H, W]
+#             stream1 = x[:, 0]  # [B, C, H, W]
+#             stream2 = x[:, 1]  # [B, C, H, W]
+            
+
+            
+#             # 각 stream 독립 처리
+#             out1 = self.stream1_c3(stream1)
+#             out2 = self.stream2_c3(stream2)
+            
+
+            
+#             # Concatenate and fuse
+#             fused = torch.cat([out1, out2], dim=1)
+
+            
+#             result = self.fusion_conv(fused)
+
+            
+#             return result
+            
+#         elif x.dim() == 4:
+#             # Single stream: [B, C, H, W]
+#             # 두 stream으로 복제
+#             out1 = self.stream1_c3(x)
+#             out2 = self.stream2_c3(x)
+#             fused = torch.cat([out1, out2], dim=1)
+#             return self.fusion_conv(fused)
+#         else:
+#             raise ValueError(f"Expected 4D or 5D input, got {x.shape}")
+
 class MultiStreamC3(nn.Module):  # C3 상속하지 않음!
     """Multi-stream CSP Bottleneck that outputs fused single stream."""
 
@@ -347,47 +401,119 @@ class MultiStreamC3(nn.Module):  # C3 상속하지 않음!
         """
         super().__init__()
         
-        # 각 stream을 독립적으로 처리할 C3 생성
-        self.stream1_c3 = C3(c1, c1, n, shortcut, g, e)  # stream1용
-        self.stream2_c3 = C3(c1, c1, n, shortcut, g, e)  # stream2용
+        # Shared C3 for grouped processing
+        self.c3 = C3(2 * c1, 2 * c1, n, shortcut, g=2, e=e)
+        
+        # Copy weights to ensure sharing between groups
+        def copy_weights(module):
+            if isinstance(module, Conv):
+                if module.conv.groups == 2:
+                    c_out_half = module.conv.out_channels // 2
+                    module.conv.weight.data[c_out_half:] = module.conv.weight.data[:c_out_half]
+                    if module.conv.bias is not None:
+                        module.conv.bias.data[c_out_half:] = module.conv.bias.data[:c_out_half]
+            for child in module.children():
+                copy_weights(child)
+        
+        copy_weights(self.c3)
         
         # Fusion layer: 2*c1 → c2
         self.fusion_conv = Conv(2 * c1, c2, 1, 1)
         
     def forward(self, x):
-
-        
         if x.dim() == 5 and x.shape[1] == 2:
             # Dual stream: [B, 2, C, H, W]
-            stream1 = x[:, 0]  # [B, C, H, W]
-            stream2 = x[:, 1]  # [B, C, H, W]
+            B, streams, C, H, W = x.shape
             
-
+            # Reshape to concatenated channels: [B, 2*C, H, W]
+            x_reshaped = x.reshape(B, 2 * C, H, W)
             
-            # 각 stream 독립 처리
-            out1 = self.stream1_c3(stream1)
-            out2 = self.stream2_c3(stream2)
+            # Process with grouped C3
+            out = self.c3(x_reshaped)  # [B, 2*C_out, H_out, W_out] where C_out = c1
             
-
-            
-            # Concatenate and fuse
-            fused = torch.cat([out1, out2], dim=1)
-
-            
-            result = self.fusion_conv(fused)
-
+            # Fuse
+            result = self.fusion_conv(out)
             
             return result
             
         elif x.dim() == 4:
             # Single stream: [B, C, H, W]
-            # 두 stream으로 복제
-            out1 = self.stream1_c3(x)
-            out2 = self.stream2_c3(x)
-            fused = torch.cat([out1, out2], dim=1)
-            return self.fusion_conv(fused)
+            B, C, H, W = x.shape
+            # Duplicate channels
+            x_dupl = torch.cat((x, x), dim=1)  # [B, 2*C, H, W]
+            
+            # Process with grouped C3
+            out = self.c3(x_dupl)  # [B, 2*C_out, H_out, W_out]
+            
+            # Fuse
+            result = self.fusion_conv(out)
+            
+            return result
         else:
             raise ValueError(f"Expected 4D or 5D input, got {x.shape}")
+        
+# class MultiStreamC2f(nn.Module):  # C2f 상속하지 않음!
+#     """Multi-stream CSP Bottleneck that outputs fused single stream."""
+
+#     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+#         """
+#         Initialize multi-stream C2f module.
+#         Args:
+#             c1 (int): Input channels per stream.
+#             c2 (int): Output channels (fused).
+#         """
+#         super().__init__()
+        
+#         # Shared C2f for grouped processing
+#         self.c2f = C2f(2 * c1, 2 * c1, n, shortcut, g=2, e=e)
+        
+#         # Copy weights to ensure sharing between groups
+#         def copy_weights(module):
+#             if isinstance(module, Conv):
+#                 if module.conv.groups == 2:
+#                     c_out_half = module.conv.out_channels // 2
+#                     module.conv.weight.data[c_out_half:] = module.conv.weight.data[:c_out_half]
+#                     if module.conv.bias is not None:
+#                         module.conv.bias.data[c_out_half:] = module.conv.bias.data[:c_out_half]
+#             for child in module.children():
+#                 copy_weights(child)
+        
+#         copy_weights(self.c2f)
+        
+#         # Fusion layer: 2*c1 → c2
+#         self.fusion_conv = Conv(2 * c1, c2, 1, 1)
+        
+#     def forward(self, x):
+#         if x.dim() == 5 and x.shape[1] == 2:
+#             # Dual stream: [B, 2, C, H, W]
+#             B, streams, C, H, W = x.shape
+            
+#             # Reshape to concatenated channels: [B, 2*C, H, W]
+#             x_reshaped = x.reshape(B, 2 * C, H, W)
+            
+#             # Process with grouped C2f
+#             out = self.c2f(x_reshaped)  # [B, 2*C_out, H_out, W_out] where C_out = c1
+            
+#             # Fuse
+#             result = self.fusion_conv(out)
+            
+#             return result
+            
+#         elif x.dim() == 4:
+#             # Single stream: [B, C, H, W]
+#             B, C, H, W = x.shape
+#             # Duplicate channels
+#             x_dupl = torch.cat((x, x), dim=1)  # [B, 2*C, H, W]
+            
+#             # Process with grouped C2f
+#             out = self.c2f(x_dupl)  # [B, 2*C_out, H_out, W_out]
+            
+#             # Fuse
+#             result = self.fusion_conv(out)
+            
+#             return result
+#         else:
+#             raise ValueError(f"Expected 4D or 5D input, got {x.shape}")
 
 class C3x(C3):
     """C3 module with cross-convolutions."""

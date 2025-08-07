@@ -283,6 +283,192 @@ class v8DetectionLoss:
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
 
+class v8DetectionLossWithDepth:
+    """Criterion class for computing training losses for YOLOv8 object detection with depth estimation."""
+
+    def __init__(self, model, tal_topk=10, depth_weight=0.7, huber_delta=0.7):  # model must be de-paralleled
+        """Initialize v8DetectionLossWithDepth with model parameters, task-aligned assignment settings, and depth loss hyperparameters."""
+        device = next(model.parameters()).device  # get model device
+        h = model.args  # hyperparameters
+
+        m = model.model[-1]  # Detect() module
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.hyp = h
+        self.stride = m.stride  # model strides
+        self.nc = m.nc  # number of classes
+        self.no = m.nc + m.reg_max * 4 + 1  # +1 for depth channel
+        self.reg_max = m.reg_max
+        self.device = device
+
+        self.use_dfl = m.reg_max > 1
+
+        self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+        # Depth loss hyperparameters
+        self.depth_weight = depth_weight  # Weight for depth loss
+        self.huber_delta = huber_delta    # Delta for Huber loss
+
+    def preprocess(self, targets, batch_size, scale_tensor):
+        """Preprocess targets by converting to tensor format and scaling coordinates, including depth."""
+        nl, ne = targets.shape
+        if nl == 0:
+            out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), ne - 1, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                if n := matches.sum():
+                    out[j, :n] = targets[matches, 1:]
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        return out
+
+    def bbox_decode(self, anchor_points, pred_dist):
+        """Decode predicted object bounding box coordinates from anchor points and distribution."""
+        if self.use_dfl:
+            b, a, c = pred_dist.shape  # batch, anchors, channels
+            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+        return dist2bbox(pred_dist, anchor_points, xywh=False)
+
+    def huber_loss(self, pred_depth, gt_depth):
+        """Compute Huber loss for depth."""
+        r = gt_depth - pred_depth
+        abs_r = torch.abs(r)
+        return torch.where(abs_r <= self.huber_delta, 0.5 * r ** 2, self.huber_delta * (abs_r - 0.5 * self.huber_delta))
+
+    def relative_loss(self, pred_depth, gt_depth):
+        """Compute relative error loss for depth with stability."""
+        # Add epsilon to prevent division by zero
+        eps = 1e-8
+        return torch.abs(gt_depth - pred_depth) / (gt_depth + eps)
+    
+    def scale_invariant_loss(self, pred_depth, gt_depth):
+        """Compute scale-invariant depth loss (more suitable for normalized depths)."""
+        eps = 1e-6  # Increased for FP16 compatibility
+        # Cast to FP32 to prevent underflow
+        pred = pred_depth.to(torch.float32)
+        gt = gt_depth.to(torch.float32)
+        log_pred = torch.log(pred + eps)
+        log_gt = torch.log(gt + eps)
+        
+        diff = log_pred - log_gt
+        n = diff.numel()
+        if n == 0:
+            return torch.tensor(0.0, device=self.device)
+        scale_inv_loss = torch.mean(diff ** 2) - (torch.sum(diff) ** 2) / (n ** 2)
+        return scale_inv_loss
+
+    def __call__(self, preds, batch):
+        """Calculate the sum of the loss for box, cls, dfl, and depth multiplied by batch size."""
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, depth
+        feats = preds[1] if isinstance(preds, tuple) else preds
+        # Split into distri, scores, and depths (assuming last channel is depth)
+        pred_distri, pred_scores, pred_depths = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc, 1), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        pred_depths = pred_depths.permute(0, 2, 1).contiguous().squeeze(-1)  # (b, h*w)
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets (now including depth: assume batch["depths"] is provided as (nl, ) tensor)
+        if "depths" not in batch:
+            # Create dummy depths if missing
+            n_objects = len(batch["cls"])
+            batch["depths"] = torch.ones(n_objects, dtype=torch.float32, device=self.device)
+        
+        # Ensure all tensors are on the same device
+        batch["batch_idx"] = batch["batch_idx"].to(self.device)
+        batch["cls"] = batch["cls"].to(self.device)
+        batch["bboxes"] = batch["bboxes"].to(self.device)
+        batch["depths"] = batch["depths"].to(self.device)
+        
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"], batch["depths"].view(-1, 1)), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes, gt_depths = targets.split((1, 4, 1), 2)  # cls, xyxy, depth
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+
+        _, target_bboxes, target_scores, fg_mask, target_indices = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+
+        # Depth loss (only for foreground anchors)
+        # Depth loss (only for foreground anchors)
+        if fg_mask.sum() > 0:
+            batch_idx = torch.arange(batch_size, device=self.device).view(-1, 1).expand_as(target_indices)
+            target_depths_all = gt_depths[batch_idx, target_indices].squeeze(-1)  # (b, h*w)
+            target_depths = target_depths_all[fg_mask]  # (num_fg)
+            pred_depths_fg = pred_depths[fg_mask]  # (num_fg)
+            
+            # Apply sigmoid activation for normalized depth values [0, 1]
+            pred_depths_fg = torch.sigmoid(pred_depths_fg)
+            
+            # Ensure target depths are in valid range and not zero
+            target_depths = torch.clamp(target_depths, min=1e-6, max=1.0)
+            pred_depths_fg = torch.clamp(pred_depths_fg, min=1e-6, max=1.0)
+            
+            # Mask out invalid depths (e.g., normalized 0 from original -1.0)
+            valid_depth_mask = target_depths > 1e-5  # Adjust threshold if needed
+            if valid_depth_mask.sum() > 0:
+                pred_depths_fg = pred_depths_fg[valid_depth_mask]
+                target_depths = target_depths[valid_depth_mask]
+                
+                # Compute losses
+                l1_loss = F.l1_loss(pred_depths_fg, target_depths, reduction='none')
+                scale_inv_loss = self.scale_invariant_loss(pred_depths_fg, target_depths)
+                
+                # Combine losses
+                total_depth_loss = l1_loss.mean() + 0.1 * scale_inv_loss
+                loss[3] = total_depth_loss
+                
+                # Debug output
+                if torch.isnan(loss[3]) or torch.isinf(loss[3]):
+                    print(f"🚨 Depth loss issue:")
+                    print(f"  pred_depths_fg range: [{pred_depths_fg.min():.6f}, {pred_depths_fg.max():.6f}]")
+                    print(f"  target_depths range: [{target_depths.min():.6f}, {target_depths.max():.6f}]")
+                    print(f"  l1_loss: {l1_loss.mean():.6f}")
+                    print(f"  scale_inv_loss: {scale_inv_loss:.6f}")
+                    loss[3] = torch.tensor(0.0, device=self.device)
+            else:
+                loss[3] = torch.tensor(0.0, device=self.device)  # No valid depths
+                
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= self.depth_weight  # depth gain
+
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, depth)
+
+
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 

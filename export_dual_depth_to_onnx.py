@@ -6,7 +6,7 @@ Exports yolov8-dual.yaml trained model with depth estimation to ONNX format
 
 """
 # 기본 변환
-python export_dual_depth_to_onnx.py /home/byounggun/ultralytics/runs/train/exp135/weights/best.pt
+python export_dual_depth_to_onnx.py /home/byounggun/ultralytics/runs/train/exp149/weights/best.pt
 
 # 추론 예제도 함께 생성
 python export_dual_depth_to_onnx.py /path/to/your/best.pt --create-example
@@ -35,6 +35,7 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 try:
     from ultralytics import YOLO
     import ultralytics
+
     print(f"✅ Using ultralytics from: {ultralytics.__file__}")
 except ImportError as e:
     print(f"❌ Failed to import ultralytics: {e}")
