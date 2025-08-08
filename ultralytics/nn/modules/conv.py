@@ -80,90 +80,93 @@ class MultiStreamConv(nn.Module):
 
 
 
+
 class SpatialAlignedMultiStreamConv(nn.Module):
-    """공간적으로 정렬된 듀얼 스트림 Conv - Pooling과 Padding을 이용한 NPU 호환 버전"""
-    
+    """
+    모든 NPU 미지원 연산자를 회피하도록 최종 수정된 버전.
+    Slice Assignment 대신 F.pad를 사용하여 공간 정렬을 수행합니다.
+    """
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
-        self.conv = Conv(c1, c2, k, s, autopad(k, p, d), g=g, d=d, act=act)
-        # Optional share weights
-        if c2 % 2 == 0:
-            half = c2 // 2
-            self.conv.conv.weight.data[half : c2] = self.conv.conv.weight.data[0 : half]
-            if self.conv.conv.bias is not None:
-                self.conv.conv.bias.data[half : c2] = self.conv.conv.bias.data[0 : half]
-        
-        # Narrow FOV 정보
+        c_in_half = c1 // 2
+        if c1 % 2 != 0:
+            raise ValueError("Input channels 'c1' must be divisible by 2.")
+
+        # 각 스트림을 위한 독립 Conv 레이어
+        self.wide_processor = Conv(c_in_half, c_in_half, k=3, s=1, p=1, g=g, d=d, act=act)
+        self.narrow_processor = Conv(c_in_half, c_in_half, k=3, s=1, p=1, g=g, d=d, act=act)
+
+        # NPU 호환 피처 축소기 (AvgPool2d)
+        self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2)
+
+        # Narrow FOV 기하학적 정보
         self.narrow_bbox = {
             'center_x': 0.499289, 'center_y': 0.499912,
             'width': 0.286041, 'height': 0.291975
         }
-        self.narrow_weight = nn.Parameter(torch.tensor(0.5))
 
-        # 🔴 NPU 호환을 위한 AvgPool2d 레이어 정의
-        # 예시로 2배 축소. 이 값은 실제 wide/narrow 해상도 비율에 맞춰 조정해야 합니다.
-        self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2) 
+        # 최종 융합 Conv 레이어
+        self.fusion_conv = Conv(c_in_half, c2, k=k, s=s, p=p, g=g, d=d, act=act)
+
+    def forward(self, x):
+        # 1. 스트림 분리
+        c_half = x.shape[1] // 2
+        wide_feature = x[:, :c_half]
+        narrow_feature = x[:, c_half:]
+
+        # 2. 독립 처리
+        wide_processed = self.wide_processor(wide_feature)
+        narrow_processed = self.narrow_processor(narrow_feature)
+
+        # 3. 공간 정렬 및 융합
+        # 3a. Narrow 피처 축소
+        narrow_downscaled = self.downscaler(narrow_processed)
         
-    def place_narrow_in_wide_space(self, narrow_tensor, target_size):
-        """Pooling으로 축소 후 Padding으로 배치"""
-        B, C, H_narrow_in, W_narrow_in = narrow_tensor.shape
-        H_wide, W_wide = target_size
-
-        # 1. AvgPool2d를 이용해 narrow_tensor를 NPU 친화적으로 축소
-        narrow_downscaled = self.downscaler(narrow_tensor)
-        _, _, H_narrow, W_narrow = narrow_downscaled.shape
-
-        # 2. 배경 텐서 생성
-        noise_std = 0.02
-        # aligned_narrow = torch.randn((B, C, H_wide, W_wide), 
-        #                            device=narrow_tensor.device, 
-        #                            dtype=narrow_tensor.dtype) * noise_std
-        # ✅ NPU 호환을 위해 고정된 값(0)으로 채워진 텐서를 생성합니다.
-        aligned_narrow = torch.zeros((B, C, H_wide, W_wide), 
-                                    device=narrow_tensor.device, 
-                                    dtype=narrow_tensor.dtype)
+        # 3b. F.pad를 이용해 정렬된 캔버스 생성
+        aligned_narrow_canvas = self.place_feature_with_pad(narrow_downscaled, wide_processed.shape)
         
-        # 3. 축소된 narrow_tensor를 붙여넣을 위치 계산
+        # 4. 융합 (덧셈)
+        fused_feature = wide_processed + aligned_narrow_canvas
+
+        # 5. 최종 Conv
+        output = self.fusion_conv(fused_feature)
+        return output
+
+    def place_feature_with_pad(self, narrow_feature, wide_shape):
+        """
+        F.pad를 사용하여 작은 피처맵 주위에 0을 채워 큰 피처맵과 크기를 맞춥니다.
+        이것이 NPU에서 'Expand'를 제거하는 최종 해결책입니다.
+        """
+        B, C, H_wide, W_wide = wide_shape
+        _, _, H_narrow, W_narrow = narrow_feature.shape
+
+        # 배치될 중앙 위치 계산
         center_x_pixel = self.narrow_bbox['center_x'] * W_wide
         center_y_pixel = self.narrow_bbox['center_y'] * H_wide
         
-        x_start = int(center_x_pixel - W_narrow / 2)
-        y_start = int(center_y_pixel - H_narrow / 2)
+        # 패딩 계산
+        pad_left = int(center_x_pixel - W_narrow / 2)
+        pad_top = int(center_y_pixel - H_narrow / 2)
 
-        # 4. 슬라이싱으로 값 복사
-        x_end = x_start + W_narrow
-        y_end = y_start + H_narrow
+        # 패딩 값은 (왼쪽, 오른쪽, 위, 아래) 순서
+        # 오른쪽과 아래쪽 패딩은 전체 크기에서 시작점과 피처 크기를 빼서 계산
+        pad_right = W_wide - (pad_left + W_narrow)
+        pad_bottom = H_wide - (pad_top + H_narrow)
         
-        # 경계 체크
-        x_start_c, y_start_c = max(0, x_start), max(0, y_start)
-        x_end_c, y_end_c = min(W_wide, x_end), min(H_wide, y_end)
+        # 패딩 값이 음수가 되지 않도록 보정 (만약 피처가 캔버스보다 크거나 경계에 걸칠 경우)
+        # 이 로직은 피처가 캔버스 안에 완전히 들어온다고 가정할 때 가장 간단합니다.
+        # 복잡한 경계 처리가 필요하다면 추가 로직이 필요하지만, 대부분의 경우 아래 코드로 충분합니다.
+        if pad_left < 0 or pad_top < 0 or pad_right < 0 or pad_bottom < 0:
+            # 경계를 벗어나는 경우에 대한 안전장치 (이 경우는 거의 발생하지 않아야 함)
+            # 가장 간단한 방법은 그냥 0으로 채워진 캔버스를 반환하는 것
+            print("Warning: Feature placement is out of bounds. Returning zero canvas.")
+            return torch.zeros(wide_shape, device=narrow_feature.device, dtype=narrow_feature.dtype)
 
-        if (x_end_c > x_start_c) and (y_end_c > y_start_c):
-            # 원본에서 가져올 부분과 대상에 붙여넣을 부분 계산
-            src_x_start, src_y_start = x_start_c - x_start, y_start_c - y_start
-            src_x_end, src_y_end = src_x_start + (x_end_c - x_start_c), src_y_start + (y_end_c - y_start_c)
-            
-            source_region = narrow_downscaled[:, :, src_y_start:src_y_end, src_x_start:src_x_end]
-            aligned_narrow[:, :, y_start_c:y_end_c, x_start_c:x_end_c] = source_region
-            
-        return aligned_narrow
-
-    def forward(self, x):
-        if x.dim() == 4:
-            B, C_total, H, W = x.shape
-            C = C_total // 2
-            wide = x[:, :C]
-            narrow = x[:, C:]
-            
-            # place_narrow_in_wide_space 함수는 이제 NPU 친화적으로 동작
-            narrow_aligned = self.place_narrow_in_wide_space(narrow, (H, W))
-            
-            narrow_weighted = narrow_aligned * torch.sigmoid(self.narrow_weight)
-            x_concat = torch.cat([wide, narrow_weighted], dim=1)
-            out = self.conv(x_concat)
-            return out
-        else:
-            raise ValueError(f"Expected 4D input [B, {self.conv.conv.in_channels}, H, W], got {x.shape}")
+        # F.pad 적용
+        # padding 튜플은 마지막 차원부터 역순으로 (pad_left, pad_right, pad_top, pad_bottom)
+        padded_feature = F.pad(narrow_feature, (pad_left, pad_right, pad_top, pad_bottom), "constant", 0)
+        
+        return padded_feature
 
 # class SpatialAlignedMultiStreamConv(nn.Module):
 #     """공간적으로 정렬된 듀얼 스트림 Conv - 개선 버전 (4D NPU 호환)"""
