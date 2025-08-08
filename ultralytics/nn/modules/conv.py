@@ -1,4 +1,3 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Convolution modules."""
 
 import math
@@ -27,54 +26,23 @@ __all__ = (
 )
 
 
-def autopad(k, p=None, d=1):  # kernel, padding, dilation
+def autopad(k, p=None, d=1):
     """Pad to 'same' shape outputs."""
     if d > 1:
-        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
+        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
     if p is None:
-        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
+        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
     return p
 
-# class MultiStreamConv(nn.Module):
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         super().__init__()
-#         # 🔧 c1은 자동으로 이전 레이어의 출력 채널 수가 전달됨
-#         # dual stream 입력이 이미 concatenated되어 들어오므로 c1을 그대로 사용
-#         self.conv = Conv(c1, c2, k, s, autopad(k, p, d), g=1, d=d, act=act)
-#         # Optional share weights (assume c2 even)
-#         if c2 % 2 == 0:
-#             half = c2 // 2
-#             self.conv.conv.weight.data[half : c2] = self.conv.conv.weight.data[0 : half]
-#             if self.conv.conv.bias is not None:
-#                 self.conv.conv.bias.data[half : c2] = self.conv.conv.bias.data[0 : half]
-
-#     def forward(self, x):
-#         if x.dim() == 4:  # [B, c1, H, W] - 이미 concatenated된 입력
-#             out = self.conv(x)  # [B, c2, H_out, W_out]
-#             return out
-#         else:
-#             raise ValueError(f"Expected 4D input [B, {self.conv.conv.in_channels}, H, W], got {x.shape}")
-
-
-
 class MultiStreamConv(nn.Module):
-    """
-    Grouped Convolution을 사용하여 두 스트림을 독립적으로 처리하는 NPU 친화적 모듈
-    """
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
-        # 🔴 입력 채널(c1)과 출력 채널(c2)은 2로 나누어 떨어져야 합니다.
         if c1 % 2 != 0 or c2 % 2 != 0:
             raise ValueError("Input and output channels must be divisible by 2 for groups=2.")
         
-        # 🔴 groups=2 설정을 통해 두 스트림이 독립적으로 처리되도록 합니다.
-        # g=1은 groups 파라미터가 아니라 dilation과 관련된 group 파라미터이므로, Conv 내부의 nn.Conv2d에 groups=2를 전달해야 합니다.
-        # Ultralytics의 Conv 모듈은 groups 인자를 직접 지원하므로 g=2로 설정합니다.
         self.conv = Conv(c1, c2, k, s, p=p, g=2, d=d, act=act)
 
     def forward(self, x):
-        # 입력 x는 [B, 6, H, W] 형태
-        # Grouped Convolution이 모든 것을 알아서 처리합니다.
         return self.conv(x)
 
 
@@ -82,175 +50,61 @@ class MultiStreamConv(nn.Module):
 
 
 class SpatialAlignedMultiStreamConv(nn.Module):
-    """
-    모든 NPU 미지원 연산자를 회피하도록 최종 수정된 버전.
-    Slice Assignment 대신 F.pad를 사용하여 공간 정렬을 수행합니다.
-    """
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
         c_in_half = c1 // 2
         if c1 % 2 != 0:
             raise ValueError("Input channels 'c1' must be divisible by 2.")
 
-        # 각 스트림을 위한 독립 Conv 레이어
         self.wide_processor = Conv(c_in_half, c_in_half, k=3, s=1, p=1, g=g, d=d, act=act)
         self.narrow_processor = Conv(c_in_half, c_in_half, k=3, s=1, p=1, g=g, d=d, act=act)
 
-        # NPU 호환 피처 축소기 (AvgPool2d)
         self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2)
 
-        # Narrow FOV 기하학적 정보
         self.narrow_bbox = {
             'center_x': 0.499289, 'center_y': 0.499912,
             'width': 0.286041, 'height': 0.291975
         }
 
-        # 최종 융합 Conv 레이어
         self.fusion_conv = Conv(c_in_half, c2, k=k, s=s, p=p, g=g, d=d, act=act)
 
     def forward(self, x):
-        # 1. 스트림 분리
         c_half = x.shape[1] // 2
         wide_feature = x[:, :c_half]
         narrow_feature = x[:, c_half:]
 
-        # 2. 독립 처리
         wide_processed = self.wide_processor(wide_feature)
         narrow_processed = self.narrow_processor(narrow_feature)
 
-        # 3. 공간 정렬 및 융합
-        # 3a. Narrow 피처 축소
         narrow_downscaled = self.downscaler(narrow_processed)
         
-        # 3b. F.pad를 이용해 정렬된 캔버스 생성
         aligned_narrow_canvas = self.place_feature_with_pad(narrow_downscaled, wide_processed.shape)
         
-        # 4. 융합 (덧셈)
         fused_feature = wide_processed + aligned_narrow_canvas
 
-        # 5. 최종 Conv
         output = self.fusion_conv(fused_feature)
         return output
 
     def place_feature_with_pad(self, narrow_feature, wide_shape):
-        """
-        F.pad를 사용하여 작은 피처맵 주위에 0을 채워 큰 피처맵과 크기를 맞춥니다.
-        이것이 NPU에서 'Expand'를 제거하는 최종 해결책입니다.
-        """
         B, C, H_wide, W_wide = wide_shape
         _, _, H_narrow, W_narrow = narrow_feature.shape
 
-        # 배치될 중앙 위치 계산
         center_x_pixel = self.narrow_bbox['center_x'] * W_wide
         center_y_pixel = self.narrow_bbox['center_y'] * H_wide
         
-        # 패딩 계산
         pad_left = int(center_x_pixel - W_narrow / 2)
         pad_top = int(center_y_pixel - H_narrow / 2)
 
-        # 패딩 값은 (왼쪽, 오른쪽, 위, 아래) 순서
-        # 오른쪽과 아래쪽 패딩은 전체 크기에서 시작점과 피처 크기를 빼서 계산
         pad_right = W_wide - (pad_left + W_narrow)
         pad_bottom = H_wide - (pad_top + H_narrow)
         
-        # 패딩 값이 음수가 되지 않도록 보정 (만약 피처가 캔버스보다 크거나 경계에 걸칠 경우)
-        # 이 로직은 피처가 캔버스 안에 완전히 들어온다고 가정할 때 가장 간단합니다.
-        # 복잡한 경계 처리가 필요하다면 추가 로직이 필요하지만, 대부분의 경우 아래 코드로 충분합니다.
         if pad_left < 0 or pad_top < 0 or pad_right < 0 or pad_bottom < 0:
-            # 경계를 벗어나는 경우에 대한 안전장치 (이 경우는 거의 발생하지 않아야 함)
-            # 가장 간단한 방법은 그냥 0으로 채워진 캔버스를 반환하는 것
             print("Warning: Feature placement is out of bounds. Returning zero canvas.")
             return torch.zeros(wide_shape, device=narrow_feature.device, dtype=narrow_feature.dtype)
 
-        # F.pad 적용
-        # padding 튜플은 마지막 차원부터 역순으로 (pad_left, pad_right, pad_top, pad_bottom)
         padded_feature = F.pad(narrow_feature, (pad_left, pad_right, pad_top, pad_bottom), "constant", 0)
         
         return padded_feature
-
-# class SpatialAlignedMultiStreamConv(nn.Module):
-#     """공간적으로 정렬된 듀얼 스트림 Conv - 개선 버전 (4D NPU 호환)"""
-    
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         super().__init__()
-#         # 🔧 c1은 자동으로 이전 레이어의 출력 채널 수가 전달됨
-#         # forward에서 dual stream 처리 후 다시 c1 채널로 concat됨
-#         self.conv = Conv(c1, c2, k, s, autopad(k, p, d), g=1, d=d, act=act)
-#         # Optional share weights
-#         if c2 % 2 == 0:
-#             half = c2 // 2
-#             self.conv.conv.weight.data[half : c2] = self.conv.conv.weight.data[0 : half]
-#             if self.conv.conv.bias is not None:
-#                 self.conv.conv.bias.data[half : c2] = self.conv.conv.bias.data[0 : half]
-        
-#         # Narrow FOV 정보
-#         self.narrow_bbox = {
-#             'center_x': 0.499289,
-#             'center_y': 0.499912,
-#             'width': 0.286041,
-#             'height': 0.291975
-#         }
-        
-#         # 🔧 Zero padding 문제 완화를 위한 가중치
-#         self.narrow_weight = nn.Parameter(torch.tensor(0.5))
-
-#     def place_narrow_in_wide_space(self, narrow_tensor, target_size):
-#         """Narrow tensor를 wide space에 배치하되 정보 손실 최소화 - Gaussian noise 버전"""
-#         B, C, H_narrow, W_narrow = narrow_tensor.shape
-#         H_wide, W_wide = target_size
-        
-#         # 🚀 개선: 일관된 Gaussian noise 사용 (training/inference 동일)
-#         noise_std = 0.02
-#         aligned_narrow = torch.randn((B, C, H_wide, W_wide), 
-#                                    device=narrow_tensor.device, 
-#                                    dtype=narrow_tensor.dtype) * noise_std
-        
-#         # YOLO bbox → 픽셀 좌표 변환
-#         center_x = int(self.narrow_bbox['center_x'] * W_wide)
-#         center_y = int(self.narrow_bbox['center_y'] * H_wide)
-#         bbox_w = int(self.narrow_bbox['width'] * W_wide)
-#         bbox_h = int(self.narrow_bbox['height'] * H_wide)
-        
-#         # 배치할 위치 계산
-#         x1 = max(0, center_x - bbox_w // 2)
-#         y1 = max(0, center_y - bbox_h // 2)
-#         x2 = min(W_wide, x1 + bbox_w)
-#         y2 = min(H_wide, y1 + bbox_h)
-        
-#         target_h = y2 - y1
-#         target_w = x2 - x1
-        
-#         if target_h > 0 and target_w > 0:
-#             narrow_resized = F.interpolate(narrow_tensor, 
-#                                          size=(target_h, target_w), 
-#                                          mode='bilinear', 
-#                                          align_corners=False)
-            
-#             narrow_strength = 0.6
-#             noise_strength = 0.4
-#             aligned_narrow[:, :, y1:y2, x1:x2] = (
-#                 narrow_resized * narrow_strength + 
-#                 aligned_narrow[:, :, y1:y2, x1:x2] * noise_strength
-#             )
-            
-
-#         return aligned_narrow
-
-#     def forward(self, x):
-#         if x.dim() == 4:
-#             B, C_total, H, W = x.shape
-#             C = C_total // 2
-#             wide = x[:, :C]
-#             narrow = x[:, C:]
-#             narrow_aligned = self.place_narrow_in_wide_space(narrow, (H, W))
-#             narrow_weighted = narrow_aligned * torch.sigmoid(self.narrow_weight)
-#             x_concat = torch.cat([wide, narrow_weighted], dim=1)
-#             out = self.conv(x_concat)
-#             return out
-#         else:
-#             raise ValueError(f"Expected 4D input [B, {self.conv.conv.in_channels}, H, W], got {x.shape}")
-
-
 
 
 class MultiStreamMaxPool2d(nn.Module):
