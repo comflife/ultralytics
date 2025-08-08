@@ -216,18 +216,19 @@ def preprocess_image(image_path, target_size=640):
 
 def create_dual_stream_input(wide_tensor, narrow_tensor):
     """
-    두 이미지를 듀얼 스트림 형태로 결합
+    두 이미지를 듀얼 스트림 형태로 결합 (NPU 호환 4차원)
     
     Args:
         wide_tensor (torch.Tensor): Wide stream 이미지 [3, H, W]
         narrow_tensor (torch.Tensor): Narrow stream 이미지 [3, H, W]
     
     Returns:
-        torch.Tensor: 듀얼 스트림 입력 [1, 2, 3, H, W]
+        torch.Tensor: 듀얼 스트림 입력 [1, 6, H, W] - NPU 호환 4차원
     """
-    # 두 이미지를 스택하여 듀얼 스트림 생성
-    dual_stream = torch.stack([wide_tensor, narrow_tensor], dim=0)  # [2, 3, H, W]
-    dual_stream = dual_stream.unsqueeze(0)  # [1, 2, 3, H, W]
+    # 🔧 NPU 호환: 4차원 입력으로 변경 [1, 6, H, W]
+    # 두 이미지를 채널 차원에서 concat
+    dual_stream = torch.cat([wide_tensor, narrow_tensor], dim=0)  # [6, H, W]
+    dual_stream = dual_stream.unsqueeze(0)  # [1, 6, H, W]
     
     print(f"🔗 Created dual stream input: {dual_stream.shape}")
     return dual_stream

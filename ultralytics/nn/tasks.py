@@ -186,19 +186,23 @@ class BaseModel(torch.nn.Module):
         is_dual_stream_input = False
         dual_stream_active = getattr(self, 'dual_stream', False)
         
+        # 🔧 NPU 호환: 4차원 dual-stream 처리로 변경
         # Process different input formats
         if isinstance(x, list) and len(x) == 2 and all(isinstance(t, torch.Tensor) for t in x):
-            # List of two tensors -> stack to [B, 2, C, H, W]
-            x = torch.stack(x, dim=1)
+            # List of two tensors -> concat to [B, 2*C, H, W] (4차원)
+            x = torch.cat(x, dim=1)  # [B, C, H, W] + [B, C, H, W] -> [B, 2*C, H, W]
             is_dual_stream_input = True
             dual_stream_active = True
         elif isinstance(x, torch.Tensor) and x.dim() == 5 and x.shape[1] == 2:
-            # Already in dual stream format [B, 2, C, H, W]
+            # 5차원 입력을 4차원으로 변환: [B, 2, C, H, W] -> [B, 2*C, H, W]
+            B, streams, C, H, W = x.shape
+            x = x.reshape(B, streams * C, H, W)  # [B, 2*C, H, W]
             is_dual_stream_input = True
             dual_stream_active = True
         elif isinstance(x, torch.Tensor) and x.dim() == 4 and getattr(self, 'dual_stream', False):
-            # Single stream input to dual stream model - duplicate the input
-            x = x.unsqueeze(1).repeat(1, 2, 1, 1, 1)  # [B, C, H, W] -> [B, 2, C, H, W]
+            # Single stream input to dual stream model - duplicate in channel dimension
+            if x.shape[1] != 2 * 3:  # 6채널이 아닌 경우에만 복제
+                x = torch.cat([x, x], dim=1)  # [B, C, H, W] -> [B, 2*C, H, W]
             is_dual_stream_input = True
             dual_stream_active = True
         
@@ -450,8 +454,8 @@ class DetectionModel(BaseModel):
             
             # Use dual stream input for stride calculation if it's a dual stream model
             if self.dual_stream:
-                # Create dual stream test input: [1, 2, ch, s, s]
-                test_input = torch.zeros(1, 2, ch, s, s)
+                # 🔧 NPU 호환: 4차원 입력으로 변경 [1, 6, s, s] - dual stream RGB (고정 6채널)
+                test_input = torch.zeros(1, 6, s, s)  # [B, 6, H, W] - 4차원 고정
             else:
                 # Standard single stream test input: [1, ch, s, s]  
                 test_input = torch.zeros(1, ch, s, s)

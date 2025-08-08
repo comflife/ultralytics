@@ -401,56 +401,23 @@ class MultiStreamC3(nn.Module):  # C3 상속하지 않음!
         """
         super().__init__()
         
-        # Shared C3 for grouped processing
-        self.c3 = C3(2 * c1, 2 * c1, n, shortcut, g=2, e=e)
+        # Store input channels for later use
+        self.c1 = c1
+        self.c2 = c2
         
-        # Copy weights to ensure sharing between groups
-        def copy_weights(module):
-            if isinstance(module, Conv):
-                if module.conv.groups == 2:
-                    c_out_half = module.conv.out_channels // 2
-                    module.conv.weight.data[c_out_half:] = module.conv.weight.data[:c_out_half]
-                    if module.conv.bias is not None:
-                        module.conv.bias.data[c_out_half:] = module.conv.bias.data[:c_out_half]
-            for child in module.children():
-                copy_weights(child)
-        
-        copy_weights(self.c3)
-        
-        # Fusion layer: 2*c1 → c2
-        self.fusion_conv = Conv(2 * c1, c2, 1, 1)
+        # 🔧 NPU 호환: 4차원 dual-stream 처리용 C3
+        # C3의 채널 변화를 직접 처리 (c1 → c2)
+        self.c3 = C3(c1, c2, n, shortcut, g=1, e=e)  # c1 → c2로 변경
         
     def forward(self, x):
-        if x.dim() == 5 and x.shape[1] == 2:
-            # Dual stream: [B, 2, C, H, W]
-            B, streams, C, H, W = x.shape
-            
-            # Reshape to concatenated channels: [B, 2*C, H, W]
-            x_reshaped = x.reshape(B, 2 * C, H, W)
-            
-            # Process with grouped C3
-            out = self.c3(x_reshaped)  # [B, 2*C_out, H_out, W_out] where C_out = c1
-            
-            # Fuse
-            result = self.fusion_conv(out)
-            
-            return result
-            
-        elif x.dim() == 4:
-            # Single stream: [B, C, H, W]
-            B, C, H, W = x.shape
-            # Duplicate channels
-            x_dupl = torch.cat((x, x), dim=1)  # [B, 2*C, H, W]
-            
-            # Process with grouped C3
-            out = self.c3(x_dupl)  # [B, 2*C_out, H_out, W_out]
-            
-            # Fuse
-            result = self.fusion_conv(out)
+        if x.dim() == 4:  # [B, C, H, W] - 4차원 입력
+            # 🔧 NPU 호환: 4차원 dual stream 처리
+            # C3가 직접 c1 → c2 변환 처리
+            result = self.c3(x)  # [B, c2, H_out, W_out]
             
             return result
         else:
-            raise ValueError(f"Expected 4D or 5D input, got {x.shape}")
+            raise ValueError(f"Expected 4D input, got {x.shape}")
         
 # class MultiStreamC2f(nn.Module):  # C2f 상속하지 않음!
 #     """Multi-stream CSP Bottleneck that outputs fused single stream."""

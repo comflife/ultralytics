@@ -35,241 +35,40 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
-# class MultiStreamConv(nn.Module):
-#     """Multi-stream convolution for processing dual camera inputs."""
-
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         """Initialize MultiStreamConv with dual stream processing capability."""
-#         super().__init__()
-#         self.conv = Conv(c1, c2, k, s, p, g=g, d=d, act=act)
-
-#     def forward(self, x):
-#         """
-#         Forward pass for multi-stream convolution.
-        
-#         Args:
-#             x (torch.Tensor): Input tensor. Can be:
-#                 - 4D: [B, C, H, W] (single stream)
-#                 - 5D: [B, 2, C, H, W] (dual stream)
-        
-#         Returns:
-#             torch.Tensor: Output tensor in dual stream format [B, 2, C_out, H_out, W_out]
-#         """
-#         if x.dim() == 5 and x.shape[1] == 2:
-#             # Dual stream input: [B, 2, C, H, W]
-#             B, streams, C, H, W = x.shape
-            
-#             # Reshape to process both streams: [B*2, C, H, W]
-#             x_reshaped = x.view(B * streams, C, H, W)
-            
-#             # Apply convolution
-#             out = self.conv(x_reshaped)  # [B*2, C_out, H_out, W_out]
-            
-#             # Reshape back to dual stream format: [B, 2, C_out, H_out, W_out]
-#             _, C_out, H_out, W_out = out.shape
-#             out = out.view(B, streams, C_out, H_out, W_out)
-            
-#             return out
-            
-#         elif x.dim() == 4:
-#             # Single stream input: [B, C, H, W]
-#             # Convert to dual stream by duplicating
-#             out = self.conv(x)  # [B, C_out, H_out, W_out]
-#             # Duplicate for dual stream: [B, 2, C_out, H_out, W_out]
-#             out = out.unsqueeze(1).repeat(1, 2, 1, 1, 1)
-#             return out
-            
-#         else:
-#             raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D input with shape {x.shape}")
-
-
 class MultiStreamConv(nn.Module):
-    """Multi-stream convolution for processing dual camera inputs."""
-
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-        """Initialize MultiStreamConv with dual stream processing capability."""
         super().__init__()
-        # Assuming original g=1 for simplicity; adjust if needed for grouped conv
-        self.conv = Conv(2 * c1, 2 * c2, k, s, p, g=2, d=d, act=act)
-        # Share weights and biases between the two groups
-        self.c2 = c2
-        self.conv.conv.weight.data[c2:2 * c2] = self.conv.conv.weight.data[0:c2]
-        if self.conv.conv.bias is not None:
-            self.conv.conv.bias.data[c2:2 * c2] = self.conv.conv.bias.data[0:c2]
+        # 🔧 c1은 자동으로 이전 레이어의 출력 채널 수가 전달됨
+        # dual stream 입력이 이미 concatenated되어 들어오므로 c1을 그대로 사용
+        self.conv = Conv(c1, c2, k, s, autopad(k, p, d), g=1, d=d, act=act)
+        # Optional share weights (assume c2 even)
+        if c2 % 2 == 0:
+            half = c2 // 2
+            self.conv.conv.weight.data[half : c2] = self.conv.conv.weight.data[0 : half]
+            if self.conv.conv.bias is not None:
+                self.conv.conv.bias.data[half : c2] = self.conv.conv.bias.data[0 : half]
 
     def forward(self, x):
-        """
-        Forward pass for multi-stream convolution.
-        
-        Args:
-            x (torch.Tensor): Input tensor. Can be:
-                - 4D: [B, C, H, W] (single stream)
-                - 5D: [B, 2, C, H, W] (dual stream)
-        
-        Returns:
-            torch.Tensor: Output tensor in dual stream format [B, 2, C_out, H_out, W_out]
-        """
-        if x.dim() == 5 and x.shape[1] == 2:
-            # Dual stream input: [B, 2, C, H, W]
-            B, streams, C, H, W = x.shape
-            
-            # Reshape to process as concatenated channels: [B, 2*C, H, W]
-            x_reshaped = x.reshape(B, 2 * C, H, W)
-            
-            # Apply convolution
-            out = self.conv(x_reshaped)  # [B, 2*C_out, H_out, W_out]
-            
-            # Reshape back to dual stream format: [B, 2, C_out, H_out, W_out]
-            _, C_out_total, H_out, W_out = out.shape
-            C_out = C_out_total // 2
-            out = out.reshape(B, 2, C_out, H_out, W_out)
-            
+        if x.dim() == 4:  # [B, c1, H, W] - 이미 concatenated된 입력
+            out = self.conv(x)  # [B, c2, H_out, W_out]
             return out
-            
-        elif x.dim() == 4:
-            # Single stream input: [B, C, H, W]
-            # Duplicate channels for dual stream processing
-            B, C, H, W = x.shape
-            x_dupl = torch.cat((x, x), dim=1)  # [B, 2*C, H, W]
-            
-            # Apply convolution
-            out = self.conv(x_dupl)  # [B, 2*C_out, H_out, W_out]
-            
-            # Reshape to dual stream format: [B, 2, C_out, H_out, W_out]
-            _, C_out_total, H_out, W_out = out.shape
-            C_out = C_out_total // 2
-            out = out.reshape(B, 2, C_out, H_out, W_out)
-            
-            return out
-            
         else:
-            raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D input with shape {x.shape}")
-
-
-# class SpatialAlignedMultiStreamConv(nn.Module):
-#     """공간적으로 정렬된 듀얼 스트림 Conv - 개선 버전"""
-    
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         super().__init__()
-#         self.cv_wide = Conv(c1, c2, k, s, autopad(k, p, d), g=g, d=d, act=act)
-#         self.cv_narrow = Conv(c1, c2, k, s, autopad(k, p, d), g=g, d=d, act=act)
-        
-#         # Narrow FOV 정보
-#         self.narrow_bbox = {
-#             'center_x': 0.499289,
-#             'center_y': 0.499912,
-#             'width': 0.286041,
-#             'height': 0.291975
-#         }
-        
-#         # 🔧 Zero padding 문제 완화를 위한 가중치
-#         self.narrow_weight = nn.Parameter(torch.tensor(0.5))
-
-#     def place_narrow_in_wide_space(self, narrow_tensor, target_size):
-#         """Narrow tensor를 wide space에 배치하되 정보 손실 최소화 - Gaussian noise 버전"""
-#         B, C, H_narrow, W_narrow = narrow_tensor.shape
-#         H_wide, W_wide = target_size
-        
-#         # print(f"DEBUG: SpatialAlign - Narrow {narrow_tensor.shape} → Wide space {target_size}")
-        
-#         # 🚀 개선: 일관된 Gaussian noise 사용 (training/inference 동일)
-#         # Training과 inference 모두 같은 distribution으로 일관성 확보
-#         noise_std = 0.02  # narrow tensor 값 범위에 맞춘 적절한 std
-#         aligned_narrow = torch.randn((B, C, H_wide, W_wide), 
-#                                    device=narrow_tensor.device, 
-#                                    dtype=narrow_tensor.dtype) * noise_std
-        
-#         # YOLO bbox → 픽셀 좌표 변환
-#         center_x = int(self.narrow_bbox['center_x'] * W_wide)
-#         center_y = int(self.narrow_bbox['center_y'] * H_wide)
-#         bbox_w = int(self.narrow_bbox['width'] * W_wide)
-#         bbox_h = int(self.narrow_bbox['height'] * H_wide)
-        
-#         # 배치할 위치 계산
-#         x1 = max(0, center_x - bbox_w // 2)
-#         y1 = max(0, center_y - bbox_h // 2)
-#         x2 = min(W_wide, x1 + bbox_w)
-#         y2 = min(H_wide, y1 + bbox_h)
-        
-#         target_h = y2 - y1
-#         target_w = x2 - x1
-        
-#         # print(f"DEBUG: Narrow region: ({x1}:{x2}, {y1}:{y2}) = {target_w}x{target_h}")
-#         # print(f"DEBUG: Original narrow: {W_narrow}x{H_narrow}")
-#         # print(f"DEBUG: Size reduction: {target_w/W_wide:.3f}x{target_h/H_wide:.3f}")
-        
-#         if target_h > 0 and target_w > 0:
-#             # 🔧 Narrow를 target 크기로 resize
-#             narrow_resized = F.interpolate(narrow_tensor, 
-#                                          size=(target_h, target_w), 
-#                                          mode='bilinear', 
-#                                          align_corners=False)
-            
-#             # 🚀 일관된 블렌딩 전략 (training/inference 동일)
-#             # 95% narrow 정보 + 5% Gaussian noise로 일관성 확보
-#             narrow_strength = 0.6  # narrow 정보 강도
-#             noise_strength = 0.4   # noise 유지 비율
-#             aligned_narrow[:, :, y1:y2, x1:x2] = (
-#                 narrow_resized * narrow_strength + 
-#                 aligned_narrow[:, :, y1:y2, x1:x2] * noise_strength
-#             )
-            
-#             # print(f"DEBUG: Successfully placed narrow with consistent noise blending")
-#         # else:
-#             # print(f"DEBUG: ❌ Invalid target size: {target_w}x{target_h}")
-        
-#         # print(f"DEBUG: Aligned narrow range: {aligned_narrow.min():.6f} ~ {aligned_narrow.max():.6f}")
-#         return aligned_narrow
-
-#     def forward(self, x):
-#         # print(f"DEBUG: SpatialAlignedMultiStreamConv input shape: {x.shape}")
-        
-#         if x.dim() == 5 and x.shape[1] == 2:  # [B, 2, C, H, W]
-#             # print("DEBUG: ✅ Processing dual stream with spatial alignment")
-            
-#             wide_stream = x[:, 0]    # [B, C, H, W]
-#             narrow_stream = x[:, 1]  # [B, C, H, W]
-            
-#             # print(f"DEBUG: Wide stream range: {wide_stream.min():.6f} ~ {wide_stream.max():.6f}")
-#             # print(f"DEBUG: Narrow stream range: {narrow_stream.min():.6f} ~ {narrow_stream.max():.6f}")
-            
-#             # Wide stream 처리 (변경 없음)
-#             wide_out = self.cv_wide(wide_stream)
-            
-#             # Narrow stream을 wide space에 배치
-#             H_wide, W_wide = wide_stream.shape[2], wide_stream.shape[3]
-#             narrow_aligned = self.place_narrow_in_wide_space(narrow_stream, (H_wide, W_wide))
-            
-#             # 🔧 Narrow stream에 학습 가능한 가중치 적용
-#             narrow_weighted = narrow_aligned * torch.sigmoid(self.narrow_weight)
-            
-#             # 정렬된 narrow stream 처리
-#             narrow_out = self.cv_narrow(narrow_weighted)
-            
-#             # print(f"DEBUG: Wide output range: {wide_out.min():.6f} ~ {wide_out.max():.6f}")
-#             # print(f"DEBUG: Narrow aligned output range: {narrow_out.min():.6f} ~ {narrow_out.max():.6f}")
-            
-#             # Dual stream 형태로 재결합
-#             output = torch.stack([wide_out, narrow_out], dim=1)  # [B, 2, C_out, H_out, W_out]
-            
-#             # print(f"DEBUG: SpatialAligned final output shape: {output.shape}")
-#             return output
-#         else:
-#             # Single stream 처리
-#             return self.cv_wide(x)
+            raise ValueError(f"Expected 4D input [B, {self.conv.conv.in_channels}, H, W], got {x.shape}")
 
 class SpatialAlignedMultiStreamConv(nn.Module):
-    """공간적으로 정렬된 듀얼 스트림 Conv - 개선 버전"""
+    """공간적으로 정렬된 듀얼 스트림 Conv - 개선 버전 (4D NPU 호환)"""
     
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
-        # Grouped conv for shared weights
-        self.conv = Conv(2 * c1, 2 * c2, k, s, autopad(k, p, d), g=2, d=d, act=act)
-        
-        # Share weights and biases between groups
-        self.conv.conv.weight.data[c2:2 * c2] = self.conv.conv.weight.data[0:c2]
-        if self.conv.conv.bias is not None:
-            self.conv.conv.bias.data[c2:2 * c2] = self.conv.conv.bias.data[0:c2]
+        # 🔧 c1은 자동으로 이전 레이어의 출력 채널 수가 전달됨
+        # forward에서 dual stream 처리 후 다시 c1 채널로 concat됨
+        self.conv = Conv(c1, c2, k, s, autopad(k, p, d), g=1, d=d, act=act)
+        # Optional share weights
+        if c2 % 2 == 0:
+            half = c2 // 2
+            self.conv.conv.weight.data[half : c2] = self.conv.conv.weight.data[0 : half]
+            if self.conv.conv.bias is not None:
+                self.conv.conv.bias.data[half : c2] = self.conv.conv.bias.data[0 : half]
         
         # Narrow FOV 정보
         self.narrow_bbox = {
@@ -287,11 +86,8 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         B, C, H_narrow, W_narrow = narrow_tensor.shape
         H_wide, W_wide = target_size
         
-        # print(f"DEBUG: SpatialAlign - Narrow {narrow_tensor.shape} → Wide space {target_size}")
-        
         # 🚀 개선: 일관된 Gaussian noise 사용 (training/inference 동일)
-        # Training과 inference 모두 같은 distribution으로 일관성 확보
-        noise_std = 0.02  # narrow tensor 값 범위에 맞춘 적절한 std
+        noise_std = 0.02
         aligned_narrow = torch.randn((B, C, H_wide, W_wide), 
                                    device=narrow_tensor.device, 
                                    dtype=narrow_tensor.dtype) * noise_std
@@ -311,25 +107,14 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         target_h = y2 - y1
         target_w = x2 - x1
         
-        
         if target_h > 0 and target_w > 0:
-            # 🔧 Narrow를 target 크기로 resize
-            # 제약: 2배수 upsample만 가능하므로, nearest neighbor로 2^n 배 upsample 후 crop/pad 조정
-            # 하지만 arbitrary size이므로, bilinear 유지하나 제약 준수 위해 scale_factor 사용 (up/down 구분)
-            scale_h = target_h / H_narrow
-            scale_w = target_w / W_narrow
-            
-            # Upsample만 2배수 제한: 만약 scale >1 이면 2^n으로 upsample 후 downsample 대체
-            # 하지만 downsample 필요한 경우 bilinear 사용 (제약 upsample만 언급)
             narrow_resized = F.interpolate(narrow_tensor, 
                                          size=(target_h, target_w), 
                                          mode='bilinear', 
                                          align_corners=False)
             
-            # 🚀 일관된 블렌딩 전략 (training/inference 동일)
-            # 95% narrow 정보 + 5% Gaussian noise로 일관성 확보
-            narrow_strength = 0.6  # narrow 정보 강도 강도
-            noise_strength = 0.4   # noise 유지 비율
+            narrow_strength = 0.6
+            noise_strength = 0.4
             aligned_narrow[:, :, y1:y2, x1:x2] = (
                 narrow_resized * narrow_strength + 
                 aligned_narrow[:, :, y1:y2, x1:x2] * noise_strength
@@ -339,243 +124,20 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         return aligned_narrow
 
     def forward(self, x):
-        # print(f"DEBUG: SpatialAlignedMultiStreamConv input shape: {x.shape}")
-        
-        if x.dim() == 5 and x.shape[1] == 2:  # [B, 2, C, H, W]
-            # print("DEBUG: ✅ Processing dual stream with spatial alignment")
-            
-            wide_stream = x[:, 0]    # [B, C, H, W]
-            narrow_stream = x[:, 1]  # [B, C, H, W]
-            
-            # print(f"DEBUG: Wide stream range: {wide_stream.min():.6f} ~ {wide_stream.max():.6f}")
-            # print(f"DEBUG: Narrow stream range: {narrow_stream.min():.6f} ~ {narrow_stream.max():.6f}")
-            
-            # Narrow stream을 wide space에 배치
-            H_wide, W_wide = wide_stream.shape[2], wide_stream.shape[3]
-            narrow_aligned = self.place_narrow_in_wide_space(narrow_stream, (H_wide, W_wide))
-            
-            # 🔧 Narrow stream에 학습 가능한 가중치 적용
+        if x.dim() == 4:
+            B, C_total, H, W = x.shape
+            C = C_total // 2
+            wide = x[:, :C]
+            narrow = x[:, C:]
+            narrow_aligned = self.place_narrow_in_wide_space(narrow, (H, W))
             narrow_weighted = narrow_aligned * torch.sigmoid(self.narrow_weight)
-            
-            # Concatenate channels for grouped conv: [B, 2*C, H, W]
-            x_concat = torch.cat([wide_stream, narrow_weighted], dim=1)
-            
-            # Apply grouped conv
-            out_concat = self.conv(x_concat)  # [B, 2*C_out, H_out, W_out]
-            
-            # Split back to dual stream: assume 32 multiple channels
-            B, C_out_total, H_out, W_out = out_concat.shape
-            C_out = C_out_total // 2
-            wide_out = out_concat[:, :C_out]
-            narrow_out = out_concat[:, C_out:]
-            
-            # Dual stream 형태로 재결합 with concat instead of stack
-            output = torch.cat([wide_out.unsqueeze(1), narrow_out.unsqueeze(1)], dim=1)  # [B, 2, C_out, H_out, W_out]
-            
-            # print(f"DEBUG: SpatialAligned final output shape: {output.shape}")
-            return output
-            
-        elif x.dim() == 4:
-            # Single stream: duplicate for grouped processing
-            B, C, H, W = x.shape
-            x_dupl = torch.cat([x, x], dim=1)  # [B, 2*C, H, W]
-            
-            out_concat = self.conv(x_dupl)  # [B, 2*C_out, H_out, W_out]
-            
-            # Take one stream (e.g., first) as output for single stream
-            C_out = out_concat.shape[1] // 2
-            return out_concat[:, :C_out]
-            
+            x_concat = torch.cat([wide, narrow_weighted], dim=1)
+            out = self.conv(x_concat)
+            return out
         else:
-            raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D with shape {x.shape}")
+            raise ValueError(f"Expected 4D input [B, {self.conv.conv.in_channels}, H, W], got {x.shape}")
 
 
-
-# Assuming Conv and autopad are defined elsewhere (e.g., from Ultralytics YOLO)
-
-# class SpatialAlignedMultiStreamConv(nn.Module):
-#     """공간적으로 정렬된 듀얼 스트림 Conv - 개선 버전"""
-    
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         super().__init__()
-#         # Grouped conv for shared weights
-#         self.conv = Conv(2 * c1, 2 * c2, k, s, autopad(k, p, d), g=2, d=d, act=act)
-        
-#         # Share weights and biases between groups
-#         self.conv.conv.weight.data[c2:2 * c2] = self.conv.conv.weight.data[0:c2]
-#         if self.conv.conv.bias is not None:
-#             self.conv.conv.bias.data[c2:2 * c2] = self.conv.conv.bias.data[0:c2]
-        
-#         # Narrow FOV 정보
-#         self.narrow_bbox = {
-#             'center_x': 0.499289,
-#             'center_y': 0.499912,
-#             'width': 0.286041,
-#             'height': 0.291975
-#         }
-        
-#         # 🔧 Zero padding 문제 완화를 위한 가중치
-#         self.narrow_weight = nn.Parameter(torch.tensor(0.5))
-
-#     def custom_bilinear_interpolate(self, input_tensor, target_size):
-#         """Manual bilinear interpolation without F.interpolate."""
-#         B, C, H_in, W_in = input_tensor.shape
-#         H_out, W_out = target_size
-        
-#         # Create output tensor
-#         output = torch.zeros((B, C, H_out, W_out), device=input_tensor.device, dtype=input_tensor.dtype)
-        
-#         # Precompute scales
-#         scale_h = H_in / H_out
-#         scale_w = W_in / W_out
-        
-#         # Vectorized grid for output coordinates
-#         i_grid, j_grid = torch.meshgrid(torch.arange(H_out, device=input_tensor.device),
-#                                         torch.arange(W_out, device=input_tensor.device),
-#                                         indexing='ij')
-        
-#         # Corresponding input coordinates (not integer)
-#         y = i_grid.float() * scale_h
-#         x = j_grid.float() * scale_w
-        
-#         # Floor and ceil for nearest pixels
-#         y0 = torch.floor(y).long()
-#         x0 = torch.floor(x).long()
-#         y1 = y0 + 1
-#         x1 = x0 + 1
-        
-#         # Clamp to input bounds
-#         y0 = torch.clamp(y0, 0, H_in - 1)
-#         y1 = torch.clamp(y1, 0, H_in - 1)
-#         x0 = torch.clamp(x0, 0, W_in - 1)
-#         x1 = torch.clamp(x1, 0, W_in - 1)
-        
-#         # Weights (fractional parts)
-#         wy = y - y0.float()
-#         wx = x - x0.float()
-        
-#         # For efficiency, loop over batch and channels (to avoid huge memory usage in large tensors)
-#         for b in range(B):
-#             for c in range(C):
-#                 # Extract four points
-#                 Ia = input_tensor[b, c, y0, x0]  # Top-left
-#                 Ib = input_tensor[b, c, y0, x1]  # Top-right
-#                 Ic = input_tensor[b, c, y1, x0]  # Bottom-left
-#                 Id = input_tensor[b, c, y1, x1]  # Bottom-right
-                
-#                 # Interpolate
-#                 wa = (1 - wx) * (1 - wy)
-#                 wb = wx * (1 - wy)
-#                 wc = (1 - wx) * wy
-#                 wd = wx * wy
-                
-#                 output[b, c] = Ia * wa + Ib * wb + Ic * wc + Id * wd
-        
-#         return output
-
-#     def place_narrow_in_wide_space(self, narrow_tensor, target_size):
-#         """Narrow tensor를 wide space에 배치하되 정보 손실 최소화 - Gaussian noise 버전"""
-#         B, C, H_narrow, W_narrow = narrow_tensor.shape
-#         H_wide, W_wide = target_size
-        
-#         # print(f"DEBUG: SpatialAlign - Narrow {narrow_tensor.shape} → Wide space {target_size}")
-        
-#         # 🚀 개선: 일관된 Gaussian noise 사용 (training/inference 동일)
-#         # Training과 inference 모두 같은 distribution으로 일관성 확보
-#         noise_std = 0.02  # narrow tensor 값 범위에 맞춘 적절한 std
-#         aligned_narrow = torch.randn((B, C, H_wide, W_wide), 
-#                                      device=narrow_tensor.device, 
-#                                      dtype=narrow_tensor.dtype) * noise_std
-        
-#         # YOLO bbox → 픽셀 좌표 변환
-#         center_x = int(self.narrow_bbox['center_x'] * W_wide)
-#         center_y = int(self.narrow_bbox['center_y'] * H_wide)
-#         bbox_w = int(self.narrow_bbox['width'] * W_wide)
-#         bbox_h = int(self.narrow_bbox['height'] * H_wide)
-        
-#         # 배치할 위치 계산
-#         x1 = max(0, center_x - bbox_w // 2)
-#         y1 = max(0, center_y - bbox_h // 2)
-#         x2 = min(W_wide, x1 + bbox_w)
-#         y2 = min(H_wide, y1 + bbox_h)
-        
-#         target_h = y2 - y1
-#         target_w = x2 - x1
-        
-        
-#         if target_h > 0 and target_w > 0:
-#             # 🔧 Narrow를 target 크기로 resize
-#             # 제약: 2배수 upsample만 가능하므로, nearest neighbor로 2^n 배 upsample 후 crop/pad 조정
-#             # 하지만 arbitrary size이므로, bilinear 유지하나 제약 준수 위해 scale_factor 사용 (up/down 구분)
-#             scale_h = target_h / H_narrow
-#             scale_w = target_w / W_narrow
-            
-#             # Upsample만 2배수 제한: 만약 scale >1 이면 2^n으로 upsample 후 downsample 대체
-#             # 하지만 downsample 필요한 경우 bilinear 사용 (제약 upsample만 언급)
-#             narrow_resized = self.custom_bilinear_interpolate(narrow_tensor, (target_h, target_w))
-            
-#             # 🚀 일관된 블렌딩 전략 (training/inference 동일)
-#             # 95% narrow 정보 + 5% Gaussian noise로 일관성 확보
-#             narrow_strength = 0.9  # narrow 정보 강도 강도
-#             noise_strength = 0.1   # noise 유지 비율
-#             aligned_narrow[:, :, y1:y2, x1:x2] = (
-#                 narrow_resized * narrow_strength + 
-#                 aligned_narrow[:, :, y1:y2, x1:x2] * noise_strength
-#             )
-            
-
-#         return aligned_narrow
-
-#     def forward(self, x):
-#         # print(f"DEBUG: SpatialAlignedMultiStreamConv input shape: {x.shape}")
-        
-#         if x.dim() == 5 and x.shape[1] == 2:  # [B, 2, C, H, W]
-#             # print("DEBUG: ✅ Processing dual stream with spatial alignment")
-            
-#             wide_stream = x[:, 0]    # [B, C, H, W]
-#             narrow_stream = x[:, 1]  # [B, C, H, W]
-            
-#             # print(f"DEBUG: Wide stream range: {wide_stream.min():.6f} ~ {wide_stream.max():.6f}")
-#             # print(f"DEBUG: Narrow stream range: {narrow_stream.min():.6f} ~ {narrow_stream.max():.6f}")
-            
-#             # Narrow stream을 wide space에 배치
-#             H_wide, W_wide = wide_stream.shape[2], wide_stream.shape[3]
-#             narrow_aligned = self.place_narrow_in_wide_space(narrow_stream, (H_wide, W_wide))
-            
-#             # 🔧 Narrow stream에 학습 가능한 가중치 적용
-#             narrow_weighted = narrow_aligned * torch.sigmoid(self.narrow_weight)
-            
-#             # Concatenate channels for grouped conv: [B, 2*C, H, W]
-#             x_concat = torch.cat([wide_stream, narrow_weighted], dim=1)
-            
-#             # Apply grouped conv
-#             out_concat = self.conv(x_concat)  # [B, 2*C_out, H_out, W_out]
-            
-#             # Split back to dual stream: assume 32 multiple channels
-#             B, C_out_total, H_out, W_out = out_concat.shape
-#             C_out = C_out_total // 2
-#             wide_out = out_concat[:, :C_out]
-#             narrow_out = out_concat[:, C_out:]
-            
-#             # Dual stream 형태로 재결합 with concat instead of stack
-#             output = torch.cat([wide_out.unsqueeze(1), narrow_out.unsqueeze(1)], dim=1)  # [B, 2, C_out, H_out, W_out]
-            
-#             # print(f"DEBUG: SpatialAligned final output shape: {output.shape}")
-#             return output
-            
-#         elif x.dim() == 4:
-#             # Single stream: duplicate for grouped processing
-#             B, C, H, W = x.shape
-#             x_dupl = torch.cat([x, x], dim=1)  # [B, 2*C, H, W]
-            
-#             out_concat = self.conv(x_dupl)  # [B, 2*C_out, H_out, W_out]
-            
-#             # Take one stream (e.g., first) as output for single stream
-#             C_out = out_concat.shape[1] // 2
-#             return out_concat[:, :C_out]
-            
-#         else:
-#             raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D with shape {x.shape}")
 
 
 class MultiStreamMaxPool2d(nn.Module):
