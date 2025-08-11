@@ -6,7 +6,7 @@ Exports a model trained on 4D concatenated input ([B, 6, H, W]) to ONNX format.
 
 """
 # 기본 변환
-python export_dual_depth_to_onnx.py /home/byounggun/ultralytics/runs/train/exp149/weights/best.pt
+python export_dual_depth_to_onnx_v2.py /home/byounggun/ultralytics/runs/train/exp244/weights/best.pt
 
 # 추론 예제도 함께 생성
 python export_dual_depth_to_onnx_v2.py /home/byounggun/ultralytics/runs/train/exp198/weights/best.pt --create-example
@@ -53,8 +53,8 @@ def verify_custom_modules_with_depth():
     try:
         from ultralytics.nn.modules.conv import MultiStreamConv, SpatialAlignedMultiStreamConv
         print("✅ MultiStreamConv and SpatialAlignedMultiStreamConv imported successfully")
-        from ultralytics.nn.modules.block import MultiStreamC3
-        print("✅ MultiStreamC3 imported successfully")
+        from ultralytics.nn.modules.block import C2f
+        print("✅ C2f imported successfully")
         from ultralytics.nn.modules.head import Detect
         print("✅ Detect head imported successfully")
     except ImportError as e:
@@ -66,10 +66,16 @@ def verify_custom_modules_with_depth():
         # 4D 입력 테스트
         test_input = torch.randn(1, 6, 32, 32)  # [B, 6, H, W]
         
-        # 모델의 첫 레이어는 c1=6, c2=64(예시) 일 것이므로 이에 맞춰 테스트
+        # MultiStreamConv 테스트 (c1=6)
         conv_test = MultiStreamConv(6, 64)
         conv_output = conv_test(test_input)
         print(f"✅ MultiStreamConv test with 4D input: {test_input.shape} -> {conv_output.shape}")
+
+        # SpatialAlignedMultiStreamConv 테스트 (c1=64)
+        # MultiStreamConv의 출력을 입력으로 사용
+        spatial_conv_test = SpatialAlignedMultiStreamConv(64, 128)
+        spatial_conv_output = spatial_conv_test(conv_output)
+        print(f"✅ SpatialAlignedMultiStreamConv test with 4D input: {conv_output.shape} -> {spatial_conv_output.shape}")
         
         # Depth 정보 확인
         print("🔍 Checking depth estimation support...")
@@ -116,27 +122,38 @@ def format_output_info(output):
         return f"{type(output).__name__}"
 
 def analyze_model_output_structure(model, dummy_input):
-    """모델 출력 구조 분석"""
+    """
+    모델의 출력을 분석하여 구조와 주요 출력 텐서를 반환
+    """
     print("🔍 Analyzing model output structure...")
-    
-    with torch.no_grad():
-        outputs = model(dummy_input)
-    
-    if isinstance(outputs, (tuple, list)):
-        print(f"📊 Model outputs {len(outputs)} tensors:")
-        for i, output in enumerate(outputs):
-            if isinstance(output, torch.Tensor):
-                print(f"   Output {i}: {output.shape}")
-                if len(output.shape) == 3:
-                    batch_size, channels, anchors = output.shape
-                    print(f"     -> Detection format: {channels} channels")
-                    print(f"     -> Expected: 4(bbox) + 1(conf) + nc(classes) + 1(depth)")
-        main_output = outputs[0] if outputs else None
-    else:
-        print(f"📊 Model output: {outputs.shape}")
-        main_output = outputs
-    
-    return outputs, main_output
+    try:
+        # 🔴 FIX: Unpack the tuple for multiple inputs
+        outputs = model(*dummy_input)
+        
+        main_output = None
+        # 🔴 FIX: The model returns a list [P3_output, P4_output, P5_output]
+        # The final output for detection is a concatenation of these.
+        if isinstance(outputs, (tuple, list)):
+            # In export mode, the output is a list of tensors from different detection heads
+            print(f"   - Model returns a tuple/list of {len(outputs)} detection heads.")
+            for i, out in enumerate(outputs):
+                print(f"     - Head {i}: shape={out.shape}, dtype={out.dtype}")
+            
+            # For ONNX export, we treat them as separate outputs.
+            # The 'main_output' concept is less relevant here, but we can use the first.
+            main_output = outputs[0]
+        else:
+            print(f"   - Model returns a single tensor.")
+            main_output = outputs
+            outputs = [outputs] # Ensure outputs is a list
+            print(f"     - Output: shape={main_output.shape}, dtype={main_output.dtype}")
+            
+        return outputs, main_output
+    except Exception as e:
+        print(f"❌ Failed during model analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
 
 def export_dual_depth_model_to_onnx(
     model_path: str,
@@ -165,13 +182,37 @@ def export_dual_depth_model_to_onnx(
     try:
         print("📂 Loading model...")
         yolo_model = YOLO(model_path)
-        model = yolo_model.model
+        from ultralytics.nn.modules.head import Detect
+
+        # 래퍼 모델 정의: 두 개의 3채널 입력을 받아 하나로 합침
+        class DualInputWrapper(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, images_wide, images_narrow):
+                x = torch.cat((images_wide, images_narrow), dim=1)
+                return self.model(x)
+
+        # Set the original model to export mode before wrapping
+        original_model = yolo_model.model
+        original_model.eval()
+        for m in original_model.modules():
+            if hasattr(m, 'export'):
+                m.export = True
+            if isinstance(m, Detect):
+                m.dynamic = dynamic
+                m.export = True
+        print("✅ Model set to export mode.")
+
+        # 원본 모델을 래퍼로 감싸기
+        model = DualInputWrapper(original_model)
         model.eval()
-        print(f"✅ Model loaded successfully")
+        print(f"✅ Model wrapped for dual 3-channel input.")
         
         print(f"🏗️  Model architecture:")
         print(f"   - Model type: {type(model)}")
-        print(f"   - Number of classes: {getattr(model, 'nc', 'Unknown')}")
+        print(f"   - Number of classes: {getattr(yolo_model.model, 'nc', 'Unknown')}")
         
     except Exception as e:
         print(f"❌ Failed to load model: {e}")
@@ -192,11 +233,11 @@ def export_dual_depth_model_to_onnx(
         model_path_obj = Path(model_path)
         output_path = model_path_obj.parent / f"{model_path_obj.stem}_4d_dual_depth.onnx"
     
-    # 🔴 CHANGED: 4D 입력에 맞게 설명 수정
-    print(f"\n📤 Starting 4D CONCATENATED DUAL STREAM + DEPTH ONNX export...")
+    # 🔴 CHANGED: 4D 입력 대신 두 개의 3채널 입력으로 변경
+    print(f"\n📤 Starting DUAL 3-CHANNEL INPUT + DEPTH ONNX export...")
     print(f"⚙️  Export settings:")
     print(f"   - Input size: {imgsz}")
-    print(f"   - Input format: Concatenated Dual Stream [B, 6, H, W]")
+    print(f"   - Input format: Dual 3-Channel Input [B, 3, H, W] x 2")
     print(f"   - Output format: Detection + Depth [B, nc+6, anchors]")
     print(f"   - Half precision: {half}")
     print(f"   - Dynamic shapes: {dynamic}")
@@ -204,14 +245,17 @@ def export_dual_depth_model_to_onnx(
     print(f"   - Output path: {output_path}")
     
     try:
-        # 🔴 CHANGED: 4D 입력 생성 ([B, 6, H, W])
+        # 🔴 CHANGED: 두 개의 3채널 더미 입력 생성
         if half and device != "cpu":
             model = model.half()
-            dummy_input = torch.randn(1, 6, imgsz, imgsz, dtype=torch.float16).to(device_obj)
+            dummy_input_wide = torch.randn(1, 3, imgsz, imgsz, dtype=torch.float16).to(device_obj)
+            dummy_input_narrow = torch.randn(1, 3, imgsz, imgsz, dtype=torch.float16).to(device_obj)
         else:
-            dummy_input = torch.randn(1, 6, imgsz, imgsz, dtype=torch.float32).to(device_obj)
+            dummy_input_wide = torch.randn(1, 3, imgsz, imgsz, dtype=torch.float32).to(device_obj)
+            dummy_input_narrow = torch.randn(1, 3, imgsz, imgsz, dtype=torch.float32).to(device_obj)
         
-        print(f"🔍 Test forward pass with 4D concatenated dual stream input: {dummy_input.shape}")
+        dummy_input = (dummy_input_wide, dummy_input_narrow)
+        print(f"🔍 Test forward pass with dual 3-channel input: {dummy_input_wide.shape}, {dummy_input_narrow.shape}")
         
         outputs, main_output = analyze_model_output_structure(model, dummy_input)
         
@@ -219,18 +263,20 @@ def export_dual_depth_model_to_onnx(
             print("❌ Failed to get model output!")
             return None
         
-        # 🔴 CHANGED: Dynamic axes를 4D 입력에 맞게 수정
+        # 🔴 CHANGED: Dynamic axes를 두 개의 입력에 맞게 수정
         dynamic_axes = None
         if dynamic:
             dynamic_axes = {
-                'images': {0: 'batch_size', 2: 'height', 3: 'width'},  # [B, 6, H, W]
-                'output0': {0: 'batch_size', 2: 'anchors'}              # [B, channels, anchors]
+                'images_wide': {0: 'batch_size', 2: 'height', 3: 'width'},
+                'images_narrow': {0: 'batch_size', 2: 'height', 3: 'width'},
+                'output0': {0: 'batch_size', 2: 'anchors'}
             }
             if isinstance(outputs, (tuple, list)) and len(outputs) > 1:
                 for i in range(1, len(outputs)):
                     dynamic_axes[f'output{i}'] = {0: 'batch_size', 2: 'anchors'}
         
-        input_names = ['images']
+        # 🔴 CHANGED: 입력 이름을 두 개로 설정
+        input_names = ['images_wide', 'images_narrow']
         output_names = [f'output{i}' for i in range(len(outputs))] if isinstance(outputs, (tuple, list)) else ['output0']
         
         print(f"🔗 Input names: {input_names}")
@@ -282,10 +328,11 @@ def export_dual_depth_model_to_onnx(
             print(f"\n🧪 Testing with ONNX Runtime...")
             import onnxruntime as ort
             session = ort.InferenceSession(str(output_path), providers=['CUDAExecutionProvider', 'CPUExecutionProvider'] if device != "cpu" else ['CPUExecutionProvider'])
-            test_input_np = dummy_input.cpu().numpy()
-            ort_outputs = session.run(None, {'images': test_input_np})
+            test_input_np_wide = dummy_input[0].cpu().numpy()
+            test_input_np_narrow = dummy_input[1].cpu().numpy()
+            ort_outputs = session.run(None, {'images_wide': test_input_np_wide, 'images_narrow': test_input_np_narrow})
             print(f"✅ ONNX Runtime test successful!")
-            print(f"   - Input shape: {test_input_np.shape}")
+            print(f"   - Input shapes: {test_input_np_wide.shape}, {test_input_np_narrow.shape}")
             for i, ort_output in enumerate(ort_outputs):
                 print(f"   - Output {i} shape: {ort_output.shape}")
 
