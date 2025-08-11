@@ -36,70 +36,35 @@ def autopad(k, p=None, d=1):
 
 
 class MultiStreamConv(nn.Module):
-    """
-    Multi-stream convolution layer for dual-input models.
-    It splits the input channel-wise into two streams, processes them with separate convolutions,
-    and then concatenates the results. This is suitable for NPU-based environments where
-    input normalization is applied per stream.
-    """
-
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-        """
-        Initialize MultiStreamConv.
-        Args:
-            c1 (int): Input channels. Must be an even number.
-            c2 (int): Output channels. Must be an even number.
-            k (int): Kernel size.
-            s (int): Stride.
-            p (int, optional): Padding.
-            g (int): Groups.
-            d (int): Dilation.
-            act (bool): Whether to include an activation function.
-        """
+    def __init__(self, c1, c2, k=1, s=1, g=1, d=1, act=True):
         super().__init__()
-        if c1 % 2 != 0:
-            raise ValueError(f"Input channels 'c1' ({c1}) must be divisible by 2.")
-        if c2 % 2 != 0:
-            raise ValueError(f"Output channels 'c2' ({c2}) must be divisible by 2.")
+        if c1 % 2 != 0 or c2 % 2 != 0:
+            raise ValueError("Input and output channels must be divisible by 2.")
 
         c1_half = c1 // 2
         c2_half = c2 // 2
 
-        # 1x1 Conv를 사용하여 채널 분리 (NPU 슬라이스 오류 회피)
-        self.split1 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, groups=1, bias=False)
-        self.split2 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, groups=1, bias=False)
-        
-        # 1x1 Conv 가중치를 수동으로 설정하여 identity-like 연산 수행
-        with torch.no_grad():
-            self.split1.weight.zero_()
-            self.split2.weight.zero_()
-            for i in range(c1_half):
-                # stream1: 입력의 앞 절반 채널 선택
-                self.split1.weight[i, i, 0, 0] = 1.0
-                # stream2: 입력의 뒤 절반 채널 선택
-                self.split2.weight[i, i + c1_half, 0, 0] = 1.0
+        # Split using fixed 1x1 conv weights (no indexing in loop → no Expand)
+        w1 = torch.zeros(c1_half, c1, 1, 1)
+        w2 = torch.zeros(c1_half, c1, 1, 1)
+        for i in range(c1_half):
+            w1[i, i, 0, 0] = 1.0
+            w2[i, i + c1_half, 0, 0] = 1.0
 
-        # 각 스트림을 처리할 독립적인 Conv 레이어
-        self.conv1 = Conv(c1_half, c2_half, k, s, p, g, d, act)
-        self.conv2 = Conv(c1_half, c2_half, k, s, p, g, d, act)
+        self.split1 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
+        self.split2 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
+        self.split1.weight = nn.Parameter(w1, requires_grad=False)
+        self.split2.weight = nn.Parameter(w2, requires_grad=False)
+
+        # Conv without padding
+        self.conv1 = Conv(c1_half, c2_half, k, s, p=0, g=g, d=d, act=act)
+        self.conv2 = Conv(c1_half, c2_half, k, s, p=0, g=g, d=d, act=act)
 
     def forward(self, x):
-        """
-        Forward pass through MultiStreamConv.
-        Args:
-            x (torch.Tensor): Input tensor with shape [B, C, H, W].
-        Returns:
-            (torch.Tensor): Output tensor after processing both streams.
-        """
-        # 1x1 Conv를 사용하여 두 스트림으로 분리
         stream1 = self.split1(x)
         stream2 = self.split2(x)
-
-        # 각 스트림을 독립적으로 처리
         out1 = self.conv1(stream1)
         out2 = self.conv2(stream2)
-
-        # 결과를 다시 합침
         return torch.cat([out1, out2], dim=1)
 
 # -------------------------------------------------
