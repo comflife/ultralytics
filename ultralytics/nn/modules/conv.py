@@ -40,7 +40,8 @@ class MultiStreamConv(nn.Module):
         if c1 % 2 != 0 or c2 % 2 != 0:
             raise ValueError("Input and output channels must be divisible by 2 for groups=2.")
         
-        self.conv = Conv(c1, c2, k, s, p=p, g=2, d=d, act=act)
+        # self.conv = Conv(c1, c2, k, s, p=p, g=2, d=d, act=act)
+        self.conv = Conv(c1, c2, k, s, p=p, g=1, d=d, act=act)
 
     def forward(self, x):
         return self.conv(x)
