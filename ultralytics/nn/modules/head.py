@@ -196,57 +196,93 @@ class Detect(nn.Module):
         y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
         return y if self.export else (y, {"one2many": x, "one2one": one2one})
 
+#     def _inference(self, x: List[torch.Tensor]) -> torch.Tensor:
+#         """
+#         Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
+
+#         Args:
+#             x (List[torch.Tensor]): List of feature maps from different detection layers.
+
+#         Returns:
+#             (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
+#         """
+#         # Inference path
+#         shape = x[0].shape  # BCHW
+#         # x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+#         # x_cat_list = [xi.permute(0, 2, 3, 1).view(shape[0], -1, self.no) for xi in x]
+#         # x_cat = torch.cat(x_cat_list, 1)  # [B, total_anchors, C]
+#         # # x_cat = x_cat.permute(0, 2, 1)  # [B, C, total_anchors]
+#         # x_cat = x_cat.unsqueeze(-1).permute(0, 2, 1, 3).squeeze(-1)
+#         flattened_x = [torch.flatten(xi, start_dim=2) for xi in x]
+
+# # 2. 생성된 텐서 리스트를 2번 차원(마지막 차원)을 기준으로 합칩니다.
+# #    최종적으로 [B, C, total_anchors] 형태의 텐서가 됩니다.
+#         x_cat = torch.cat(flattened_x, dim=2)
+#         if self.format != "imx" and (self.dynamic or self.shape != shape):
+#             self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+#             self.shape = shape
+
+#         if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
+#             box = x_cat[:, : self.reg_max * 4]
+#             cls = x_cat[:, self.reg_max * 4 : self.reg_max * 4 + self.nc]
+#             if self.with_depth:
+#                 depth = x_cat[:, self.reg_max * 4 + self.nc :]
+#         else:
+#             if self.with_depth:
+#                 box, cls, depth = x_cat.split((self.reg_max * 4, self.nc, 1), 1)
+#             else:
+#                 box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+
+#         if self.export and self.format in {"tflite", "edgetpu"}:
+#             # Precompute normalization factor to increase numerical stability
+#             # See https://github.com/ultralytics/ultralytics/issues/7371
+#             grid_h = shape[2]
+#             grid_w = shape[3]
+#             grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
+#             norm = self.strides / (self.stride[0] * grid_size)
+#             dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
+#         elif self.export and self.format == "imx":
+#             dbox = self.decode_bboxes(
+#                 self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
+#             )
+#             return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
+#         else:
+#             dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+
+#         if self.with_depth:
+#             return torch.cat((dbox, cls.sigmoid(), depth.sigmoid()), 1)
+#         else:
+#             return torch.cat((dbox, cls.sigmoid()), 1)
+
+
     def _inference(self, x: List[torch.Tensor]) -> torch.Tensor:
         """
         Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
-
-        Args:
-            x (List[torch.Tensor]): List of feature maps from different detection layers.
-
-        Returns:
-            (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
         """
         # Inference path
         shape = x[0].shape  # BCHW
-        # x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
-        x_cat_list = [xi.permute(0, 2, 3, 1).reshape(shape[0], -1, self.no) for xi in x]
-        x_cat = torch.cat(x_cat_list, 1) # [B, total_anchors, C]
-        x_cat = x_cat.permute(0, 2, 1) # [B, C, total_anchors]
-        if self.format != "imx" and (self.dynamic or self.shape != shape):
-            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+        
+        # NPU 친화적인 flatten과 cat을 사용하여 모든 레벨의 예측을 하나로 합칩니다.
+        x_cat = torch.cat([torch.flatten(xi, start_dim=2) for xi in x], dim=2)
+
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (y.transpose(0, 1) for y in make_anchors(x, self.stride, 0.5))
             self.shape = shape
-
-        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
-            box = x_cat[:, : self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4 : self.reg_max * 4 + self.nc]
-            if self.with_depth:
-                depth = x_cat[:, self.reg_max * 4 + self.nc :]
+        
+        # box와 cls 예측을 분리합니다.
+        if self.with_depth:
+            box, cls, depth = x_cat.split((self.reg_max * 4, self.nc, 1), 1)
         else:
-            if self.with_depth:
-                box, cls, depth = x_cat.split((self.reg_max * 4, self.nc, 1), 1)
-            else:
-                box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
 
-        if self.export and self.format in {"tflite", "edgetpu"}:
-            # Precompute normalization factor to increase numerical stability
-            # See https://github.com/ultralytics/ultralytics/issues/7371
-            grid_h = shape[2]
-            grid_w = shape[3]
-            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
-            norm = self.strides / (self.stride[0] * grid_size)
-            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
-        elif self.export and self.format == "imx":
-            dbox = self.decode_bboxes(
-                self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
-            )
-            return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
-        else:
-            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+        # DFL과 decode_bboxes를 전체 텐서에 대해 한 번만 호출합니다.
+        dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
 
         if self.with_depth:
             return torch.cat((dbox, cls.sigmoid(), depth.sigmoid()), 1)
         else:
             return torch.cat((dbox, cls.sigmoid()), 1)
+
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""

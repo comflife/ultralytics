@@ -53,45 +53,78 @@ __all__ = (
 )
 
 
+# class DFL(nn.Module):
+#     """
+#     Integral module of Distribution Focal Loss (DFL).
+
+#     Proposed in Generalized Focal Loss https://ieeexplore.ieee.org/document/9792391
+#     """
+
+#     def __init__(self, c1=16):
+#         """Initialize a convolutional layer with a given number of input channels."""
+#         super().__init__()
+#         self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
+#         x = torch.arange(c1, dtype=torch.float)
+#         self.conv.weight.data[:] = nn.Parameter(x.view(1, c1, 1, 1))
+#         self.c1 = c1
+
+#     def forward(self, x):
+#         """Apply the DFL module to input tensor and return transformed output."""
+#         b, _, a = x.shape  # batch, channels, anchors
+#         return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
+#         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
+
+
+
 class DFL(nn.Module):
     """
     Integral module of Distribution Focal Loss (DFL).
-
-    Proposed in Generalized Focal Loss https://ieeexplore.ieee.org/document/9792391
+    This is the final NPU-friendly version for inference, using a sigmoid-conv
+    combination to replace unsupported softmax and argmax operators.
     """
 
     def __init__(self, c1=16):
-        """Initialize a convolutional layer with a given number of input channels."""
+        """Initialize a convolutional layer with a fixed weight for weighted average."""
         super().__init__()
         self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
+        # Initialize kernel weights to represent positions [0, 1, 2, ..., c1-1]
         x = torch.arange(c1, dtype=torch.float)
         self.conv.weight.data[:] = nn.Parameter(x.view(1, c1, 1, 1))
         self.c1 = c1
 
     def forward(self, x):
-        """Apply the DFL module to input tensor and return transformed output."""
-        b, _, a = x.shape  # batch, channels, anchors
-        return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
-        # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
+        """
+        Apply a sigmoid-based weighted average to decode box coordinates.
+        This method is robust for both 3D and 4D inputs and uses only NPU-safe operators.
+        """
+        # --- Step 1: Ensure input tensor is 3D ---
+        # Handle 4D input from validation/export by flattening spatial dimensions
+        if x.ndim == 4:
+            x = x.flatten(start_dim=2)
 
-# class DFL(nn.Module):
-#     def __init__(self, c1=16):
-#         super().__init__()
-#         self.c1 = int(c1)
-#         # 0..C-1 인덱스 벡터를 상수로 보유
-#         idx = torch.arange(self.c1, dtype=torch.float32).view(1, 1, self.c1, 1)  # (1,1,C,1)
-#         self.register_buffer("bins", idx, persistent=True)
+        b, c, a = x.shape  # b=batch, c=channels (4*c1), a=anchors
 
-#     def forward(self, x):
-#         b, c_total, a = x.shape
-#         assert c_total % 4 == 0 and c_total // 4 == self.c1
-#         x = x.view(b, 4, self.c1, a)              # (B,4,C,A)
-#         lsm = F.log_softmax(x, dim=2)             # (B,4,C,A)
-#         probs = torch.exp(lsm)                    # (B,4,C,A)
-#         # 기대값 = sum(probs * bins) over C
-#         # bins broadcast: (1,1,C,1)
-#         e = (probs * self.bins).sum(dim=2)        # (B,4,A)
-#         return e
+        # --- Step 2: Reshape and Normalize with Sigmoid ---
+        # Reshape from [B, 4*c1, A] to [B*4, c1, 1, A] to isolate the distribution (c1)
+        # for each of the 4 coordinates. This prepares the tensor for the 1x1 convolution.
+        x = x.reshape(b * 4, self.c1, 1, a)
+
+        # Apply sigmoid to logits. This scales them to a [0, 1] range, acting as
+        # pseudo-probabilities. This is the replacement for the unsupported softmax.
+        x = torch.sigmoid(x)
+
+        # --- Step 3: Calculate Weighted Average using Conv ---
+        # Apply the 1x1 convolution. This is equivalent to a dot product between the
+        # sigmoid-activated weights and the kernel [0, 1, ..., c1-1],
+        # efficiently calculating the expected value.
+        x = self.conv(x)
+
+        # --- Step 4: Reshape back to the desired output format ---
+        # Reshape from [B*4, 1, 1, A] back to [B, 4, A]
+        x = x.view(b, 4, a)
+
+        return x
+
 
 
 
