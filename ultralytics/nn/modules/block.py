@@ -74,6 +74,26 @@ class DFL(nn.Module):
         return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
         # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
 
+# class DFL(nn.Module):
+#     def __init__(self, c1=16):
+#         super().__init__()
+#         self.c1 = int(c1)
+#         # 0..C-1 인덱스 벡터를 상수로 보유
+#         idx = torch.arange(self.c1, dtype=torch.float32).view(1, 1, self.c1, 1)  # (1,1,C,1)
+#         self.register_buffer("bins", idx, persistent=True)
+
+#     def forward(self, x):
+#         b, c_total, a = x.shape
+#         assert c_total % 4 == 0 and c_total // 4 == self.c1
+#         x = x.view(b, 4, self.c1, a)              # (B,4,C,A)
+#         lsm = F.log_softmax(x, dim=2)             # (B,4,C,A)
+#         probs = torch.exp(lsm)                    # (B,4,C,A)
+#         # 기대값 = sum(probs * bins) over C
+#         # bins broadcast: (1,1,C,1)
+#         e = (probs * self.bins).sum(dim=2)        # (B,4,A)
+#         return e
+
+
 
 class Proto(nn.Module):
     """Ultralytics YOLO models mask Proto module for segmentation models."""

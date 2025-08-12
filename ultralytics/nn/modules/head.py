@@ -208,7 +208,10 @@ class Detect(nn.Module):
         """
         # Inference path
         shape = x[0].shape  # BCHW
-        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        # x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        x_cat_list = [xi.view(shape[0], self.no, -1) for xi in x]
+        x_cat = torch.cat([i.permute(0, 2, 1) for i in x_cat_list], 1)
+        x_cat = x_cat.permute(0, 2, 1)
         if self.format != "imx" and (self.dynamic or self.shape != shape):
             self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
             self.shape = shape

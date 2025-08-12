@@ -26,8 +26,14 @@ __all__ = (
 )
 
 
+
+# --- Helper Functions and Basic Building Blocks ---
+
 def autopad(k, p=None, d=1):
-    """Pad to 'same' shape outputs."""
+    """
+    Pad to 'same' shape outputs.
+    Calculates padding for a convolution layer to maintain spatial dimensions with stride=1.
+    """
     if d > 1:
         k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
     if p is None:
@@ -35,30 +41,35 @@ def autopad(k, p=None, d=1):
     return p
 
 
+# --- Custom Backbone Modules ---
+
 class MultiStreamConv(nn.Module):
+    """
+    Custom dual-stream convolution that splits channels, processes them in parallel,
+    and concatenates the results. Uses standard 'same' padding.
+    """
     def __init__(self, c1, c2, k=1, s=1, g=1, d=1, act=True):
         super().__init__()
         if c1 % 2 != 0 or c2 % 2 != 0:
-            raise ValueError("Input and output channels must be divisible by 2.")
+            raise ValueError("Input and output channels must be divisible by 2 for MultiStreamConv.")
 
         c1_half = c1 // 2
         c2_half = c2 // 2
 
-        # Split using fixed 1x1 conv weights (no indexing in loop → no Expand)
+        # Fixed 1x1 convs for channel splitting (NPU-friendly)
         w1 = torch.zeros(c1_half, c1, 1, 1)
         w2 = torch.zeros(c1_half, c1, 1, 1)
-        for i in range(c1_half):
-            w1[i, i, 0, 0] = 1.0
-            w2[i, i + c1_half, 0, 0] = 1.0
+        w1[:, :c1_half, 0, 0] = torch.eye(c1_half)
+        w2[:, c1_half:, 0, 0] = torch.eye(c1_half)
 
         self.split1 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
         self.split2 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
         self.split1.weight = nn.Parameter(w1, requires_grad=False)
         self.split2.weight = nn.Parameter(w2, requires_grad=False)
 
-        # Conv without padding
-        self.conv1 = Conv(c1_half, c2_half, k, s, p=0, g=g, d=d, act=act)
-        self.conv2 = Conv(c1_half, c2_half, k, s, p=0, g=g, d=d, act=act)
+        # Processing convs with standard 'same' padding
+        self.conv1 = Conv(c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
+        self.conv2 = Conv(c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
 
     def forward(self, x):
         stream1 = self.split1(x)
@@ -67,25 +78,21 @@ class MultiStreamConv(nn.Module):
         out2 = self.conv2(stream2)
         return torch.cat([out1, out2], dim=1)
 
-# -------------------------------------------------
-# SpatialAlignedMultiStreamConv (wide / narrow 스트림)
-# -------------------------------------------------
-
-
 
 class SpatialAlignedMultiStreamConv(nn.Module):
     """
-    NPU-friendly spatially-aligned dual-stream conv.
-    - [최종 수정] forward에서 동적 생성을 피하기 위해, 최대 해상도 마스크를 미리 생성하고 crop하여 사용합니다.
+    NPU-friendly spatially-aligned dual-stream conv. This module only performs
+    feature fusion and does NOT downsample (stride is fixed to 1).
+    Downsampling should be handled by a subsequent standard Conv layer in the YAML file.
     """
-    def __init__(self, c1, c2, max_hw, k=1, s=1, p=None, d=1, act=True):
+    def __init__(self, c1, c2, max_hw, k=1, p=None, d=1, act=True):
         super().__init__()
         if c1 % 2 != 0:
-            raise ValueError("Input channels 'c1' must be divisible by 2.")
+            raise ValueError("Input channels must be divisible by 2 for SpatialAlignedMultiStreamConv.")
         
         self.c_half = c1 // 2
         
-        # --- 채널 분할 및 스트림 처리부 (이전과 동일) ---
+        # Channel splitting for wide/narrow streams
         w_wide = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
         w_wide[:, :self.c_half, 0, 0] = torch.eye(self.c_half)
         self.split_wide = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
@@ -96,26 +103,25 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         self.split_narrow = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
         self.split_narrow.weight = nn.Parameter(w_narrow, requires_grad=False)
         
+        # Independent processors for each stream
         self.wide_processor   = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
         self.narrow_processor = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
 
+        # Alignment components
         self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2)
         
         w_place = torch.zeros((self.c_half, 1, 2, 2), dtype=torch.float32)
         w_place[:, 0, 0, 0] = 1.0
         self.register_buffer("place_weight", w_place, persistent=True)
         
-        # --- [수정] 최대 해상도 마스크를 __init__에서 미리 생성 ---
+        # Pre-calculates a large static mask based on max_hw
         max_H, max_W = int(max_hw[0]), int(max_hw[1])
-        
         narrow_bbox = {
             'center_x': 0.499289, 'center_y': 0.499912,
             'width': 0.286041, 'height': 0.291975
         }
-        
         cx, cy = narrow_bbox['center_x'] * max_W, narrow_bbox['center_y'] * max_H
         bw, bh = narrow_bbox['width'] * max_W, narrow_bbox['height'] * max_H
-        
         left = max(0, int(round(cx - bw / 2)))
         top = max(0, int(round(cy - bh / 2)))
         right = min(max_W, int(round(left + bw)))
@@ -124,17 +130,18 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         mask = torch.zeros(1, 1, max_H, max_W, dtype=torch.float32)
         if top < bottom and left < right:
             mask[:, :, top:bottom, left:right] = 1.0
-        
-        # 최대 크기 마스크를 정적 버퍼로 등록
         self.register_buffer("full_res_mask", mask, persistent=True)
 
-        self.fusion_conv = Conv(self.c_half, c2, k=k, s=s, p=p, g=1, d=d, act=act)
+        # Final fusion conv, always with stride=1 to preserve resolution
+        self.fusion_conv = Conv(self.c_half, c2, k=k, s=1, p=p, g=1, d=d, act=act)
 
     def forward(self, x):
         wide = self.split_wide(x)
         narrow = self.split_narrow(x)
+        
         wide_proc = self.wide_processor(wide)
         narrow_proc = self.narrow_processor(narrow)
+        
         narrow_down = self.downscaler(narrow_proc)
         
         target_h, target_w = wide_proc.shape[2:]
@@ -148,96 +155,26 @@ class SpatialAlignedMultiStreamConv(nn.Module):
             output_padding=(output_padding_h, output_padding_w), groups=self.c_half
         )
         
-        # --- [수정] 미리 생성된 큰 마스크에서 현재 해상도에 맞게 잘라내어 사용 ---
+        # Crops the runtime_mask from the large static mask
         H, W = aligned_raw.shape[2:]
         max_H, max_W = self.full_res_mask.shape[2:]
         
-        # 중앙 정렬을 위한 crop 시작점 계산
+        if H > max_H or W > max_W:
+            raise ValueError(
+                f"Runtime feature map size ({H}, {W}) is larger than max_hw ({max_H}, {max_W}) defined in YAML. "
+                f"Please increase the max_hw value for this layer in your YAML file."
+            )
+        
         start_h = (max_H - H) // 2
         start_w = (max_W - W) // 2
         
-        # 큰 마스크에서 필요한 부분만 잘라내기 (view 생성, 메모리 복사 없음)
         runtime_mask = self.full_res_mask[:, :, start_h : start_h + H, start_w : start_w + W]
         
         aligned = aligned_raw * runtime_mask
-        
         fused = wide_proc + aligned
         out = self.fusion_conv(fused)
         
         return out
-
-# class MultiStreamConv(nn.Module):
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         super().__init__()
-#         if c1 % 2 != 0 or c2 % 2 != 0:
-#             raise ValueError("Input and output channels must be divisible by 2 for groups=2.")
-        
-#         # self.conv = Conv(c1, c2, k, s, p=p, g=2, d=d, act=act)
-#         self.conv = Conv(c1, c2, k, s, p=p, g=1, d=d, act=act)
-
-#     def forward(self, x):
-#         return self.conv(x)
-
-
-
-
-
-# class SpatialAlignedMultiStreamConv(nn.Module):
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         super().__init__()
-#         c_in_half = c1 // 2
-#         if c1 % 2 != 0:
-#             raise ValueError("Input channels 'c1' must be divisible by 2.")
-
-#         self.wide_processor = Conv(c_in_half, c_in_half, k=3, s=1, p=1, g=g, d=d, act=act)
-#         self.narrow_processor = Conv(c_in_half, c_in_half, k=3, s=1, p=1, g=g, d=d, act=act)
-
-#         self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2)
-
-#         self.narrow_bbox = {
-#             'center_x': 0.499289, 'center_y': 0.499912,
-#             'width': 0.286041, 'height': 0.291975
-#         }
-
-#         self.fusion_conv = Conv(c_in_half, c2, k=k, s=s, p=p, g=g, d=d, act=act)
-
-#     def forward(self, x):
-#         c_half = x.shape[1] // 2
-#         wide_feature = x[:, :c_half]
-#         narrow_feature = x[:, c_half:]
-
-#         wide_processed = self.wide_processor(wide_feature)
-#         narrow_processed = self.narrow_processor(narrow_feature)
-
-#         narrow_downscaled = self.downscaler(narrow_processed)
-        
-#         aligned_narrow_canvas = self.place_feature_with_pad(narrow_downscaled, wide_processed.shape)
-        
-#         fused_feature = wide_processed + aligned_narrow_canvas
-
-#         output = self.fusion_conv(fused_feature)
-#         return output
-
-#     def place_feature_with_pad(self, narrow_feature, wide_shape):
-#         B, C, H_wide, W_wide = wide_shape
-#         _, _, H_narrow, W_narrow = narrow_feature.shape
-
-#         center_x_pixel = self.narrow_bbox['center_x'] * W_wide
-#         center_y_pixel = self.narrow_bbox['center_y'] * H_wide
-        
-#         pad_left = int(center_x_pixel - W_narrow / 2)
-#         pad_top = int(center_y_pixel - H_narrow / 2)
-
-#         pad_right = W_wide - (pad_left + W_narrow)
-#         pad_bottom = H_wide - (pad_top + H_narrow)
-        
-#         if pad_left < 0 or pad_top < 0 or pad_right < 0 or pad_bottom < 0:
-#             print("Warning: Feature placement is out of bounds. Returning zero canvas.")
-#             return torch.zeros(wide_shape, device=narrow_feature.device, dtype=narrow_feature.dtype)
-
-#         padded_feature = F.pad(narrow_feature, (pad_left, pad_right, pad_top, pad_bottom), "constant", 0)
-        
-#         return padded_feature
 
 
 class MultiStreamMaxPool2d(nn.Module):
