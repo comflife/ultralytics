@@ -70,99 +70,101 @@ class MultiStreamConv(nn.Module):
 # -------------------------------------------------
 # SpatialAlignedMultiStreamConv (wide / narrow 스트림)
 # -------------------------------------------------
+
+
+
 class SpatialAlignedMultiStreamConv(nn.Module):
     """
-    NPU 호환성을 위한 Dual-stream Conv 모듈
-    - wide/narrow 각각 독립 처리 후 공간 정렬하여 융합
-    - groups=1로 설정하여 NPU 최적화 호환성 확보
-    - 모든 채널은 16의 배수로 설정 권장
+    NPU-friendly spatially-aligned dual-stream conv.
+    - [최종 수정] forward에서 동적 생성을 피하기 위해, 최대 해상도 마스크를 미리 생성하고 crop하여 사용합니다.
     """
-    def __init__(self, c1, c2, k=1, s=1, p=None, d=1, act=True):
+    def __init__(self, c1, c2, max_hw, k=1, s=1, p=None, d=1, act=True):
         super().__init__()
         if c1 % 2 != 0:
             raise ValueError("Input channels 'c1' must be divisible by 2.")
         
-        c_half = c1 // 2
-
-        # 1x1 Conv를 사용해 채널을 분리 (NPU 슬라이스 오류 회피)
-        self.split_wide = nn.Conv2d(c1, c_half, kernel_size=1, stride=1, padding=0, groups=1, bias=False)
-        self.split_narrow = nn.Conv2d(c1, c_half, kernel_size=1, stride=1, padding=0, groups=1, bias=False)
+        self.c_half = c1 // 2
         
-        # 1x1 Conv 가중치를 수동으로 설정하여 identity-like 연산 수행
-        with torch.no_grad():
-            self.split_wide.weight.zero_()
-            self.split_narrow.weight.zero_()
-            for i in range(c_half):
-                # wide: 입력의 앞 절반 채널 선택
-                self.split_wide.weight[i, i, 0, 0] = 1.0
-                # narrow: 입력의 뒤 절반 채널 선택
-                self.split_narrow.weight[i, i + c_half, 0, 0] = 1.0
+        # --- 채널 분할 및 스트림 처리부 (이전과 동일) ---
+        w_wide = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
+        w_wide[:, :self.c_half, 0, 0] = torch.eye(self.c_half)
+        self.split_wide = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
+        self.split_wide.weight = nn.Parameter(w_wide, requires_grad=False)
 
-        # 각 스트림 처리용 Conv (groups=1로 안전하게 설정)
-        self.wide_processor   = Conv(c_half, c_half, k=3, s=1, p=1, g=1, d=d, act=act)
-        self.narrow_processor = Conv(c_half, c_half, k=3, s=1, p=1, g=1, d=d, act=act)
+        w_narrow = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
+        w_narrow[:, self.c_half:, 0, 0] = torch.eye(self.c_half)
+        self.split_narrow = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
+        self.split_narrow.weight = nn.Parameter(w_narrow, requires_grad=False)
+        
+        self.wide_processor   = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
+        self.narrow_processor = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
 
         self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2)
-
-        self.narrow_bbox = {
+        
+        w_place = torch.zeros((self.c_half, 1, 2, 2), dtype=torch.float32)
+        w_place[:, 0, 0, 0] = 1.0
+        self.register_buffer("place_weight", w_place, persistent=True)
+        
+        # --- [수정] 최대 해상도 마스크를 __init__에서 미리 생성 ---
+        max_H, max_W = int(max_hw[0]), int(max_hw[1])
+        
+        narrow_bbox = {
             'center_x': 0.499289, 'center_y': 0.499912,
             'width': 0.286041, 'height': 0.291975
         }
+        
+        cx, cy = narrow_bbox['center_x'] * max_W, narrow_bbox['center_y'] * max_H
+        bw, bh = narrow_bbox['width'] * max_W, narrow_bbox['height'] * max_H
+        
+        left = max(0, int(round(cx - bw / 2)))
+        top = max(0, int(round(cy - bh / 2)))
+        right = min(max_W, int(round(left + bw)))
+        bottom = min(max_H, int(round(top + bh)))
+        
+        mask = torch.zeros(1, 1, max_H, max_W, dtype=torch.float32)
+        if top < bottom and left < right:
+            mask[:, :, top:bottom, left:right] = 1.0
+        
+        # 최대 크기 마스크를 정적 버퍼로 등록
+        self.register_buffer("full_res_mask", mask, persistent=True)
 
-        # 최종 융합 Conv (groups=1)
-        self.fusion_conv = Conv(c_half, c2, k=k, s=s, p=p, g=1, d=d, act=act)
+        self.fusion_conv = Conv(self.c_half, c2, k=k, s=s, p=p, g=1, d=d, act=act)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-
-        # 1x1 Conv로 채널 분리
-        wide   = self.split_wide(x)
+        wide = self.split_wide(x)
         narrow = self.split_narrow(x)
-
-        wide_proc   = self.wide_processor(wide)
+        wide_proc = self.wide_processor(wide)
         narrow_proc = self.narrow_processor(narrow)
-
         narrow_down = self.downscaler(narrow_proc)
-
-        narrow_aligned = self._place_feature_with_pad(narrow_down, wide_proc.shape)
-
-        fused = wide_proc + narrow_aligned
-
+        
+        target_h, target_w = wide_proc.shape[2:]
+        down_h, down_w = narrow_down.shape[2:]
+        
+        raw_out_h, raw_out_w = (down_h - 1) * 2 + 2, (down_w - 1) * 2 + 2
+        output_padding_h, output_padding_w = target_h - raw_out_h, target_w - raw_out_w
+        
+        aligned_raw = F.conv_transpose2d(
+            narrow_down, self.place_weight, bias=None, stride=2, padding=0, 
+            output_padding=(output_padding_h, output_padding_w), groups=self.c_half
+        )
+        
+        # --- [수정] 미리 생성된 큰 마스크에서 현재 해상도에 맞게 잘라내어 사용 ---
+        H, W = aligned_raw.shape[2:]
+        max_H, max_W = self.full_res_mask.shape[2:]
+        
+        # 중앙 정렬을 위한 crop 시작점 계산
+        start_h = (max_H - H) // 2
+        start_w = (max_W - W) // 2
+        
+        # 큰 마스크에서 필요한 부분만 잘라내기 (view 생성, 메모리 복사 없음)
+        runtime_mask = self.full_res_mask[:, :, start_h : start_h + H, start_w : start_w + W]
+        
+        aligned = aligned_raw * runtime_mask
+        
+        fused = wide_proc + aligned
         out = self.fusion_conv(fused)
+        
         return out
-
-    def _place_feature_with_pad(self, narrow, target_shape):
-        """
-        narrow   : (B, C, H_n, W_n)
-        target   : (B, C, H_t, W_t)   <-- wide_processed.shape
-        """
-        B, C, H_t, W_t = target_shape
-        _, _, H_n, W_n = narrow.shape
-
-        # bbox 를 절대 좌표(픽셀) 로 변환
-        cx = self.narrow_bbox['center_x'] * W_t
-        cy = self.narrow_bbox['center_y'] * H_t
-        w  = self.narrow_bbox['width']    * W_t
-        h  = self.narrow_bbox['height']   * H_t
-
-        left = int(cx - w / 2)
-        top  = int(cy - h / 2)
-
-        pad_left   = left
-        pad_top    = top
-        pad_right  = W_t - (left + W_n)
-        pad_bottom = H_t - (top  + H_n)
-
-        if min(pad_left, pad_top, pad_right, pad_bottom) < 0:
-            # out‑of‑bound → 전부 0 로 채운 캔버스 반환
-            return torch.zeros(target_shape,
-                               device=narrow.device,
-                               dtype=narrow.dtype)
-
-        padded = F.pad(narrow,
-                       (pad_left, pad_right, pad_top, pad_bottom),
-                       mode='constant', value=0)
-        return padded
 
 # class MultiStreamConv(nn.Module):
 #     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
