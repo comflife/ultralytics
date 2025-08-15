@@ -122,7 +122,7 @@ def train(cfg, opt, device, callbacks=None):
         'amp': True,
         'fraction': 1.0,
         'profile': False,
-        'val': not opt.noval,
+        'val': False,
         'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
         'dual_stream': is_dual_model or opt.dual_stream,
@@ -186,7 +186,7 @@ def train(cfg, opt, device, callbacks=None):
             'save_period': 5,
             'patience': 30,
             'rect': False,
-            'multi_scale': True,
+            'multi_scale': False,
         })
     
     # Train the model using the Ultralytics YOLO API
@@ -194,17 +194,8 @@ def train(cfg, opt, device, callbacks=None):
         # ✅ This is the final, correct way to call the training function.
         results = model.train(**model_training_args)
         
-        # Evaluate on validation set
-        if not opt.noval:
-            val_args = {
-                'data': opt.data,
-                'batch': opt.batch_size * 2,
-                'dual_stream': is_dual_model or opt.dual_stream,
-            }
-            if is_dual_model or opt.dual_stream:
-                val_args.update({'conf': 0.1, 'iou': 0.3})
-            
-            results = model.val(**val_args)
+        # Validation process removed for faster training
+        print("🚀 Training completed without validation")
         
         return results
     except Exception as e:

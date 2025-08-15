@@ -34,7 +34,7 @@ def load_depth_normalization_info(norm_info_path="depth_normalization_info.json"
 
 def export_dual_depth_model_to_onnx(
     model_path: str, output_path: str = None, imgsz: int = 640,
-    half: bool = False, dynamic: bool = False, opset: int = 11, device: str = "cpu"
+    half: bool = False, dynamic: bool = False, opset: int = 13, device: str = "cpu"
 ):
     print(f"\n🚀 Loading model from: {model_path}")
     depth_info = load_depth_normalization_info()

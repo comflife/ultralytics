@@ -45,54 +45,85 @@ def autopad(k, p=None, d=1):
 
 class MultiStreamConv(nn.Module):
     """
-    Custom dual-stream convolution that splits channels, processes them in parallel,
-    and concatenates the results. Uses standard 'same' padding.
+    NPU-friendly dual-stream convolution.
+    Uses standard tensor slicing for channel splitting.
     """
     def __init__(self, c1, c2, k=1, s=1, g=1, d=1, act=True):
         super().__init__()
         if c1 % 2 != 0 or c2 % 2 != 0:
             raise ValueError("Input and output channels must be divisible by 2 for MultiStreamConv.")
 
-        c1_half = c1 // 2
+        self.c1_half = c1 // 2
         c2_half = c2 // 2
-
-        # Fixed 1x1 convs for channel splitting (NPU-friendly)
-        w1 = torch.zeros(c1_half, c1, 1, 1)
-        w2 = torch.zeros(c1_half, c1, 1, 1)
-        w1[:, :c1_half, 0, 0] = torch.eye(c1_half)
-        w2[:, c1_half:, 0, 0] = torch.eye(c1_half)
-
-        self.split1 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
-        self.split2 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
-        self.split1.weight = nn.Parameter(w1, requires_grad=False)
-        self.split2.weight = nn.Parameter(w2, requires_grad=False)
-
-        # Processing convs with standard 'same' padding
-        self.conv1 = Conv(c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
-        self.conv2 = Conv(c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
+        
+        # 🔴 Conv로 구현했던 Split 부분을 완전히 제거
+        
+        # 각 스트림을 처리할 Conv 레이어만 정의
+        self.conv1 = Conv(self.c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
+        self.conv2 = Conv(self.c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
 
     def forward(self, x):
-        stream1 = self.split1(x)
-        stream2 = self.split2(x)
+        # 🔴 표준 텐서 슬라이싱으로 6채널 입력을 3채널씩 두 개로 분리
+        # x의 형태: [Batch, 6, H, W]
+        stream1 = x[:, :self.c1_half, :, :]  # 앞쪽 3개 채널
+        stream2 = x[:, self.c1_half:, :, :]  # 뒤쪽 3개 채널
+        
         out1 = self.conv1(stream1)
         out2 = self.conv2(stream2)
+        
         return torch.cat([out1, out2], dim=1)
+
+# class MultiStreamConv(nn.Module):
+#     """
+#     Custom dual-stream convolution that splits channels, processes them in parallel,
+#     and concatenates the results. Uses standard 'same' padding.
+#     """
+#     def __init__(self, c1, c2, k=1, s=1, g=1, d=1, act=True):
+#         super().__init__()
+#         if c1 % 2 != 0 or c2 % 2 != 0:
+#             raise ValueError("Input and output channels must be divisible by 2 for MultiStreamConv.")
+
+#         c1_half = c1 // 2
+#         c2_half = c2 // 2
+
+#         # Fixed 1x1 convs for channel splitting (NPU-friendly)
+#         w1 = torch.zeros(c1_half, c1, 1, 1)
+#         w2 = torch.zeros(c1_half, c1, 1, 1)
+#         w1[:, :c1_half, 0, 0] = torch.eye(c1_half)
+#         w2[:, c1_half:, 0, 0] = torch.eye(c1_half)
+
+#         self.split1 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
+#         self.split2 = nn.Conv2d(c1, c1_half, kernel_size=1, stride=1, padding=0, bias=False)
+#         self.split1.weight = nn.Parameter(w1, requires_grad=False)
+#         self.split2.weight = nn.Parameter(w2, requires_grad=False)
+
+#         # Processing convs with standard 'same' padding
+#         self.conv1 = Conv(c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
+#         self.conv2 = Conv(c1_half, c2_half, k, s, p=None, g=g, d=d, act=act)
+
+#     def forward(self, x):
+#         stream1 = self.split1(x)
+#         stream2 = self.split2(x)
+#         out1 = self.conv1(stream1)
+#         out2 = self.conv2(stream2)
+#         return torch.cat([out1, out2], dim=1)
 
 
 class SpatialAlignedMultiStreamConv(nn.Module):
     """
-    NPU-friendly spatially-aligned dual-stream conv. This module only performs
-    feature fusion and does NOT downsample (stride is fixed to 1).
-    Downsampling should be handled by a subsequent standard Conv layer in the YAML file.
+    NPU-friendly spatially-aligned dual-stream conv. (REVISED STATIC VERSION)
+    - Replaced F.conv_transpose2d with nn.Upsample + nn.Conv2d.
+    - Removed dynamic mask slicing, simplifying the fusion to element-wise addition.
+    - This module does NOT downsample (stride is fixed to 1).
     """
-    def __init__(self, c1, c2, max_hw, k=1, p=None, d=1, act=True):
+    def __init__(self, c1, c2, max_hw, k=1, p=None, d=1, act=True): # max_hw는 더 이상 사용되지 않지만, YAML 호환성을 위해 남겨둠
         super().__init__()
         if c1 % 2 != 0:
             raise ValueError("Input channels must be divisible by 2 for SpatialAlignedMultiStreamConv.")
         
         self.c_half = c1 // 2
         
-        # Channel splitting for wide/narrow streams
+        # 1. 채널 분리 (기존과 동일)
         w_wide = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
         w_wide[:, :self.c_half, 0, 0] = torch.eye(self.c_half)
         self.split_wide = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
@@ -103,36 +134,19 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         self.split_narrow = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
         self.split_narrow.weight = nn.Parameter(w_narrow, requires_grad=False)
         
-        # Independent processors for each stream
+        # 2. 각 스트림 독립 처리 (기존과 동일)
         self.wide_processor   = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
         self.narrow_processor = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
 
-        # Alignment components
-        self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2)
+        # 3. [수정] Upsampling 방식 변경: conv_transpose2d 대신 표준 Upsample + Conv 사용
+        #    이 방식이 NPU 호환성이 훨씬 높습니다.
+        self.upsampler = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            Conv(self.c_half, self.c_half, k=3, s=1, p=1, act=act)
+        )
         
-        w_place = torch.zeros((self.c_half, 1, 2, 2), dtype=torch.float32)
-        w_place[:, 0, 0, 0] = 1.0
-        self.register_buffer("place_weight", w_place, persistent=True)
-        
-        # Pre-calculates a large static mask based on max_hw
-        max_H, max_W = int(max_hw[0]), int(max_hw[1])
-        narrow_bbox = {
-            'center_x': 0.499289, 'center_y': 0.499912,
-            'width': 0.286041, 'height': 0.291975
-        }
-        cx, cy = narrow_bbox['center_x'] * max_W, narrow_bbox['center_y'] * max_H
-        bw, bh = narrow_bbox['width'] * max_W, narrow_bbox['height'] * max_H
-        left = max(0, int(round(cx - bw / 2)))
-        top = max(0, int(round(cy - bh / 2)))
-        right = min(max_W, int(round(left + bw)))
-        bottom = min(max_H, int(round(top + bh)))
-        
-        mask = torch.zeros(1, 1, max_H, max_W, dtype=torch.float32)
-        if top < bottom and left < right:
-            mask[:, :, top:bottom, left:right] = 1.0
-        self.register_buffer("full_res_mask", mask, persistent=True)
-
-        # Final fusion conv, always with stride=1 to preserve resolution
+        # 4. [수정] 최종 Fusion Conv (기존과 유사)
+        #    입력 채널이 wide_proc(c_half)와 upsampler(c_half)의 합이므로 c1이 됩니다.
         self.fusion_conv = Conv(self.c_half, c2, k=k, s=1, p=p, g=1, d=d, act=act)
 
     def forward(self, x):
@@ -142,39 +156,117 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         wide_proc = self.wide_processor(wide)
         narrow_proc = self.narrow_processor(narrow)
         
-        narrow_down = self.downscaler(narrow_proc)
+        # 5. [수정] 동적 마스킹 및 정렬 로직을 단순한 Upsample + Add로 대체
+        #    가장 확실하고 NPU 친화적인 퓨전 방식입니다.
+        narrow_upsampled = self.upsampler(narrow_proc)
         
-        target_h, target_w = wide_proc.shape[2:]
-        down_h, down_w = narrow_down.shape[2:]
+        # 해상도를 맞추기 위한 Crop (만약 upsample 결과가 1픽셀 크다면)
+        if narrow_upsampled.shape[2:] != wide_proc.shape[2:]:
+            target_h, target_w = wide_proc.shape[2:]
+            narrow_upsampled = narrow_upsampled[:, :, :target_h, :target_w]
+
+        fused = wide_proc + narrow_upsampled
         
-        raw_out_h, raw_out_w = (down_h - 1) * 2 + 2, (down_w - 1) * 2 + 2
-        output_padding_h, output_padding_w = target_h - raw_out_h, target_w - raw_out_w
-        
-        aligned_raw = F.conv_transpose2d(
-            narrow_down, self.place_weight, bias=None, stride=2, padding=0, 
-            output_padding=(output_padding_h, output_padding_w), groups=self.c_half
-        )
-        
-        # Crops the runtime_mask from the large static mask
-        H, W = aligned_raw.shape[2:]
-        max_H, max_W = self.full_res_mask.shape[2:]
-        
-        if H > max_H or W > max_W:
-            raise ValueError(
-                f"Runtime feature map size ({H}, {W}) is larger than max_hw ({max_H}, {max_W}) defined in YAML. "
-                f"Please increase the max_hw value for this layer in your YAML file."
-            )
-        
-        start_h = (max_H - H) // 2
-        start_w = (max_W - W) // 2
-        
-        runtime_mask = self.full_res_mask[:, :, start_h : start_h + H, start_w : start_w + W]
-        
-        aligned = aligned_raw * runtime_mask
-        fused = wide_proc + aligned
         out = self.fusion_conv(fused)
         
         return out
+
+# class SpatialAlignedMultiStreamConv(nn.Module):
+#     """
+#     NPU-friendly spatially-aligned dual-stream conv. This module only performs
+#     feature fusion and does NOT downsample (stride is fixed to 1).
+#     Downsampling should be handled by a subsequent standard Conv layer in the YAML file.
+#     """
+#     def __init__(self, c1, c2, max_hw, k=1, p=None, d=1, act=True):
+#         super().__init__()
+#         if c1 % 2 != 0:
+#             raise ValueError("Input channels must be divisible by 2 for SpatialAlignedMultiStreamConv.")
+        
+#         self.c_half = c1 // 2
+        
+#         # Channel splitting for wide/narrow streams
+#         w_wide = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
+#         w_wide[:, :self.c_half, 0, 0] = torch.eye(self.c_half)
+#         self.split_wide = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
+#         self.split_wide.weight = nn.Parameter(w_wide, requires_grad=False)
+
+#         w_narrow = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
+#         w_narrow[:, self.c_half:, 0, 0] = torch.eye(self.c_half)
+#         self.split_narrow = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
+#         self.split_narrow.weight = nn.Parameter(w_narrow, requires_grad=False)
+        
+#         # Independent processors for each stream
+#         self.wide_processor   = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
+#         self.narrow_processor = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
+
+#         # Alignment components
+#         self.downscaler = nn.AvgPool2d(kernel_size=2, stride=2)
+        
+#         w_place = torch.zeros((self.c_half, 1, 2, 2), dtype=torch.float32)
+#         w_place[:, 0, 0, 0] = 1.0
+#         self.register_buffer("place_weight", w_place, persistent=True)
+        
+#         # Pre-calculates a large static mask based on max_hw
+#         max_H, max_W = int(max_hw[0]), int(max_hw[1])
+#         narrow_bbox = {
+#             'center_x': 0.499289, 'center_y': 0.499912,
+#             'width': 0.286041, 'height': 0.291975
+#         }
+#         cx, cy = narrow_bbox['center_x'] * max_W, narrow_bbox['center_y'] * max_H
+#         bw, bh = narrow_bbox['width'] * max_W, narrow_bbox['height'] * max_H
+#         left = max(0, int(round(cx - bw / 2)))
+#         top = max(0, int(round(cy - bh / 2)))
+#         right = min(max_W, int(round(left + bw)))
+#         bottom = min(max_H, int(round(top + bh)))
+        
+#         mask = torch.zeros(1, 1, max_H, max_W, dtype=torch.float32)
+#         if top < bottom and left < right:
+#             mask[:, :, top:bottom, left:right] = 1.0
+#         self.register_buffer("full_res_mask", mask, persistent=True)
+
+#         # Final fusion conv, always with stride=1 to preserve resolution
+#         self.fusion_conv = Conv(self.c_half, c2, k=k, s=1, p=p, g=1, d=d, act=act)
+
+#     def forward(self, x):
+#         wide = self.split_wide(x)
+#         narrow = self.split_narrow(x)
+        
+#         wide_proc = self.wide_processor(wide)
+#         narrow_proc = self.narrow_processor(narrow)
+        
+#         narrow_down = self.downscaler(narrow_proc)
+        
+#         target_h, target_w = wide_proc.shape[2:]
+#         down_h, down_w = narrow_down.shape[2:]
+        
+#         raw_out_h, raw_out_w = (down_h - 1) * 2 + 2, (down_w - 1) * 2 + 2
+#         output_padding_h, output_padding_w = target_h - raw_out_h, target_w - raw_out_w
+        
+#         aligned_raw = F.conv_transpose2d(
+#             narrow_down, self.place_weight, bias=None, stride=2, padding=0, 
+#             output_padding=(output_padding_h, output_padding_w), groups=self.c_half
+#         )
+        
+#         # Crops the runtime_mask from the large static mask
+#         H, W = aligned_raw.shape[2:]
+#         max_H, max_W = self.full_res_mask.shape[2:]
+        
+#         if H > max_H or W > max_W:
+#             raise ValueError(
+#                 f"Runtime feature map size ({H}, {W}) is larger than max_hw ({max_H}, {max_W}) defined in YAML. "
+#                 f"Please increase the max_hw value for this layer in your YAML file."
+#             )
+        
+#         start_h = (max_H - H) // 2
+#         start_w = (max_W - W) // 2
+        
+#         runtime_mask = self.full_res_mask[:, :, start_h : start_h + H, start_w : start_w + W]
+        
+#         aligned = aligned_raw * runtime_mask
+#         fused = wide_proc + aligned
+#         out = self.fusion_conv(fused)
+        
+#         return out
 
 
 class MultiStreamMaxPool2d(nn.Module):
