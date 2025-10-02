@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dual Stream YOLO Inference Script with Depth Visualization
-Performs inference with dual-stream YOLO model and shows depth prediction + ground truth
+Dual Stream YOLO ONNX Inference Script with Depth Visualization
+Performs inference with dual-stream YOLO ONNX model and shows depth prediction + ground truth
 """
 
 import sys
@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 import time
 import random
 import json
+import onnxruntime as ort  # ONNX Runtime 추가
 
 # 🔧 로컬 ultralytics 모듈을 우선적으로 사용하도록 설정
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -28,8 +29,8 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 # 🛠️ 설정 부분 - 여기를 수정하세요!
 # ============================================================
 
-# 모델 파일 경로
-MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp350/weights/best.pt"
+# ONNX 모델 파일 경로
+ONNX_PATH = "/home/byounggun/ultralytics/runs/train/exp352/weights/best_dual_input_depth.onnx"
 
 # 입력 이미지 디렉토리
 WIDE_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/images/"
@@ -39,7 +40,7 @@ NARROW_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/val_narrow_images/"
 LABEL_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/labels/"
 
 # 출력 설정
-OUTPUT_DIR = "inference_results_depth"
+OUTPUT_DIR = "inference_results_depth_onnx"
 
 # 추론 설정
 CONFIDENCE_THRESHOLD = 0.3
@@ -214,24 +215,28 @@ def preprocess_image(image_path, target_size=640):
     
     return tensor, (original_height, original_width), image
 
-def create_dual_stream_input(wide_tensor, narrow_tensor):
+def create_dual_stream_inputs(wide_tensor, narrow_tensor):
     """
-    두 이미지를 듀얼 스트림 형태로 결합 (NPU 호환 4차원)
+    두 이미지를 별도의 입력으로 준비 (ONNX 모델이 두 입력을 기대할 경우)
     
     Args:
         wide_tensor (torch.Tensor): Wide stream 이미지 [3, H, W]
         narrow_tensor (torch.Tensor): Narrow stream 이미지 [3, H, W]
     
     Returns:
-        torch.Tensor: 듀얼 스트림 입력 [1, 6, H, W] - NPU 호환 4차원
+        dict: {'images_wide': np.ndarray [1, 3, H, W], 'images_narrow': np.ndarray [1, 3, H, W]}
     """
-    # 🔧 NPU 호환: 4차원 입력으로 변경 [1, 6, H, W]
-    # 두 이미지를 채널 차원에서 concat
-    dual_stream = torch.cat([wide_tensor, narrow_tensor], dim=0)  # [6, H, W]
-    dual_stream = dual_stream.unsqueeze(0)  # [1, 6, H, W]
+    # 각 이미지를 [1, 3, H, W]로 변환
+    wide_input = wide_tensor.unsqueeze(0).numpy()  # [1, 3, H, W]
+    narrow_input = narrow_tensor.unsqueeze(0).numpy()  # [1, 3, H, W]
     
-    print(f"🔗 Created dual stream input: {dual_stream.shape}")
-    return dual_stream
+    print(f"🔗 Created wide input: {wide_input.shape}")
+    print(f"🔗 Created narrow input: {narrow_input.shape}")
+    
+    return {
+        'images_wide': wide_input,
+        'images_narrow': narrow_input
+    }
 
 def postprocess_results_with_depth(predictions, original_size, target_size=640):
     """
@@ -271,9 +276,9 @@ def postprocess_results_with_depth(predictions, original_size, target_size=640):
     for detection in pred:
         # detection shape 확인
         if len(detection) >= 7:  # x1, y1, x2, y2, confidence, class_id, depth
-            x1, y1, x2, y2, confidence, class_id, depth = detection.cpu().numpy()[:7]
+            x1, y1, x2, y2, confidence, class_id, depth = detection[:7]
         elif len(detection) == 6:  # depth 정보가 없는 경우
-            x1, y1, x2, y2, confidence, class_id = detection.cpu().numpy()
+            x1, y1, x2, y2, confidence, class_id = detection
             depth = 0.0  # 기본값
         else:
             continue
@@ -324,7 +329,7 @@ def draw_detections_with_depth(image, detections, gt_labels, depth_denormalizer,
         np.ndarray: 검출 결과가 그려진 이미지
     """
     if class_names is None:
-        class_names = [f"class_{i}" for i in range(80)]  # COCO 클래스 수
+        class_names = [f"class_{i}" for i in range(28)]  # 클래스 수 28로 변경
     
     result_image = image.copy()
     img_height, img_width = image.shape[:2]
@@ -393,7 +398,7 @@ def draw_detections_with_depth(image, detections, gt_labels, depth_denormalizer,
 def main():
     """메인 inference 함수"""
     
-    print("🚀 Starting Dual Stream YOLO Inference with Depth...")
+    print("🚀 Starting Dual Stream YOLO ONNX Inference with Depth...")
     
     # Depth 역정규화 객체 생성
     depth_denormalizer = DepthDenormalizer()
@@ -404,14 +409,18 @@ def main():
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(exist_ok=True)
     
-    # 1. 모델 로드
-    print(f"📦 Loading model from: {MODEL_PATH}")
+    # ONNX Runtime 세션 로드
     try:
-        model = YOLO(MODEL_PATH)
-        print("✅ Model loaded successfully!")
+        providers = ['CPUExecutionProvider']  # 필요시 'CUDAExecutionProvider' 등 추가
+        ort_session = ort.InferenceSession(ONNX_PATH, providers=providers)
+        print("✅ ONNX Runtime session loaded successfully!")
     except Exception as e:
-        print(f"❌ Failed to load model: {e}")
+        print(f"❌ Failed to load ONNX model: {e}")
         return
+    
+    # 모델 입력 이름 확인
+    input_names = [input.name for input in ort_session.get_inputs()]
+    print(f"📥 Model input names: {input_names}")
     
     # 랜덤 이미지 세트 선택
     wide_files = [f for f in os.listdir(WIDE_DIR) if f.lower().endswith('.jpg')]
@@ -439,7 +448,7 @@ def main():
     print(f"🎯 Loaded {len(gt_labels)} GT labels")
     
     # 출력 파일 이름 동적 설정
-    OUTPUT_IMAGE_NAME = f"dual_stream_depth_result_{filename}"
+    OUTPUT_IMAGE_NAME = f"dual_stream_depth_result_onnx_{filename}"
     
     # 2. 이미지 전처리
     print("🖼️ Preprocessing images...")
@@ -450,42 +459,42 @@ def main():
         print(f"❌ Failed to preprocess images: {e}")
         return
     
-    # 3. 듀얼 스트림 입력 생성
-    dual_input = create_dual_stream_input(wide_tensor, narrow_tensor)
+    # 3. 듀얼 스트림 입력 생성 (별도 입력으로)
+    dual_inputs = create_dual_stream_inputs(wide_tensor, narrow_tensor)
     
-    # 4. 추론 실행
-    print("🔮 Running inference...")
+    # 4. ONNX 추론 실행
+    print("🔮 Running ONNX inference...")
     start_time = time.time()
     
     try:
-        # 듀얼 스트림 모델의 경우 직접 forward pass 사용
-        pytorch_model = model.model if hasattr(model, 'model') else model.predictor.model
-        pytorch_model.eval()
+        # ONNX Runtime 추론
+        onnx_outputs = ort_session.run(None, dual_inputs)
         
-        with torch.no_grad():
-            # 직접 모델 forward pass 수행
-            predictions = pytorch_model(dual_input)
-            
-            # NMS 후처리 적용
-            from ultralytics.utils.ops import non_max_suppression
-            
-            # 모델의 클래스 수 가져오기
-            nc = getattr(pytorch_model, 'nc', 80)
-            
-            # NMS 적용 (depth 정보도 포함)
-            predictions = non_max_suppression(
-                predictions,
-                conf_thres=CONFIDENCE_THRESHOLD,
-                iou_thres=IOU_THRESHOLD,
-                classes=None,
-                agnostic=False,
-                max_det=300,
-                nc=nc
-            )
-            
-            # 결과를 리스트로 저장
-            results = predictions
-            
+        # Ultralytics YOLO ONNX 출력은 보통 [1, num_channels, num_detections] 형태
+        # 첫 번째 출력 사용 (detection head 출력)
+        predictions = onnx_outputs[0]
+        
+        # NMS 후처리 적용 (Ultralytics utils 사용)
+        from ultralytics.utils.ops import non_max_suppression
+        
+        # 모델의 클래스 수 (28로 설정)
+        nc = 28
+        
+        # NMS 적용 (depth 정보도 포함, 예측 출력이 [xywh, conf, cls, depth] 형태라고 가정)
+        # 출력이 xyxy 형식인지 xywh인지 확인 필요하지만, 기본적으로 YOLO ONNX는 xyxy
+        predictions = non_max_suppression(
+            torch.from_numpy(predictions),  # numpy -> torch
+            conf_thres=CONFIDENCE_THRESHOLD,
+            iou_thres=IOU_THRESHOLD,
+            classes=None,
+            agnostic=False,
+            max_det=300,
+            nc=nc
+        )
+        
+        # 결과를 리스트로 저장
+        results = predictions
+        
     except Exception as e:
         print(f"❌ Inference failed: {e}")
         import traceback
@@ -528,12 +537,12 @@ def main():
     cv2.imwrite(str(output_path), result_image)
     
     # 요약 정보도 함께 저장
-    summary_filename = f"inference_depth_summary_{filename.replace('.jpg', '.txt')}"
+    summary_filename = f"inference_depth_summary_onnx_{filename.replace('.jpg', '.txt')}"
     summary_path = output_dir / summary_filename
     with open(summary_path, 'w') as f:
-        f.write(f"Dual Stream YOLO Inference Results with Depth\n")
+        f.write(f"Dual Stream YOLO ONNX Inference Results with Depth\n")
         f.write(f"===============================================\n")
-        f.write(f"Model: {MODEL_PATH}\n")
+        f.write(f"ONNX Model: {ONNX_PATH}\n")
         f.write(f"Wide Image: {WIDE_IMAGE_PATH}\n")
         f.write(f"Narrow Image: {NARROW_IMAGE_PATH}\n")
         f.write(f"Label File: {LABEL_PATH}\n")
@@ -559,7 +568,7 @@ def main():
     print(f"✅ Results saved to:")
     print(f"  📸 Image: {output_path}")
     print(f"  📄 Summary: {summary_path}")
-    print("🎉 Depth-enhanced inference completed successfully!")
+    print("🎉 Depth-enhanced ONNX inference completed successfully!")
 
 if __name__ == "__main__":
     main()

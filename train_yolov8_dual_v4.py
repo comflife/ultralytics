@@ -122,7 +122,7 @@ def train(cfg, opt, device, callbacks=None):
         'amp': True,
         'fraction': 1.0,
         'profile': False,
-        'val': False,
+        'val': True,
         'label_smoothing': opt.label_smoothing,
         'save_period': opt.save_period,
         'dual_stream': is_dual_model or opt.dual_stream,

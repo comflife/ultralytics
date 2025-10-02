@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Dual Stream YOLO Inference Script with Depth Visualization
-Performs inference with dual-stream YOLO model and shows depth prediction + ground truth
+Dual Stream YOLO ONNX Inference Script with Depth Visualization (Extracted Model Version)
+Performs inference with extracted dual-stream YOLO ONNX model (headless) and implements custom post-processing in Python.
+Shows depth prediction + ground truth.
 """
 
 import sys
@@ -16,6 +17,9 @@ from PIL import Image, ImageDraw, ImageFont
 import time
 import random
 import json
+import onnxruntime as ort  # ONNX Runtime 추가
+import math  # for exp, max, min
+import argparse # 명령줄 인자 처리를 위해 추가
 
 # 🔧 로컬 ultralytics 모듈을 우선적으로 사용하도록 설정
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -28,8 +32,10 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 # 🛠️ 설정 부분 - 여기를 수정하세요!
 # ============================================================
 
-# 모델 파일 경로
-MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp350/weights/best.pt"
+# ONNX 모델 파일 경로 (추출된 모델)
+# ONNX_PATH = "/home/byounggun/ultralytics/runs/train/exp352/weights/best_dual_input_depth_extracted.onnx"
+# ONNX_PATH = "/home/byounggun/ultralytics/best_dual_input_depth_extracted2.onnx"
+ONNX_PATH = "/home/byounggun/ultralytics/runs/train/exp354/weights/best_dual_input_depth_extracted.onnx"
 
 # 입력 이미지 디렉토리
 WIDE_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/images/"
@@ -39,15 +45,19 @@ NARROW_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/val_narrow_images/"
 LABEL_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/labels/"
 
 # 출력 설정
-OUTPUT_DIR = "inference_results_depth"
+OUTPUT_DIR = "inference_results_depth_onnx_extracted"
 
 # 추론 설정
-CONFIDENCE_THRESHOLD = 0.3
-IOU_THRESHOLD = 0.35
+CONFIDENCE_THRESHOLD = 0.1  # C 코드의 conf_thres
+IOU_THRESHOLD = 0.35  # C 코드의 iou_thres
 IMAGE_SIZE = 640
 
-# Depth 정규화 정보 파일
-DEPTH_NORM_INFO_PATH = "/home/byounggun/ultralytics/depth_normalization_info.json"
+# Depth 정규화 정보 (C 코드와 맞춤)
+DEP_MIN = 0.1
+DEP_MAX = 419.1
+
+# Reverse letterbox 적용 여부 (C 코드의 CUSTOM_REVERSE_LETTERBOX)
+REVERSE_LETTERBOX = True  # 필요시 True로 변경
 
 # ============================================================
 
@@ -63,48 +73,12 @@ except ImportError as e:
 class DepthDenormalizer:
     """Depth 값을 원본 스케일로 복구하는 클래스"""
     
-    def __init__(self, norm_info_path=DEPTH_NORM_INFO_PATH):
-        """
-        Args:
-            norm_info_path: 정규화 정보가 저장된 JSON 파일 경로
-        """
-        self.norm_info_path = norm_info_path
-        self.norm_info = None
-        self.load_normalization_info()
-    
-    def load_normalization_info(self):
-        """정규화 정보 로드"""
-        try:
-            with open(self.norm_info_path, 'r') as f:
-                self.norm_info = json.load(f)
-            print(f"✅ 정규화 정보 로드 완료: {self.norm_info_path}")
-            print(f"   원본 범위: [{self.norm_info['min_depth']:.6f}, {self.norm_info['max_depth']:.6f}]")
-        except FileNotFoundError:
-            print(f"❌ 정규화 정보 파일을 찾을 수 없습니다: {self.norm_info_path}")
-            self.norm_info = None
-        except Exception as e:
-            print(f"❌ 정규화 정보 로드 오류: {e}")
-            self.norm_info = None
+    def __init__(self, min_depth=DEP_MIN, max_depth=DEP_MAX):
+        self.min_depth = min_depth
+        self.max_depth = max_depth
     
     def denormalize_depth(self, normalized_depth):
-        """
-        정규화된 depth 값을 원본 스케일로 복구
-        
-        Args:
-            normalized_depth: 정규화된 depth 값 (0~1 범위)
-            
-        Returns:
-            원본 스케일의 depth 값
-        """
-        if self.norm_info is None:
-            return normalized_depth
-        
-        min_depth = self.norm_info['min_depth']
-        max_depth = self.norm_info['max_depth']
-        
-        # Min-Max 역정규화
-        original_depth = normalized_depth * (max_depth - min_depth) + min_depth
-        return original_depth
+        return normalized_depth * (self.max_depth - self.min_depth) + self.min_depth
 
 def load_ground_truth_labels(label_path):
     """
@@ -175,7 +149,7 @@ def preprocess_image(image_path, target_size=640):
         target_size (int): 타겟 크기
     
     Returns:
-        torch.Tensor: 전처리된 이미지 [3, H, W]
+        np.ndarray: 전처리된 이미지 [1, 3, H, W] (numpy, for ONNX input)
         tuple: 원본 이미지 크기 (height, width)
         np.ndarray: 원본 이미지 (BGR)
     """
@@ -208,105 +182,160 @@ def preprocess_image(image_path, target_size=640):
     padded = cv2.copyMakeBorder(resized, top, bottom, left, right, 
                                cv2.BORDER_CONSTANT, value=[114, 114, 114])
     
-    # 정규화 및 텐서 변환
+    # 정규화 및 배열 변환
     normalized = padded.astype(np.float32) / 255.0
-    tensor = torch.from_numpy(normalized).permute(2, 0, 1)  # HWC -> CHW
+    tensor = normalized.transpose(2, 0, 1)[np.newaxis, :]  # [1, 3, H, W]
     
     return tensor, (original_height, original_width), image
 
-def create_dual_stream_input(wide_tensor, narrow_tensor):
+def create_dual_stream_inputs(wide_tensor, narrow_tensor):
     """
-    두 이미지를 듀얼 스트림 형태로 결합 (NPU 호환 4차원)
+    두 이미지를 별도의 입력으로 준비 (ONNX 모델이 두 입력을 기대할 경우)
     
     Args:
-        wide_tensor (torch.Tensor): Wide stream 이미지 [3, H, W]
-        narrow_tensor (torch.Tensor): Narrow stream 이미지 [3, H, W]
+        wide_tensor (np.ndarray): Wide stream 이미지 [1, 3, H, W]
+        narrow_tensor (np.ndarray): Narrow stream 이미지 [1, 3, H, W]
     
     Returns:
-        torch.Tensor: 듀얼 스트림 입력 [1, 6, H, W] - NPU 호환 4차원
+        dict: {'images_wide': np.ndarray [1, 3, H, W], 'images_narrow': np.ndarray [1, 3, H, W]}
     """
-    # 🔧 NPU 호환: 4차원 입력으로 변경 [1, 6, H, W]
-    # 두 이미지를 채널 차원에서 concat
-    dual_stream = torch.cat([wide_tensor, narrow_tensor], dim=0)  # [6, H, W]
-    dual_stream = dual_stream.unsqueeze(0)  # [1, 6, H, W]
+    print(f"🔗 Created wide input: {wide_tensor.shape}")
+    print(f"🔗 Created narrow input: {narrow_tensor.shape}")
     
-    print(f"🔗 Created dual stream input: {dual_stream.shape}")
-    return dual_stream
+    return {
+        'images_wide': wide_tensor,
+        'images_narrow': narrow_tensor
+    }
 
-def postprocess_results_with_depth(predictions, original_size, target_size=640):
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def compute_dfl_dir(reg_output, y, x, start, num_bins=16):
     """
-    Depth를 포함한 결과 후처리
+    DFL decode for one direction: sum k * softmax(v_k)
+    """
+    vals = reg_output[0, start:start + num_bins, y, x]  # [16]
+    exp_vals = np.exp(vals)
+    sum_exp = np.sum(exp_vals)
+    if sum_exp <= 0.0:
+        sum_exp = 1e-6
+    softmax = exp_vals / sum_exp
+    d = np.sum(np.arange(num_bins) * softmax)
+    return d
+
+def apply_reverse_letterbox_coords(x1, y1, x2, y2, orig_w, orig_h, model_size):
+    """
+    Undo centered letterbox with color=114: remove padding, divide by gain, then clip
+    """
+    gain_w = model_size / orig_w
+    gain_h = model_size / orig_h
+    gain = min(gain_w, gain_h)
+    pad_w = (model_size - orig_w * gain) * 0.5
+    pad_h = (model_size - orig_h * gain) * 0.5
+
+    x1 = (x1 - pad_w) / gain
+    x2 = (x2 - pad_w) / gain
+    y1 = (y1 - pad_h) / gain
+    y2 = (y2 - pad_h) / gain
+
+    x1 = max(0.0, min(x1, orig_w))
+    x2 = max(0.0, min(x2, orig_w))
+    y1 = max(0.0, min(y1, orig_h))
+    y2 = max(0.0, min(y2, orig_h))
+
+    return x1, y1, x2, y2
+
+def box_iou(x1, y1, x2, y2, ax1, ay1, ax2, ay2):
+    xx1 = max(x1, ax1)
+    yy1 = max(y1, ay1)
+    xx2 = min(x2, ax2)
+    yy2 = min(y2, ay2)
+    inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
+    area1 = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area2 = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    denom = area1 + area2 - inter + 1e-6
+    return inter / denom if denom > 0.0 else 0.0
+
+def custom_postprocess(outputs, orig_size, img_size=640.0, conf_thres=0.1, iou_thres=0.35, reverse_letterbox=REVERSE_LETTERBOX):
+    """
+    Python implementation of the C custom_postproc_run function.
     
     Args:
-        predictions: NMS 후처리된 결과 (리스트)
-        original_size (tuple): 원본 이미지 크기 (height, width)
-        target_size (int): 모델 입력 크기
+        outputs: List of 9 np.ndarray from ONNX: [reg0, cls0, dep0, reg1, cls1, dep1, reg2, cls2, dep2]
+                 Each: [1, C, H, W] where reg C=64, cls C=28, dep C=1
+        orig_size: (orig_h, orig_w)
+        img_size: Model input size (640)
     
     Returns:
-        list: 검출된 객체 리스트 [x1, y1, x2, y2, confidence, class_id, depth]
+        list: detections [[x1, y1, x2, y2, conf, class_id, depth_normalized]]
     """
-    if not predictions or len(predictions) == 0:
-        return []
-    
-    # 첫 번째 배치 결과 사용
-    pred = predictions[0]
-    
-    if pred is None or len(pred) == 0:
-        return []
-    
-    # 원본 이미지 크기로 스케일링
-    original_height, original_width = original_size
-    scale = min(target_size / original_width, target_size / original_height)
-    
-    # 패딩 계산
-    new_width = int(original_width * scale)
-    new_height = int(original_height * scale)
-    delta_w = target_size - new_width
-    delta_h = target_size - new_height
-    left = delta_w // 2
-    top = delta_h // 2
-    
+    orig_h, orig_w = orig_size
+    num_levels = len(outputs) // 3  # Assuming 3 levels
     detections = []
-    
-    for detection in pred:
-        # detection shape 확인
-        if len(detection) >= 7:  # x1, y1, x2, y2, confidence, class_id, depth
-            x1, y1, x2, y2, confidence, class_id, depth = detection.cpu().numpy()[:7]
-        elif len(detection) == 6:  # depth 정보가 없는 경우
-            x1, y1, x2, y2, confidence, class_id = detection.cpu().numpy()
-            depth = 0.0  # 기본값
-        else:
-            continue
-        
-        # 패딩 제거
-        x1 = max(0, x1 - left)
-        y1 = max(0, y1 - top)
-        x2 = max(0, x2 - left)
-        y2 = max(0, y2 - top)
-        
-        # 원본 크기로 스케일링
-        x1 = int(x1 / scale)
-        y1 = int(y1 / scale)
-        x2 = int(x2 / scale)
-        y2 = int(y2 / scale)
-        
-        # 원본 이미지 범위 내로 클리핑
-        x1 = max(0, min(x1, original_width))
-        y1 = max(0, min(y1, original_height))
-        x2 = max(0, min(x2, original_width))
-        y2 = max(0, min(y2, original_height))
-        
-        # depth 값 처리 (원래 모델 출력을 그대로 사용)
-        if len(detection) >= 7:
-            # 모델 출력이 이미 정규화되어 있다고 가정하고 직접 사용
-            # sigmoid 제거 - 모델 출력을 그대로 사용
-            depth = float(depth)
-            
-            # depth 값이 음수이거나 1을 초과하는 경우 클리핑
-            depth = max(0.0, min(1.0, depth))
-        
-        detections.append([x1, y1, x2, y2, float(confidence), int(class_id), float(depth)])
-    
+
+    # Group by level (assuming outputs ordered as P3 reg,cls,dep; P4; P5)
+    for li in range(num_levels):
+        reg = outputs[li * 3]     # [1, 64, H, W]
+        cls = outputs[li * 3 + 1] # [1, 28, H, W]
+        dep = outputs[li * 3 + 2] # [1, 1, H, W]
+
+        _, reg_C, H, W = reg.shape
+        num_bins = reg_C // 4  # 64/4=16
+
+        stride = img_size / H
+        print(f"[Level {li}] HxW = {H}x{W}, stride={stride}")
+
+        for y in range(H):
+            for x in range(W):
+                # DFL decoding
+                d_l = compute_dfl_dir(reg, y, x, 0, num_bins)
+                d_t = compute_dfl_dir(reg, y, x, num_bins, num_bins)
+                d_r = compute_dfl_dir(reg, y, x, 2 * num_bins, num_bins)
+                d_b = compute_dfl_dir(reg, y, x, 3 * num_bins, num_bins)
+
+                anchor_x = x + 0.5
+                anchor_y = y + 0.5
+
+                x1 = (anchor_x - d_l) * stride
+                y1 = (anchor_y - d_t) * stride
+                x2 = (anchor_x + d_r) * stride
+                y2 = (anchor_y + d_b) * stride
+
+                if reverse_letterbox:
+                    x1, y1, x2, y2 = apply_reverse_letterbox_coords(x1, y1, x2, y2, orig_w, orig_h, img_size)
+
+                # Class probs
+                max_conf = 0.0
+                max_class = -1
+                for k in range(28):  # cls_C=28
+                    logit = cls[0, k, y, x]
+                    prob = sigmoid(logit)
+                    if prob > max_conf:
+                        max_conf = prob
+                        max_class = k
+
+                if max_conf > conf_thres:
+                    dep_norm = sigmoid(dep[0, 0, y, x]) if dep is not None else 0.0
+                    detections.append([x1, y1, x2, y2, max_conf, max_class, dep_norm])
+
+    # Sort by conf descending
+    detections = sorted(detections, key=lambda d: d[4], reverse=True)
+
+    # NMS
+    keep = []
+    for i in range(len(detections)):
+        if detections[i][4] == 0.0: continue
+        keep.append(detections[i])
+        for j in range(i + 1, len(detections)):
+            if detections[j][4] == 0.0: continue
+            if detections[i][5] != detections[j][5]: continue
+            iou = box_iou(*detections[i][:4], *detections[j][:4])
+            if iou > iou_thres:
+                detections[j][4] = 0.0
+
+    detections = [d for d in detections if d[4] > 0.0]
+
+    print(f"Total detections after NMS: {len(detections)}")
     return detections
 
 def draw_detections_with_depth(image, detections, gt_labels, depth_denormalizer, class_names=None):
@@ -324,7 +353,7 @@ def draw_detections_with_depth(image, detections, gt_labels, depth_denormalizer,
         np.ndarray: 검출 결과가 그려진 이미지
     """
     if class_names is None:
-        class_names = [f"class_{i}" for i in range(80)]  # COCO 클래스 수
+        class_names = [f"class_{i}" for i in range(28)]  # 클래스 수 28로 변경
     
     result_image = image.copy()
     img_height, img_width = image.shape[:2]
@@ -370,59 +399,78 @@ def draw_detections_with_depth(image, detections, gt_labels, depth_denormalizer,
         
         # 박스 그리기
         color = pred_colors[int(class_id) % len(pred_colors)]
-        cv2.rectangle(result_image, (x1, y1), (x2, y2), color, 3)  # 두꺼운 선
+        cv2.rectangle(result_image, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)  # 두꺼운 선
         
         # 라벨 텍스트
         class_name = class_names[int(class_id)] if int(class_id) < len(class_names) else f"class_{int(class_id)}"
         pred_label_text = f"PRED-{class_name}: {confidence:.2f}, D:{pred_depth_original:.2f}m"
         
         # 텍스트 배경 위치 조정 (GT와 겹치지 않도록)
-        text_y = y2 + 25
+        text_y = int(y2) + 25
         if text_y > img_height - 30:
-            text_y = y1 - 10
+            text_y = int(y1) - 10
         
         # 텍스트 배경
         (text_width, text_height), _ = cv2.getTextSize(pred_label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(result_image, (x1, text_y - text_height), (x1 + text_width, text_y + 5), color, -1)
+        cv2.rectangle(result_image, (int(x1), text_y - text_height), (int(x1) + text_width, text_y + 5), color, -1)
         
         # 텍스트 그리기
-        cv2.putText(result_image, pred_label_text, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(result_image, pred_label_text, (int(x1), text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
     return result_image
 
 def main():
     """메인 inference 함수"""
     
-    print("🚀 Starting Dual Stream YOLO Inference with Depth...")
+    # 명령줄 인자 파서 설정
+    parser = argparse.ArgumentParser(description="Dual Stream YOLO ONNX Inference with single image paths.")
+    parser.add_argument('--wide-img', type=str, help='Path to the wide-angle image.')
+    parser.add_argument('--narrow-img', type=str, help='Path to the narrow-angle image.')
+    args = parser.parse_args()
+
+    # wide-img 또는 narrow-img 인자가 제공되었는지 확인
+    use_cmd_args = args.wide_img and args.narrow_img
+
+    print("🚀 Starting Dual Stream YOLO ONNX Inference with Depth (Extracted Model)...")
     
     # Depth 역정규화 객체 생성
     depth_denormalizer = DepthDenormalizer()
-    if depth_denormalizer.norm_info is None:
-        print("⚠️ Depth 정규화 정보가 없습니다. 정규화된 값을 그대로 표시합니다.")
     
     # 출력 디렉토리 생성
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(exist_ok=True)
     
-    # 1. 모델 로드
-    print(f"📦 Loading model from: {MODEL_PATH}")
+    # ONNX Runtime 세션 로드
     try:
-        model = YOLO(MODEL_PATH)
-        print("✅ Model loaded successfully!")
+        providers = ['CPUExecutionProvider']  # 필요시 'CUDAExecutionProvider' 등 추가
+        ort_session = ort.InferenceSession(ONNX_PATH, providers=providers)
+        print("✅ ONNX Runtime session loaded successfully!")
     except Exception as e:
-        print(f"❌ Failed to load model: {e}")
+        print(f"❌ Failed to load ONNX model: {e}")
         return
     
-    # 랜덤 이미지 세트 선택
-    wide_files = [f for f in os.listdir(WIDE_DIR) if f.lower().endswith('.jpg')]
-    if not wide_files:
-        print(f"❌ No JPG files found in {WIDE_DIR}")
-        return
-    
-    filename = random.choice(wide_files)
-    WIDE_IMAGE_PATH = os.path.join(WIDE_DIR, filename)
-    NARROW_IMAGE_PATH = os.path.join(NARROW_DIR, filename)
-    
+    # 모델 입력 이름 확인
+    input_names = [input.name for input in ort_session.get_inputs()]
+    print(f"📥 Model input names: {input_names}")
+
+    if use_cmd_args:
+        # 명령줄 인자에서 직접 이미지 경로 사용
+        WIDE_IMAGE_PATH = args.wide_img
+        NARROW_IMAGE_PATH = args.narrow_img
+        filename = Path(WIDE_IMAGE_PATH).name
+        print(f"🔧 Using provided image paths via command-line arguments.")
+    else:
+        # 기존 방식: 랜덤 이미지 선택
+        print(f"🔧 No image paths provided. Selecting a random image from directories.")
+        wide_files = [f for f in os.listdir(WIDE_DIR) if f.lower().endswith('.jpg')]
+        if not wide_files:
+            print(f"❌ No JPG files found in {WIDE_DIR}")
+            return
+        
+        filename = random.choice(wide_files)
+        WIDE_IMAGE_PATH = os.path.join(WIDE_DIR, filename)
+        NARROW_IMAGE_PATH = os.path.join(NARROW_DIR, filename)
+
     # 라벨 파일 경로
     label_filename = filename.replace('.jpg', '.txt')
     LABEL_PATH = os.path.join(LABEL_DIR, label_filename)
@@ -431,15 +479,20 @@ def main():
         print(f"❌ Matching narrow image not found: {NARROW_IMAGE_PATH}")
         return
     
-    print(f"🖼️ Selected random image set: {filename}")
+    print(f"🖼️ Selected image set: {filename}")
+    print(f"  - Wide: {WIDE_IMAGE_PATH}")
+    print(f"  - Narrow: {NARROW_IMAGE_PATH}")
     print(f"📄 Label file: {LABEL_PATH}")
     
-    # Ground Truth 라벨 로드
+    # Ground Truth 라벨 로드 (파일이 없으면 빈 리스트 반환)
     gt_labels = load_ground_truth_labels(LABEL_PATH)
-    print(f"🎯 Loaded {len(gt_labels)} GT labels")
+    if gt_labels:
+        print(f"🎯 Loaded {len(gt_labels)} GT labels")
+    else:
+        print("⚠️ No GT labels found or loaded. Proceeding with prediction only.")
     
     # 출력 파일 이름 동적 설정
-    OUTPUT_IMAGE_NAME = f"dual_stream_depth_result_{filename}"
+    OUTPUT_IMAGE_NAME = f"dual_stream_depth_result_onnx_extracted_{filename}"
     
     # 2. 이미지 전처리
     print("🖼️ Preprocessing images...")
@@ -451,41 +504,19 @@ def main():
         return
     
     # 3. 듀얼 스트림 입력 생성
-    dual_input = create_dual_stream_input(wide_tensor, narrow_tensor)
+    dual_inputs = create_dual_stream_inputs(wide_tensor, narrow_tensor)
     
-    # 4. 추론 실행
-    print("🔮 Running inference...")
+    # 4. ONNX 추론 실행
+    print("🔮 Running ONNX inference...")
     start_time = time.time()
     
     try:
-        # 듀얼 스트림 모델의 경우 직접 forward pass 사용
-        pytorch_model = model.model if hasattr(model, 'model') else model.predictor.model
-        pytorch_model.eval()
+        # ONNX Runtime 추론 (raw outputs)
+        onnx_outputs = ort_session.run(None, dual_inputs)
         
-        with torch.no_grad():
-            # 직접 모델 forward pass 수행
-            predictions = pytorch_model(dual_input)
-            
-            # NMS 후처리 적용
-            from ultralytics.utils.ops import non_max_suppression
-            
-            # 모델의 클래스 수 가져오기
-            nc = getattr(pytorch_model, 'nc', 80)
-            
-            # NMS 적용 (depth 정보도 포함)
-            predictions = non_max_suppression(
-                predictions,
-                conf_thres=CONFIDENCE_THRESHOLD,
-                iou_thres=IOU_THRESHOLD,
-                classes=None,
-                agnostic=False,
-                max_det=300,
-                nc=nc
-            )
-            
-            # 결과를 리스트로 저장
-            results = predictions
-            
+        # onnx_outputs: list of 9 tensors
+        results = onnx_outputs
+        
     except Exception as e:
         print(f"❌ Inference failed: {e}")
         import traceback
@@ -495,14 +526,13 @@ def main():
     inference_time = time.time() - start_time
     print(f"⚡ Inference completed in {inference_time:.3f}s")
     
-    # 5. 결과 후처리 (depth 포함)
-    print("📊 Processing results with depth...")
-    detections = postprocess_results_with_depth(results, wide_original_size, IMAGE_SIZE)
+    # 5. 커스텀 후처리 (Python 구현)
+    print("📊 Processing results with custom postprocess...")
+    detections = custom_postprocess(results, wide_original_size, IMAGE_SIZE, CONFIDENCE_THRESHOLD, IOU_THRESHOLD, REVERSE_LETTERBOX)
     
     print(f"🎯 Found {len(detections)} detections")
     for i, detection in enumerate(detections):
-        x1, y1, x2, y2, conf, cls = detection[:6]
-        depth_normalized = detection[6] if len(detection) > 6 else 0.0
+        x1, y1, x2, y2, conf, cls, depth_normalized = detection
         depth_original = depth_denormalizer.denormalize_depth(depth_normalized)
         print(f"  Detection {i+1}: class={int(cls)}, conf={conf:.3f}")
         print(f"    Depth: {depth_normalized:.6f} (normalized) -> {depth_original:.2f}m (original)")
@@ -528,12 +558,12 @@ def main():
     cv2.imwrite(str(output_path), result_image)
     
     # 요약 정보도 함께 저장
-    summary_filename = f"inference_depth_summary_{filename.replace('.jpg', '.txt')}"
+    summary_filename = f"inference_depth_summary_onnx_extracted_{filename.replace('.jpg', '.txt')}"
     summary_path = output_dir / summary_filename
     with open(summary_path, 'w') as f:
-        f.write(f"Dual Stream YOLO Inference Results with Depth\n")
+        f.write(f"Dual Stream YOLO ONNX Inference Results with Depth (Extracted Model)\n")
         f.write(f"===============================================\n")
-        f.write(f"Model: {MODEL_PATH}\n")
+        f.write(f"ONNX Model: {ONNX_PATH}\n")
         f.write(f"Wide Image: {WIDE_IMAGE_PATH}\n")
         f.write(f"Narrow Image: {NARROW_IMAGE_PATH}\n")
         f.write(f"Label File: {LABEL_PATH}\n")
@@ -545,8 +575,7 @@ def main():
         
         f.write("Prediction Details:\n")
         for i, detection in enumerate(detections):
-            x1, y1, x2, y2, conf, cls = detection[:6]
-            depth = detection[6] if len(detection) > 6 else 0.0
+            x1, y1, x2, y2, conf, cls, depth = detection
             depth_original = depth_denormalizer.denormalize_depth(depth)
             f.write(f"  PRED {i+1}. Class: {int(cls)}, Confidence: {conf:.3f}, Depth: {depth_original:.2f}m, BBox: ({x1},{y1},{x2},{y2})\n")
         
@@ -559,7 +588,7 @@ def main():
     print(f"✅ Results saved to:")
     print(f"  📸 Image: {output_path}")
     print(f"  📄 Summary: {summary_path}")
-    print("🎉 Depth-enhanced inference completed successfully!")
+    print("🎉 Depth-enhanced ONNX inference (extracted model) completed successfully!")
 
 if __name__ == "__main__":
     main()

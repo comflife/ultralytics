@@ -234,7 +234,7 @@ def verify_image_label(args):
                     assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
                     points = lb[:, 5:].reshape(-1, ndim)[:, :2]
                 elif with_depth:
-                    # 🔴 Depth estimation: 라벨 형식 class x y w h depth
+                    # Depth estimation: 라벨 형식 class x y w h depth
                     expected_cols = 6  # class, x, y, w, h, depth
                     assert lb.shape[1] == expected_cols, f"depth labels require {expected_cols} columns (class x y w h depth), {lb.shape[1]} columns detected"
                     points = lb[:, 1:5]  # bbox coordinates only
@@ -266,7 +266,7 @@ def verify_image_label(args):
                 if keypoint:
                     lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32)
                 elif with_depth:
-                    lb = np.zeros((0, 6), dtype=np.float32)  # 🔴 Depth: class, x, y, w, h, depth
+                    lb = np.zeros((0, 6), dtype=np.float32)  # Depth: class, x, y, w, h, depth
                 else:
                     lb = np.zeros((0, 5), dtype=np.float32)
         else:
@@ -274,7 +274,7 @@ def verify_image_label(args):
             if keypoint:
                 lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32)
             elif with_depth:
-                lb = np.zeros((0, 6), dtype=np.float32)  # 🔴 Depth: class, x, y, w, h, depth
+                lb = np.zeros((0, 6), dtype=np.float32)  # Depth: class, x, y, w, h, depth
             else:
                 lb = np.zeros((0, 5), dtype=np.float32)
         if keypoint:
@@ -283,7 +283,7 @@ def verify_image_label(args):
                 kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
                 keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
         
-        # 🔴 Extract depth information if available
+        # Extract depth information if available
         if with_depth and lb.shape[1] >= 6:
             depth_values = lb[:, 5:6]  # n, 1 - extract depth column
             lb = lb[:, :5]  # Keep only class and bbox for standard processing

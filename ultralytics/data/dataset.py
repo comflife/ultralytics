@@ -171,7 +171,7 @@ class YOLODataset(BaseDataset):
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         
-        # 🔴 Depth estimation 지원
+        # Depth estimation
         self.with_depth = data.get("with_depth", False) if data else False
         
         # Dual stream detection
@@ -354,7 +354,7 @@ class YOLODataset(BaseDataset):
                     repeat(nkpt),
                     repeat(ndim),
                     repeat(self.single_cls),
-                    repeat(self.with_depth),  # 🔴 Depth estimation 파라미터 추가
+                    repeat(self.with_depth),  #Depth estimation
                 ),
             )
             pbar = TQDM(results, desc=desc, total=total)
@@ -374,7 +374,7 @@ class YOLODataset(BaseDataset):
                         "normalized": True,
                         "bbox_format": "xywh",
                     }
-                    # 🔴 Depth 정보 추가
+                    # Depth 정보
                     if self.with_depth and depth_values is not None:
                         label_dict["depths"] = depth_values  # n, 1
                     
@@ -520,7 +520,7 @@ class YOLODataset(BaseDataset):
             segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
         else:
             segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
-        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized, depths=depths)  # 🔴 Depth 추가
+        label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized, depths=depths)  # Depth
         return label
 
 
@@ -621,7 +621,7 @@ class YOLODataset(BaseDataset):
             else:
                 new_batch["batch_idx"] = torch.tensor([], dtype=torch.long)
             
-            # 🔴 Depths 정보 확인 및 처리
+            # Depths 확인
             if "depths" not in new_batch:
                 # 빈 텐서로 초기화 (더미 생성하지 않음)
                 new_batch["depths"] = torch.tensor([], dtype=torch.float32)

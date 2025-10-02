@@ -2,6 +2,7 @@
 """
 YOLO Dual-Stream (Dual 3-Channel Input) Model with Depth ONNX Export Script (Final Version)
 Exports a model to accept two separate 3-channel inputs and merges them internally.
+This version EXCLUDES the final box decoding and confidence score layers, outputting raw feature maps.
 """
 
 import sys
@@ -14,7 +15,8 @@ import argparse
 import traceback
 
 # 로컬 ultralytics 모듈 경로 설정
-sys.path.insert(0, str(Path(__file__).parent.absolute()))
+# 이 스크립트가 있는 폴더에 ultralytics 소스 코드가 있다고 가정합니다.
+# sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 try:
     from ultralytics import YOLO
@@ -25,6 +27,7 @@ except ImportError as e:
     sys.exit(1)
 
 def load_depth_normalization_info(norm_info_path="depth_normalization_info.json"):
+    """Loads depth normalization info from a JSON file."""
     try:
         with open(norm_info_path, 'r') as f:
             return json.load(f)
@@ -32,10 +35,14 @@ def load_depth_normalization_info(norm_info_path="depth_normalization_info.json"
         print(f"⚠️ Depth normalization info not found. Using defaults.")
         return {"min_depth": 0.1, "max_depth": 419.1, "mean_depth": 42.96}
 
-def export_dual_depth_model_to_onnx(
+def export_raw_output_model_to_onnx(
     model_path: str, output_path: str = None, imgsz: int = 640,
-    half: bool = False, dynamic: bool = False, opset: int = 13, device: str = "cpu"
+    half: bool = False, dynamic: bool = False, opset: int = 11, device: str = "cpu"
 ):
+    """
+    Exports a YOLO model to ONNX, modifying it to return raw prediction outputs
+    before the final decoding and post-processing steps.
+    """
     print(f"\n🚀 Loading model from: {model_path}")
     depth_info = load_depth_normalization_info()
 
@@ -43,29 +50,35 @@ def export_dual_depth_model_to_onnx(
         yolo_model = YOLO(model_path)
         original_model = yolo_model.model
 
-        # 래퍼 모델: 두 개의 3채널 입력을 받아 내부적으로 합침
-        class DualInputWrapper(torch.nn.Module):
+        # 🔴 [수정] 원시 예측 값(raw logits)만 출력하는 새로운 래퍼 클래스
+        class RawOutputWrapper(torch.nn.Module):
             def __init__(self, model):
                 super().__init__()
                 self.model = model
-            def forward(self, images_wide, images_narrow):
-                x = torch.cat((images_wide, images_narrow), dim=1)
-                return self.model(x)
 
-        # 원본 모델을 export 모드로 설정
+            def forward(self, images_wide, images_narrow):
+                # 1. 두 개의 입력을 하나로 합칩니다.
+                x = torch.cat((images_wide, images_narrow), dim=1)
+                # 2. 모델의 forward를 호출하면 (최종 결과, 원시 결과) 튜플이 반환됩니다.
+                _processed_output, raw_outputs = self.model(x)
+                # 3. 우리는 원시 결과(raw_outputs)만 필요합니다.
+                # raw_outputs는 3개의 텐서로 구성된 리스트이므로, 각각을 ONNX의 개별 출력으로 반환합니다.
+                return raw_outputs[0], raw_outputs[1], raw_outputs[2]
+
+        # 원본 모델을 eval 모드로 설정
         original_model.eval()
         for m in original_model.modules():
             if hasattr(m, 'export'):
-                m.export = True
+                # 🔴 [수정] export 모드를 False로 유지하여 (최종결과, 원시결과) 튜플을 반환하게 함
+                m.export = False
             if isinstance(m, ultralytics.nn.modules.head.Detect):
                 m.dynamic = dynamic
-                m.export = True
-        print("✅ Original model set to export mode.")
+        print("✅ Original model set to eval mode for raw output.")
 
-        # 원본 모델을 래퍼로 감싸서 ONNX 변환
-        model = DualInputWrapper(original_model)
+        # 🔴 [수정] 새로운 RawOutputWrapper로 모델을 감쌈
+        model = RawOutputWrapper(original_model)
         model.eval()
-        print(f"✅ Model wrapped for dual 3-channel input.")
+        print(f"✅ Model wrapped for DUAL INPUT and RAW OUTPUT.")
         
     except Exception as e:
         print(f"❌ Failed to load or wrap model: {e}")
@@ -78,9 +91,10 @@ def export_dual_depth_model_to_onnx(
 
     if output_path is None:
         p = Path(model_path)
-        output_path = p.parent / f"{p.stem}_dual_input_depth.onnx"
+        # 🔴 [수정] 출력 파일 이름 변경
+        output_path = p.parent / f"{p.stem}_raw_output.onnx"
 
-    print(f"\n📤 Starting DUAL 3-CHANNEL INPUT + DEPTH ONNX export...")
+    print(f"\n📤 Starting RAW OUTPUT ONNX export...")
     print(f"   - Input size: {imgsz}x{imgsz}, Precision: {'FP16' if half else 'FP32'}")
     print(f"   - Dynamic shapes: {dynamic}, ONNX opset: {opset}")
     print(f"   - Output path: {output_path}")
@@ -92,8 +106,9 @@ def export_dual_depth_model_to_onnx(
         dummy_input = (dummy_input_wide, dummy_input_narrow)
 
         input_names = ['images_wide', 'images_narrow']
-        test_outputs = model(*dummy_input)
-        output_names = [f'output{i}' for i in range(len(test_outputs))]
+        
+        # 🔴 [수정] 출력은 3개의 텐서이므로 이름을 3개 지정 (P3, P4, P5에 해당)
+        output_names = ['output_small', 'output_medium', 'output_large']
         
         dynamic_axes = None
         if dynamic:
@@ -101,8 +116,9 @@ def export_dual_depth_model_to_onnx(
                 'images_wide': {0: 'batch', 2: 'height', 3: 'width'},
                 'images_narrow': {0: 'batch', 2: 'height', 3: 'width'},
             }
+            # 🔴 [수정] 각 출력은 [batch, channels, height, width] 4개 차원을 가지므로, 그에 맞게 dynamic_axes 설정
             for name in output_names:
-                 dynamic_axes[name] = {0: 'batch', 2: 'anchors'}
+                 dynamic_axes[name] = {0: 'batch', 2: 'height', 3: 'width'}
         
         print(f"🔗 Input names: {input_names}, Output names: {output_names}")
 
@@ -114,13 +130,12 @@ def export_dual_depth_model_to_onnx(
         )
         print(f"✅ ONNX export successful!")
 
-        # 검증
+        # 검증 및 테스트
         import onnx
         onnx_model = onnx.load(str(output_path))
         onnx.checker.check_model(onnx_model)
         print("✅ ONNX model validation passed.")
         
-        # ONNX 런타임 테스트
         import onnxruntime as ort
         print(f"🧪 Testing with ONNX Runtime...")
         session = ort.InferenceSession(str(output_path), providers=['CUDAExecutionProvider' if device != 'cpu' and ort.get_device() == 'GPU' else 'CPUExecutionProvider'])
@@ -130,6 +145,9 @@ def export_dual_depth_model_to_onnx(
         }
         ort_outputs = session.run(None, ort_inputs)
         print("✅ ONNX Runtime test successful!")
+        print(f"   - Number of outputs: {len(ort_outputs)}")
+        for i, out in enumerate(ort_outputs):
+            print(f"   - Output '{output_names[i]}' shape: {out.shape}")
 
         depth_info_path = Path(output_path).with_suffix('.json')
         with open(depth_info_path, 'w') as f:
@@ -144,18 +162,19 @@ def export_dual_depth_model_to_onnx(
         return None
 
 def main():
-    parser = argparse.ArgumentParser(description='Export YOLO Dual 3-Channel Input model with Depth to ONNX')
+    """Parses command-line arguments and runs the export function."""
+    parser = argparse.ArgumentParser(description='Export YOLO Dual 3-Channel Input model (RAW OUTPUT) to ONNX')
     parser.add_argument('model', type=str, help='Path to trained .pt model file')
     parser.add_argument('--output', type=str, help='Output ONNX file path')
     parser.add_argument('--imgsz', type=int, default=640, help='Input image size')
     parser.add_argument('--half', action='store_true', help='Export in FP16 precision')
     parser.add_argument('--dynamic', action='store_true', help='Enable dynamic input shapes')
-    parser.add_argument('--opset', type=int, default=16, help='ONNX opset version')
+    parser.add_argument('--opset', type=int, default=11, help='ONNX opset version')
     parser.add_argument('--device', type=str, default='cpu', help='Export device')
     
     args = parser.parse_args()
     
-    export_dual_depth_model_to_onnx(
+    export_raw_output_model_to_onnx(
         model_path=args.model, output_path=args.output, imgsz=args.imgsz,
         half=args.half, dynamic=args.dynamic, opset=args.opset, device=args.device
     )
