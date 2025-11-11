@@ -14,9 +14,13 @@
 import onnx
 onnx.utils.extract_model(
     # "/home/byounggun/ultralytics/runs/train/exp352/weights/best_dual_input_depth.onnx",
-    "/home/byounggun/ultralytics/runs/train/exp354/weights/best_dual_input_depth.onnx",
+    # "/home/byounggun/ultralytics/runs/train/exp354/weights/best_dual_input_depth.onnx",
+    # "/home/byounggun/ultralytics/runs/train/exp361/weights/best_dual_input_depth.onnx",
+    "/home/byounggun/ultralytics/runs/finetune/katri_overfit2/weights/epoch35_dual_input_depth.onnx",
     # "/home/byounggun/ultralytics/runs/train/exp352/weights/best_dual_input_depth_extracted.onnx",
-    "/home/byounggun/ultralytics/runs/train/exp354/weights/best_dual_input_depth_extracted.onnx",
+    # "/home/byounggun/ultralytics/runs/train/exp354/weights/best_dual_input_depth_extracted.onnx",
+    # "/home/byounggun/ultralytics/runs/train/exp361/weights/best_dual_input_depth_extracted.onnx",
+    "/home/byounggun/ultralytics/runs/finetune/katri_overfit2/weights/epoch35_dual_input_depth_extracted.onnx",
     ["images_wide", "images_narrow"],
     [
       # P3 (80x80): l, c, o

@@ -29,21 +29,25 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 # ============================================================
 
 # 모델 파일 경로
-MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp350/weights/best.pt"
+# MODEL_PATH = "/home/byounggun/ultralytics/runs/train/exp361/weights/best.pt"
+MODEL_PATH = "/home/byounggun/ultralytics/runs/finetune/katri_overfit2/weights/epoch30.pt"
 
 # 입력 이미지 디렉토리
-WIDE_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/images/"
-NARROW_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/val_narrow_images/"
+# WIDE_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/images/"
+WIDE_DIR = "/home/byounggun/ultralytics/finetune_katri_name/images"
+# NARROW_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/val_narrow_images/"
+NARROW_DIR = "/home/byounggun/ultralytics/finetune_katri_name/narrow_images"
 
 # 라벨 디렉토리 (GT depth 정보)
-LABEL_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/labels/"
+# LABEL_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/labels/"
+LABEL_DIR = "/home/byounggun/ultralytics/finetune_katri_name/labels"
 
 # 출력 설정
-OUTPUT_DIR = "inference_results_depth"
+OUTPUT_DIR = "katri_inference_results_depth"
 
 # 추론 설정
 CONFIDENCE_THRESHOLD = 0.3
-IOU_THRESHOLD = 0.35
+IOU_THRESHOLD = 0.55
 IMAGE_SIZE = 640
 
 # Depth 정규화 정보 파일
@@ -414,9 +418,9 @@ def main():
         return
     
     # 랜덤 이미지 세트 선택
-    wide_files = [f for f in os.listdir(WIDE_DIR) if f.lower().endswith('.jpg')]
+    wide_files = [f for f in os.listdir(WIDE_DIR) if f.lower().endswith(('.jpg', '.jpeg'))]
     if not wide_files:
-        print(f"❌ No JPG files found in {WIDE_DIR}")
+        print(f"❌ No JPG/JPEG files found in {WIDE_DIR}")
         return
     
     filename = random.choice(wide_files)
@@ -424,7 +428,7 @@ def main():
     NARROW_IMAGE_PATH = os.path.join(NARROW_DIR, filename)
     
     # 라벨 파일 경로
-    label_filename = filename.replace('.jpg', '.txt')
+    label_filename = filename.replace('.jpg', '.txt').replace('.jpeg', '.txt')
     LABEL_PATH = os.path.join(LABEL_DIR, label_filename)
     
     if not os.path.exists(NARROW_IMAGE_PATH):
@@ -528,7 +532,7 @@ def main():
     cv2.imwrite(str(output_path), result_image)
     
     # 요약 정보도 함께 저장
-    summary_filename = f"inference_depth_summary_{filename.replace('.jpg', '.txt')}"
+    summary_filename = f"inference_depth_summary_{filename.replace('.jpg', '.txt').replace('.jpeg', '.txt')}"
     summary_path = output_dir / summary_filename
     with open(summary_path, 'w') as f:
         f.write(f"Dual Stream YOLO Inference Results with Depth\n")

@@ -108,22 +108,23 @@ class MultiStreamConv(nn.Module):
 #         out2 = self.conv2(stream2)
 #         return torch.cat([out1, out2], dim=1)
 
-
 class SpatialAlignedMultiStreamConv(nn.Module):
     """
-    NPU-friendly spatially-aligned dual-stream conv. (REVISED STATIC VERSION)
-    - Replaced F.conv_transpose2d with nn.Upsample + nn.Conv2d.
-    - Removed dynamic mask slicing, simplifying the fusion to element-wise addition.
-    - This module does NOT downsample (stride is fixed to 1).
+    NPU-friendly spatially-aligned dual-stream conv. (WITH FIXED CONV CHAIN DOWNSAMPLE)
+    - Narrow: Fixed AvgPool k=4 s=4 + adjust Conv to bbox approx + center-pad → small narrow on wide.
+    - No adaptive: 고정 conv a x a 조합, miss align OK.
     """
-    def __init__(self, c1, c2, max_hw, k=1, p=None, d=1, act=True): # max_hw는 더 이상 사용되지 않지만, YAML 호환성을 위해 남겨둠
+    def __init__(self, c1, c2, max_hw, k=1, p=None, d=1, act=True, bbox=None):
         super().__init__()
         if c1 % 2 != 0:
-            raise ValueError("Input channels must be divisible by 2 for SpatialAlignedMultiStreamConv.")
+            raise ValueError("Input channels must be divisible by 2.")
         
         self.c_half = c1 // 2
+        self.bbox = bbox or {'center_x': 0.5, 'center_y': 0.5, 'width': 0.286, 'height': 0.292}  # default
+        self.target_roi_h = int(max_hw * self.bbox['height'])  # e.g., 320*0.292 ≈ 93, but fixed approx
+        self.target_roi_w = int(max_hw * self.bbox['width'])   # ≈ 92
         
-        # 1. 채널 분리 (기존과 동일)
+        # 채널 분리 & processors (기존)
         w_wide = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
         w_wide[:, :self.c_half, 0, 0] = torch.eye(self.c_half)
         self.split_wide = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
@@ -134,42 +135,104 @@ class SpatialAlignedMultiStreamConv(nn.Module):
         self.split_narrow = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
         self.split_narrow.weight = nn.Parameter(w_narrow, requires_grad=False)
         
-        # 2. 각 스트림 독립 처리 (기존과 동일)
-        self.wide_processor   = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
+        self.wide_processor = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
         self.narrow_processor = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
 
-        # 3. [수정] Upsampling 방식 변경: conv_transpose2d 대신 표준 Upsample + Conv 사용
-        #    이 방식이 NPU 호환성이 훨씬 높습니다.
-        self.upsampler = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            Conv(self.c_half, self.c_half, k=3, s=1, p=1, act=act)
-        )
-        
-        # 4. [수정] 최종 Fusion Conv (기존과 유사)
-        #    입력 채널이 wide_proc(c_half)와 upsampler(c_half)의 합이므로 c1이 됩니다.
+        # [신규] Fixed Conv Chain for Narrow Down: k=4 s=4 pool + 1x1 Conv adjust (no upsample, fixed output)
+        self.narrow_pool1 = nn.AvgPool2d(kernel_size=4, stride=4)  # 320→80
+        self.narrow_adjust = nn.Conv2d(self.c_half, self.c_half, kernel_size=1, stride=1, padding=0)  # channel keep, spatial fixed (or add small pool)
+        # Note: To exact roi, chain more pools (e.g., + AvgPool k=2 s=1 for fine-tune), but approx OK
+
+        # Fusion Conv
         self.fusion_conv = Conv(self.c_half, c2, k=k, s=1, p=p, g=1, d=d, act=act)
 
     def forward(self, x):
+        batch, _, input_h, input_w = x.shape
         wide = self.split_wide(x)
         narrow = self.split_narrow(x)
         
-        wide_proc = self.wide_processor(wide)
+        wide_proc = self.wide_processor(wide)  # [B, c_half, input_h, input_w]
         narrow_proc = self.narrow_processor(narrow)
         
-        # 5. [수정] 동적 마스킹 및 정렬 로직을 단순한 Upsample + Add로 대체
-        #    가장 확실하고 NPU 친화적인 퓨전 방식입니다.
-        narrow_upsampled = self.upsampler(narrow_proc)
+        # Fixed Conv Chain Downsample
+        narrow_stage1 = self.narrow_pool1(narrow_proc)  # e.g., 320→80
+        narrow_small = self.narrow_adjust(narrow_stage1)  # adjust (spatial same, or add pool for ~92)
+        # If need finer: narrow_small = nn.AvgPool2d(k=3, s=1)(narrow_small)  # 80→~78, miss OK
         
-        # 해상도를 맞추기 위한 Crop (만약 upsample 결과가 1픽셀 크다면)
-        if narrow_upsampled.shape[2:] != wide_proc.shape[2:]:
-            target_h, target_w = wide_proc.shape[2:]
-            narrow_upsampled = narrow_upsampled[:, :, :target_h, :target_w]
-
-        fused = wide_proc + narrow_upsampled
+        # Center pad to match wide (approx roi size)
+        pad_h = (input_h - narrow_small.shape[2]) // 2
+        pad_w = (input_w - narrow_small.shape[3]) // 2
+        pad_top, pad_bottom = pad_h, input_h - narrow_small.shape[2] - pad_h
+        pad_left, pad_right = pad_w, input_w - narrow_small.shape[3] - pad_w
+        narrow_padded = F.pad(narrow_small, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+        
+        # Fuse: wide + small narrow (padded)
+        fused = wide_proc + narrow_padded
         
         out = self.fusion_conv(fused)
-        
         return out
+
+# class SpatialAlignedMultiStreamConv(nn.Module):
+#     """
+#     NPU-friendly spatially-aligned dual-stream conv. (REVISED STATIC VERSION)
+#     - Replaced F.conv_transpose2d with nn.Upsample + nn.Conv2d.
+#     - Removed dynamic mask slicing, simplifying the fusion to element-wise addition.
+#     - This module does NOT downsample (stride is fixed to 1).
+#     """
+#     def __init__(self, c1, c2, max_hw, k=1, p=None, d=1, act=True): # max_hw는 더 이상 사용되지 않지만, YAML 호환성을 위해 남겨둠
+#         super().__init__()
+#         if c1 % 2 != 0:
+#             raise ValueError("Input channels must be divisible by 2 for SpatialAlignedMultiStreamConv.")
+        
+#         self.c_half = c1 // 2
+        
+#         # 1. 채널 분리 (기존과 동일)
+#         w_wide = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
+#         w_wide[:, :self.c_half, 0, 0] = torch.eye(self.c_half)
+#         self.split_wide = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
+#         self.split_wide.weight = nn.Parameter(w_wide, requires_grad=False)
+
+#         w_narrow = torch.zeros(self.c_half, c1, 1, 1, dtype=torch.float32)
+#         w_narrow[:, self.c_half:, 0, 0] = torch.eye(self.c_half)
+#         self.split_narrow = nn.Conv2d(c1, self.c_half, 1, 1, 0, bias=False)
+#         self.split_narrow.weight = nn.Parameter(w_narrow, requires_grad=False)
+        
+#         # 2. 각 스트림 독립 처리 (기존과 동일)
+#         self.wide_processor   = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
+#         self.narrow_processor = Conv(self.c_half, self.c_half, k=3, s=1, p=1, g=1, d=d, act=act)
+
+#         # 3. [수정] Upsampling 방식 변경: conv_transpose2d 대신 표준 Upsample + Conv 사용
+#         #    이 방식이 NPU 호환성이 훨씬 높습니다.
+#         self.upsampler = nn.Sequential(
+#             nn.Upsample(scale_factor=2, mode='nearest'),
+#             Conv(self.c_half, self.c_half, k=3, s=1, p=1, act=act)
+#         )
+        
+#         # 4. [수정] 최종 Fusion Conv (기존과 유사)
+#         #    입력 채널이 wide_proc(c_half)와 upsampler(c_half)의 합이므로 c1이 됩니다.
+#         self.fusion_conv = Conv(self.c_half, c2, k=k, s=1, p=p, g=1, d=d, act=act)
+
+#     def forward(self, x):
+#         wide = self.split_wide(x)
+#         narrow = self.split_narrow(x)
+        
+#         wide_proc = self.wide_processor(wide)
+#         narrow_proc = self.narrow_processor(narrow)
+        
+#         # 5. [수정] 동적 마스킹 및 정렬 로직을 단순한 Upsample + Add로 대체
+#         #    가장 확실하고 NPU 친화적인 퓨전 방식입니다.
+#         narrow_upsampled = self.upsampler(narrow_proc)
+        
+#         # 해상도를 맞추기 위한 Crop (만약 upsample 결과가 1픽셀 크다면)
+#         if narrow_upsampled.shape[2:] != wide_proc.shape[2:]:
+#             target_h, target_w = wide_proc.shape[2:]
+#             narrow_upsampled = narrow_upsampled[:, :, :target_h, :target_w]
+
+#         fused = wide_proc + narrow_upsampled
+        
+#         out = self.fusion_conv(fused)
+        
+#         return out
 
 # class SpatialAlignedMultiStreamConv(nn.Module):
 #     """

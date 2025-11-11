@@ -35,7 +35,7 @@ print(f"🔧 Using local ultralytics from: {ULTRALYTICS_ROOT}")
 # ONNX 모델 파일 경로 (추출된 모델)
 # ONNX_PATH = "/home/byounggun/ultralytics/runs/train/exp352/weights/best_dual_input_depth_extracted.onnx"
 # ONNX_PATH = "/home/byounggun/ultralytics/best_dual_input_depth_extracted2.onnx"
-ONNX_PATH = "/home/byounggun/ultralytics/runs/train/exp354/weights/best_dual_input_depth_extracted.onnx"
+ONNX_PATH = "/home/byounggun/ultralytics/runs/train/exp361/weights/best_dual_input_depth_extracted.onnx"
 
 # 입력 이미지 디렉토리
 WIDE_DIR = "/home/byounggun/ultralytics/swm_dual_split/val/images/"
